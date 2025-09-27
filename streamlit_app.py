@@ -371,7 +371,8 @@ def generate_factsheet_csv_content(
     last_comparison_df: pd.DataFrame,
     last_comparison_metrics: dict,
     current_live_value: float,
-    index_name: str = "Custom Index"
+    index_name: str = "Custom Index",
+    ai_agent_embed_snippet: str = None # Added for consistency, though won't be in CSV
 ) -> str:
     """Generates a comprehensive factsheet as a multi-section CSV string, including historical data."""
     content = []
@@ -430,7 +431,8 @@ def generate_factsheet_html_content(
     last_comparison_df: pd.DataFrame,
     last_comparison_metrics: dict,
     current_live_value: float,
-    index_name: str = "Custom Index"
+    index_name: str = "Custom Index",
+    ai_agent_embed_snippet: str = None # New argument for AI agent snippet
 ) -> str:
     """Generates a comprehensive factsheet as an HTML string, including visualizations but NOT raw historical data."""
     html_content_parts = []
@@ -454,12 +456,15 @@ def generate_factsheet_html_content(
             .plotly-graph { margin-top: 20px; border: 1px solid #444; border-radius: 5px; overflow: hidden; }
             .info-box { background-color: #334455; border-left: 5px solid #6699cc; padding: 10px; margin-top: 10px; border-radius: 4px; }
             .warning-box { background-color: #554433; border-left: 5px solid #cc9966; padding: 10px; margin-top: 10px; border-radius: 4px; }
+            .ai-agent-section { margin-top: 30px; padding: 15px; background-color: #333344; border-radius: 8px; }
+            .ai-agent-section h3 { color: #add8e6; border-bottom: 1px solid #555; padding-bottom: 5px; }
             @media print {
                 body { background-color: #fff; color: #000; }
                 .container { box-shadow: none; border: 1px solid #eee; background-color: #fff; }
                 h1, h2, h3, h4 { color: #000; border-bottom-color: #ccc; }
                 th, td { border-color: #ccc; }
                 .plotly-graph { border: none; }
+                .ai-agent-section { display: none; /* Hide AI agent in print view if not desired */ }
             }
         </style>
     </head>
@@ -544,6 +549,14 @@ def generate_factsheet_html_content(
     elif not current_calculated_index_history.empty:
         html_content_parts.append(f"<p class='info-box'>Historical performance chart for {index_name} is too large for the HTML factsheet. Please refer to the CSV download.</p>")
 
+    # --- AI Agent Embed Snippet ---
+    if ai_agent_embed_snippet:
+        html_content_parts.append("""
+            <div class="ai-agent-section">
+                <h3>Embedded AI Agent</h3>
+        """)
+        html_content_parts.append(ai_agent_embed_snippet)
+        html_content_parts.append("</div>")
 
     html_content_parts.append("""
         <div class="info-box">
@@ -1330,6 +1343,14 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 factsheet_constituents_df_final["Weighted Price"] = factsheet_constituents_df_final["Last Price"] * factsheet_constituents_df_final["Weights"]
                 current_live_value_for_factsheet_final = factsheet_constituents_df_final["Weighted Price"].sum() if not factsheet_constituents_df_final["Weighted Price"].empty else 0.0
 
+        # AI Agent Embed Snippet input
+        ai_agent_snippet_input = st.text_area(
+            "Optional: Paste HTML snippet for an embedded AI Agent (e.g., iframe code)",
+            height=150,
+            key="ai_agent_embed_snippet_input",
+            value="<iframe\n  src=\"https://etlas-v5.vercel.app/chat-agent?id=93dee35f-0ebe-42f6-beef-9a1abd1a6f12\"\n  width=\"400\"\n  height=\"600\"\n  frameborder=\"0\"\n  style=\"border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);\"\n></iframe>"
+        )
+
         col_factsheet_download_options_1, col_factsheet_download_options_2 = st.columns(2)
 
         with col_factsheet_download_options_1:
@@ -1341,7 +1362,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         last_comparison_df=last_comparison_df,
                         last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
                         current_live_value=current_live_value_for_factsheet_final,
-                        index_name=factsheet_index_name_final
+                        index_name=factsheet_index_name_final,
+                        ai_agent_embed_snippet=None # CSV doesn't support HTML embeds
                     )
                     st.session_state["last_facts_data"] = factsheet_csv_content.encode('utf-8')
                     st.download_button(
@@ -1365,7 +1387,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         last_comparison_df=last_comparison_df,
                         last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
                         current_live_value=current_live_value_for_factsheet_final,
-                        index_name=factsheet_index_name_final
+                        index_name=factsheet_index_name_final,
+                        ai_agent_embed_snippet=ai_agent_snippet_input if ai_agent_snippet_input.strip() else None # Pass the user's snippet
                     )
                     st.session_state["last_factsheet_html_data"] = factsheet_html_content.encode('utf-8')
 
@@ -1376,14 +1399,11 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         file_name=f"InvsionConnect_Factsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
                         mime="text/html",
                         key="factsheet_download_button_final_html",
-                        help="Includes charts for performance and composition. Open in browser to Print to PDF."
+                        help="Includes charts for performance and composition, and optional embedded AI agent. Open in browser to Print to PDF."
                     )
                     st.success("HTML Factsheet generated and ready for download! (Open in browser, then 'Print to PDF')")
                 else:
                     st.warning("No data available to generate a factsheet. Please calculate a new index, load a saved index, or run a comparison first.")
-
-        # --- Removed the conditional comparison-only buttons ---
-        # The main download buttons now handle the case where only comparison data is available.
 
         st.markdown("---")
         st.subheader("6. View/Delete Individual Saved Indexes")
