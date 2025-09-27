@@ -40,16 +40,15 @@ if "user_id" not in st.session_state:
 if "saved_indexes" not in st.session_state:
     st.session_state["saved_indexes"] = []
 if "current_calculated_index_data" not in st.session_state: # To store current CSV's index data
-    st.session_state["current_calculated_index_data"] = None
+    st.session_state["current_calculated_index_data"] = pd.DataFrame() # Initialize as empty DataFrame
 if "current_calculated_index_history" not in st.session_state: # To store historical index values for plotting
-    st.session_state["current_calculated_index_history"] = pd.DataFrame()
+    st.session_state["current_calculated_index_history"] = pd.DataFrame() # Initialize as empty DataFrame
 if "last_comparison_df" not in st.session_state:
     st.session_state["last_comparison_df"] = pd.DataFrame()
 if "last_comparison_metrics" not in st.session_state: # To store metrics for factsheet
     st.session_state["last_comparison_metrics"] = {}
 if "last_facts_data" not in st.session_state: # To store data for factsheet download
     st.session_state["last_facts_data"] = None
-
 
 # --- Load Credentials from Streamlit Secrets ---
 def load_secrets():
@@ -861,12 +860,13 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
     # --- After calculation for a new index ---
     # Retrieve current_calculated_index_data and history, ensuring they are DataFrames
-    # Use explicit type checking or a helper to ensure it's a DataFrame
-    current_calculated_index_data_raw = st.session_state.get("current_calculated_index_data")
-    current_calculated_index_data_df = pd.DataFrame() if current_calculated_index_data_raw is None else current_calculated_index_data_raw
+    current_calculated_index_data_df = st.session_state.get("current_calculated_index_data")
+    if not isinstance(current_calculated_index_data_df, pd.DataFrame): # Explicit check
+        current_calculated_index_data_df = pd.DataFrame()
 
-    current_calculated_index_history_raw = st.session_state.get("current_calculated_index_history")
-    current_calculated_index_history_df = pd.DataFrame() if current_calculated_index_history_raw is None else current_calculated_index_history_raw
+    current_calculated_index_history_df = st.session_state.get("current_calculated_index_history")
+    if not isinstance(current_calculated_index_history_df, pd.DataFrame): # Explicit check
+        current_calculated_index_history_df = pd.DataFrame()
 
     if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
         
@@ -890,7 +890,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         # Add Last Price and Weighted Price columns to constituents_df_for_live for consistent factsheet generation
         constituents_df_for_live["Last Price"] = constituents_df_for_live["symbol"].map(live_quotes)
         constituents_df_for_live["Weighted Price"] = constituents_df_for_live["Last Price"] * constituents_df_for_live["Weights"]
-        current_live_value_for_factsheet = constituents_df_for_live["Weighted Price"].sum() if not constituents_df_for_live["Weighted Price"].empty else 0.0
+        current_live_value_for_factsheet_display = constituents_df_for_live["Weighted Price"].sum() if not constituents_df_for_live["Weighted Price"].empty else 0.0
 
         display_single_index_details("Newly Calculated Index", constituents_df_for_live, current_calculated_index_history_df, index_id="new_index")
         
@@ -919,8 +919,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                             st.success(f"Index '{index_name_to_save}' saved successfully!")
                             # Clear session state to prevent re-saving and force reload
                             st.session_state["saved_indexes"] = [] 
-                            st.session_state["current_calculated_index_data"] = None 
-                            st.session_state["current_calculated_index_history"] = pd.DataFrame()
+                            st.session_state["current_calculated_index_data"] = pd.DataFrame() # Reset to empty DataFrame
+                            st.session_state["current_calculated_index_history"] = pd.DataFrame() # Reset to empty DataFrame
                             st.rerun()
                 except Exception as e:
                     st.error(f"Error saving new index: {e}")
@@ -941,8 +941,10 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 st.info("No saved indexes found for your account.")
         except Exception as e: st.error(f"Error loading indexes: {e}")
     
-    if st.session_state.get("saved_indexes"):
-        index_names_from_db = [idx['index_name'] for idx in st.session_state["saved_indexes"]]
+    # Ensure saved_indexes is a list (can be empty)
+    saved_indexes = st.session_state.get("saved_indexes", [])
+    if saved_indexes:
+        index_names_from_db = [idx['index_name'] for idx in saved_indexes]
         
         selected_custom_indexes_names = st.multiselect(
             "Select saved custom indexes to include in comparison:", 
@@ -959,7 +961,12 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             comparison_end_date = st.date_input("Comparison End Date", value=datetime.now().date(), key="comparison_end_date")
             if comparison_start_date >= comparison_end_date:
                 st.error("Comparison start date must be before end date.")
-                return # Stop execution if dates are invalid
+                # Make sure to initialize comparison_start_date, comparison_end_date if they weren't set.
+                # Or handle return gracefully, if that's the desired behavior.
+                # For now, let's just use default dates to ensure the flow continues.
+                comparison_start_date = datetime.now().date() - timedelta(days=365)
+                comparison_end_date = datetime.now().date()
+
 
         with col_comp_bench:
             benchmark_symbols_str = st.text_area(
@@ -989,7 +996,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
                 # Fetch data for selected custom indexes
                 for index_name in selected_custom_indexes_names:
-                    db_index_data = next((idx for idx in st.session_state["saved_indexes"] if idx['index_name'] == index_name), None)
+                    db_index_data = next((idx for idx in saved_indexes if idx['index_name'] == index_name), None) # Use local `saved_indexes`
                     if db_index_data:
                         constituents_df = pd.DataFrame(db_index_data['constituents'])
                         
@@ -1064,11 +1071,16 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 else:
                     st.info("No data selected or fetched for comparison.")
 
-        if not st.session_state.get("last_comparison_df", pd.DataFrame()).empty:
+        # Ensure last_comparison_df is a DataFrame
+        last_comparison_df = st.session_state.get("last_comparison_df")
+        if not isinstance(last_comparison_df, pd.DataFrame):
+            last_comparison_df = pd.DataFrame()
+
+        if not last_comparison_df.empty:
             st.markdown("#### Cumulative Performance Comparison (Normalized to 100)")
             fig_comparison = go.Figure()
-            for col in st.session_state["last_comparison_df"].columns:
-                fig_comparison.add_trace(go.Scatter(x=st.session_state["last_comparison_df"].index, y=st.session_state["last_comparison_df"][col], mode='lines', name=col))
+            for col in last_comparison_df.columns:
+                fig_comparison.add_trace(go.Scatter(x=last_comparison_df.index, y=last_comparison_df[col], mode='lines', name=col))
             
             fig_comparison.update_layout(
                 title_text="Multi-Index & Benchmark Performance",
@@ -1089,71 +1101,60 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         st.subheader("5. Generate and Download Consolidated Factsheet")
         st.info("The factsheet will include constituents, current live value, historical performance, comparison charts data, and performance metrics for the last calculated comparison.")
         
-        # Determine the `factsheet_constituents_df` and `factsheet_history_df` to pass to `generate_factsheet_content`.
-        # These should represent the data for the *main* index being reported on in the factsheet,
-        # which could be the newly calculated one or a selected saved one.
+        # --- Factsheet data preparation logic ---
+        factsheet_constituents_df_final = pd.DataFrame()
+        factsheet_history_df_final = pd.DataFrame()
+        factsheet_index_name_final = "Consolidated Report"
+        current_live_value_for_factsheet_final = 0.0
         
-        # Initialize with empty DataFrames to ensure type consistency
-        factsheet_constituents_df = pd.DataFrame()
-        factsheet_history_df = pd.DataFrame()
-        factsheet_index_name = "Consolidated Report" # Default name
-        current_live_value_for_factsheet = 0.0
-
-        # Preference: If a new index was just calculated, use that data
-        if not current_calculated_index_data_df.empty: # Use the local df variable
-            factsheet_constituents_df = current_calculated_index_data_df.copy()
-            factsheet_history_df = current_calculated_index_history_df.copy() # Use the local df variable
-            factsheet_index_name = "Newly Calculated Index" 
+        # Prioritize newly calculated index for the factsheet if available
+        if not current_calculated_index_data_df.empty:
+            factsheet_constituents_df_final = current_calculated_index_data_df.copy()
+            factsheet_history_df_final = current_calculated_index_history_df.copy()
+            factsheet_index_name_final = "Newly Calculated Index" 
             
-            # Recalculate live value for the newly calculated index's constituents for the factsheet
-            live_quotes_for_factsheet = {}
-            symbols_for_ltp_for_factsheet = [sym for sym in factsheet_constituents_df["symbol"]] if not factsheet_constituents_df.empty else []
-            if not st.session_state["instruments_df"].empty and symbols_for_ltp_for_factsheet:
+            # Fetch live prices for this index's constituents for the factsheet
+            live_quotes_for_factsheet_final = {}
+            symbols_for_ltp_for_factsheet_final = [sym for sym in factsheet_constituents_df_final["symbol"]] if not factsheet_constituents_df_final.empty else []
+            if not st.session_state["instruments_df"].empty and symbols_for_ltp_for_factsheet_final:
                 try:
                     kc_client = get_authenticated_kite_client(api_key, access_token)
                     if kc_client:
-                        instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp_for_factsheet]
-                        ltp_data_batch_for_factsheet = kc_client.ltp(instrument_identifiers)
-                        for sym in symbols_for_ltp_for_factsheet:
+                        instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp_for_factsheet_final]
+                        ltp_data_batch_for_factsheet_final = kc_client.ltp(instrument_identifiers)
+                        for sym in symbols_for_ltp_for_factsheet_final:
                             key = f"{DEFAULT_EXCHANGE}:{sym}"
-                            live_quotes_for_factsheet[sym] = ltp_data_batch_for_factsheet.get(key, {}).get("last_price", np.nan)
+                            live_quotes_for_factsheet_final[sym] = ltp_data_batch_for_factsheet_final.get(key, {}).get("last_price", np.nan)
                 except Exception as e:
-                    st.warning(f"Error fetching batch LTP for factsheet live value: {e}. Live prices might be partial.")
+                    st.warning(f"Error fetching batch LTP for factsheet live value (final): {e}. Live prices might be partial.")
             
             # Ensure 'Name' column exists
-            if 'Name' not in factsheet_constituents_df.columns and not st.session_state["instruments_df"].empty:
-                instrument_names_for_factsheet = st.session_state["instruments_df"].set_index('tradingsymbol')['name'].to_dict()
-                factsheet_constituents_df['Name'] = factsheet_constituents_df['symbol'].map(instrument_names_for_factsheet).fillna(factsheet_constituents_df['symbol'])
-            elif 'Name' not in factsheet_constituents_df.columns:
-                factsheet_constituents_df['Name'] = factsheet_constituents_df['symbol']
+            if 'Name' not in factsheet_constituents_df_final.columns and not st.session_state["instruments_df"].empty:
+                instrument_names_for_factsheet_final = st.session_state["instruments_df"].set_index('tradingsymbol')['name'].to_dict()
+                factsheet_constituents_df_final['Name'] = factsheet_constituents_df_final['symbol'].map(instrument_names_for_factsheet_final).fillna(factsheet_constituents_df_final['symbol'])
+            elif 'Name' not in factsheet_constituents_df_final.columns:
+                factsheet_constituents_df_final['Name'] = factsheet_constituents_df_final['symbol']
 
-            factsheet_constituents_df["Last Price"] = factsheet_constituents_df["symbol"].map(live_quotes_for_factsheet)
-            factsheet_constituents_df["Weighted Price"] = factsheet_constituents_df["Last Price"] * factsheet_constituents_df["Weights"]
-            current_live_value_for_factsheet = factsheet_constituents_df["Weighted Price"].sum() if not factsheet_constituents_df["Weighted Price"].empty else 0.0
+            factsheet_constituents_df_final["Last Price"] = factsheet_constituents_df_final["symbol"].map(live_quotes_for_factsheet_final)
+            factsheet_constituents_df_final["Weighted Price"] = factsheet_constituents_df_final["Last Price"] * factsheet_constituents_df_final["Weights"]
+            current_live_value_for_factsheet_final = factsheet_constituents_df_final["Weighted Price"].sum() if not factsheet_constituents_df_final["Weighted Price"].empty else 0.0
         
-        # If no new index but a single saved index is selected for management, use that
-        # (This block needs `selected_index_to_manage` and `selected_db_index_data` from section 6's scope)
-        # To make it accessible, we would need to store `selected_db_index_data` in session state or recalculate.
-        # For simplicity in this fix, we'll ensure factsheet_constituents_df is handled gracefully.
-
-        if st.button("Generate & Download Factsheet", key="generate_download_factsheet_btn"):
-            
-            # Re-evaluating factsheet_constituents_df and current_live_value_for_factsheet
-            # to capture the state when the button is pressed.
-            # This logic should reflect *what the user wants a factsheet for*.
-            # For simplicity, we'll prioritize the 'newly calculated index' if present,
-            # otherwise, the comparison's context is what the factsheet will predominantly reflect.
-
-            # We need to compute `current_live_value_for_factsheet` and populate `factsheet_constituents_df`
-            # based on the *currently displayed* or *most relevant* index.
-            # The previous logic for `current_live_value_for_factsheet` was good for the newly calculated index display.
-            # Let's encapsulate that for the factsheet generation if `current_calculated_index_data` is available.
-            
-            # If `current_calculated_index_data` is available, this is likely what the user wants a factsheet for.
-            if not current_calculated_index_data_df.empty: # Use the locally ensured DataFrame
-                factsheet_constituents_df_final = current_calculated_index_data_df.copy()
-                factsheet_history_df_final = current_calculated_index_history_df.copy()
-                factsheet_index_name_final = "Newly Calculated Index"
+        # If no newly calculated index, but a specific saved index is selected for management (section 6), use that
+        elif 'selected_index_to_manage' in st.session_state and st.session_state['selected_index_to_manage'] != "--- Select ---":
+            # Find the data for the selected saved index
+            selected_db_index_data_for_factsheet = next((idx for idx in saved_indexes if idx['index_name'] == st.session_state['selected_index_to_manage']), None)
+            if selected_db_index_data_for_factsheet:
+                factsheet_constituents_df_final = pd.DataFrame(selected_db_index_data_for_factsheet['constituents']).copy()
+                # Need to load/re-calculate history for factsheet if not in session state
+                # For simplicity here, we assume if it was displayed in section 6, its history would be available.
+                # A more robust solution might call _calculate_historical_index_value here again if needed.
+                factsheet_history_df_final = pd.DataFrame(selected_db_index_data_for_factsheet.get('historical_performance', []))
+                if not factsheet_history_df_final.empty:
+                    factsheet_history_df_final['date'] = pd.to_datetime(factsheet_history_df_final['date'])
+                    factsheet_history_df_final.set_index('date', inplace=True)
+                    factsheet_history_df_final.sort_index(inplace=True)
+                
+                factsheet_index_name_final = selected_db_index_data_for_factsheet['index_name']
 
                 # Fetch live prices for this index's constituents for the factsheet
                 live_quotes_for_factsheet_final = {}
@@ -1168,7 +1169,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                                 key = f"{DEFAULT_EXCHANGE}:{sym}"
                                 live_quotes_for_factsheet_final[sym] = ltp_data_batch_for_factsheet_final.get(key, {}).get("last_price", np.nan)
                     except Exception as e:
-                        st.warning(f"Error fetching batch LTP for factsheet live value (final): {e}. Live prices might be partial.")
+                        st.warning(f"Error fetching batch LTP for factsheet live value (selected saved index): {e}. Live prices might be partial.")
                 
                 if 'Name' not in factsheet_constituents_df_final.columns and not st.session_state["instruments_df"].empty:
                     instrument_names_for_factsheet_final = st.session_state["instruments_df"].set_index('tradingsymbol')['name'].to_dict()
@@ -1180,10 +1181,12 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 factsheet_constituents_df_final["Weighted Price"] = factsheet_constituents_df_final["Last Price"] * factsheet_constituents_df_final["Weights"]
                 current_live_value_for_factsheet_final = factsheet_constituents_df_final["Weighted Price"].sum() if not factsheet_constituents_df_final["Weighted Price"].empty else 0.0
 
+        if st.button("Generate & Download Factsheet", key="generate_download_factsheet_btn"):
+            if not factsheet_constituents_df_final.empty or not last_comparison_df.empty:
                 factsheet_content = generate_factsheet_content(
                     current_calculated_index_data=factsheet_constituents_df_final,
                     current_calculated_index_history=factsheet_history_df_final,
-                    last_comparison_df=st.session_state.get("last_comparison_df", pd.DataFrame()),
+                    last_comparison_df=last_comparison_df, # Use the locally ensured DataFrame
                     last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
                     current_live_value=current_live_value_for_factsheet_final,
                     index_name=factsheet_index_name_final
@@ -1199,42 +1202,45 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 )
                 st.success("Factsheet generated and ready for download!")
             else:
-                st.warning("Please calculate a new index or load a saved index first to generate its specific factsheet. Comparison data will still be included if available.")
-                # Even if no specific index is selected/calculated, still offer a generic factsheet if comparison data exists.
-                if not st.session_state.get("last_comparison_df", pd.DataFrame()).empty:
-                    factsheet_content = generate_factsheet_content(
-                        current_calculated_index_data=pd.DataFrame(), # No specific index data
-                        current_calculated_index_history=pd.DataFrame(), # No specific index data
-                        last_comparison_df=st.session_state.get("last_comparison_df", pd.DataFrame()),
-                        last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
-                        current_live_value=0.0, # N/A for generic comparison
-                        index_name="Comparison Report"
-                    )
-                    st.session_state["last_facts_data"] = factsheet_content.encode('utf-8')
-                    st.download_button(
-                        label="Download Comparison Factsheet (CSV)",
-                        data=st.session_state["last_facts_data"],
-                        file_name=f"InvsionConnect_ComparisonFactsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
-                        key="factsheet_download_button_comparison_only"
-                    )
-                    st.success("Comparison factsheet generated and ready for download!")
-                else:
-                    st.info("No data available to generate a factsheet.")
-
+                st.warning("No data available to generate a factsheet. Please calculate a new index, load a saved index, or run a comparison first.")
+        
+        # --- Conditional download button for comparison only if no specific index is selected ---
+        if factsheet_constituents_df_final.empty and not last_comparison_df.empty:
+            st.info("No specific index is currently selected for a detailed factsheet, but you can download a comparison-only factsheet.")
+            if st.button("Download Comparison Factsheet (CSV)", key="factsheet_download_button_comparison_only_visible"):
+                factsheet_content = generate_factsheet_content(
+                    current_calculated_index_data=pd.DataFrame(), # No specific index data
+                    current_calculated_index_history=pd.DataFrame(), # No specific index data
+                    last_comparison_df=last_comparison_df,
+                    last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
+                    current_live_value=0.0, # N/A for generic comparison
+                    index_name="Comparison Report"
+                )
+                st.session_state["last_facts_data"] = factsheet_content.encode('utf-8')
+                st.download_button(
+                    label="Download Comparison Factsheet (CSV)",
+                    data=st.session_state["last_facts_data"],
+                    file_name=f"InvsionConnect_ComparisonFactsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="factsheet_download_button_comparison_only_final"
+                )
+                st.success("Comparison factsheet generated and ready for download!")
 
         st.markdown("---")
         st.subheader("6. View/Delete Individual Saved Indexes")
-        # This section remains for managing individual indexes
+        
+        # Ensure `index_names_from_db` is available here
+        index_names_from_db_for_selector = [idx['index_name'] for idx in saved_indexes] if saved_indexes else []
+
         selected_index_to_manage = st.selectbox(
             "Select a single saved index to view details or delete:", 
-            ["--- Select ---"] + index_names_from_db, 
+            ["--- Select ---"] + index_names_from_db_for_selector, 
             key="select_single_saved_index_to_manage"
         )
 
         selected_db_index_data = None
         if selected_index_to_manage != "--- Select ---":
-            selected_db_index_data = next((idx for idx in st.session_state["saved_indexes"] if idx['index_name'] == selected_index_to_manage), None)
+            selected_db_index_data = next((idx for idx in saved_indexes if idx['index_name'] == selected_index_to_manage), None)
             if selected_db_index_data:
                 loaded_constituents_df = pd.DataFrame(selected_db_index_data['constituents'])
                 loaded_historical_performance_raw = selected_db_index_data.get('historical_performance')
@@ -1276,6 +1282,9 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         st.session_state["saved_indexes"] = [] # Force reload
                         st.rerun()
                     except Exception as e: st.error(f"Error deleting index: {e}")
+    else:
+        st.info("No saved indexes to manage yet. Load them using the button above.")
+
 
 # --- Main Application Logic (Tab Rendering) ---
 # Global api_key and access_token to pass to tab functions that use cached utility functions.
