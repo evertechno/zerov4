@@ -20,7 +20,7 @@ st.title("Invsion Connect")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
 # --- Global Constants & Session State Initialization ---
-TRADING_DAYS_PER_YEAR = 225 # Adjusted to a more common average for Indian markets, or keep 252 if preferred
+TRADING_DAYS_PER_YEAR = 252 # Reverted to 252, as it's a more commonly accepted general figure for equity markets. Can be adjusted.
 DEFAULT_EXCHANGE = "NSE"
 
 # Initialize session state variables if they don't exist
@@ -214,40 +214,64 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
         return {}
     
     # Ensure returns are not already in percentage form for cumulative calculation
-    daily_returns_decimal = returns_series / 100.0 if returns_series.abs().mean() > 1 else returns_series
+    # Using 0.1 as a threshold, if mean absolute return is > 0.1 (e.g., 10%), it's likely percentage.
+    # Convert to decimal for calculations.
+    daily_returns_decimal = returns_series / 100.0 if returns_series.abs().mean() > 0.1 else returns_series
+
+    # Ensure no NaN or infinite values in returns before cumulative product
+    daily_returns_decimal = daily_returns_decimal.replace([np.inf, -np.inf], np.nan).dropna()
+    if daily_returns_decimal.empty:
+        return {} # Not enough valid data
 
     cumulative_returns = (1 + daily_returns_decimal).cumprod() - 1
     total_return = cumulative_returns.iloc[-1] * 100 if not cumulative_returns.empty else 0
 
     num_periods = len(daily_returns_decimal)
-    if num_periods > 0 and (1 + daily_returns_decimal).min() > 0:
-        # Annualized return from daily compounding
-        annualized_return = ((1 + daily_returns_decimal).prod())**(TRADING_DAYS_PER_YEAR / num_periods) - 1
+    
+    # Annualized Return (Geometric Mean for stability)
+    # Expm1 and Log1p for numerical stability with small returns
+    if num_periods > 0 and (1 + daily_returns_decimal > 0).all(): # Ensure values are > -1 to prevent log(negative)
+        geometric_mean_daily_return = np.expm1(np.log1p(daily_returns_decimal).mean())
+        annualized_return = np.expm1((1 + geometric_mean_daily_return) ** TRADING_DAYS_PER_YEAR - 1) * 100
     else:
         annualized_return = 0
-    annualized_return *= 100
 
     daily_volatility = daily_returns_decimal.std()
     annualized_volatility = daily_volatility * np.sqrt(TRADING_DAYS_PER_YEAR) * 100 if daily_volatility is not None else 0
 
     # Ensure risk_free_rate is decimal for calculation (e.g., 5% = 0.05)
-    sharpe_ratio = (annualized_return / 100 - risk_free_rate / 100) / (annualized_volatility / 100) if annualized_volatility != 0 else np.nan
+    risk_free_rate_decimal = risk_free_rate / 100.0
+    sharpe_ratio = (annualized_return / 100 - risk_free_rate_decimal) / (annualized_volatility / 100) if annualized_volatility != 0 else np.nan
 
-    peak = cumulative_returns.expanding(min_periods=1).max()
-    drawdown = (cumulative_returns - peak) / (peak + 1) # (current_value - peak) / peak. If peak is 0, use 1 to avoid division by zero.
-    max_drawdown = drawdown.min() * 100 if not drawdown.empty else 0
+    # Max Drawdown
+    if not cumulative_returns.empty:
+        peak = cumulative_returns.expanding(min_periods=1).max()
+        # Ensure peak is not zero to avoid division by zero. If peak is 0, max_drawdown is 0.
+        drawdown = ((cumulative_returns - peak) / peak).replace([np.inf, -np.inf], np.nan).fillna(0) # Handle cases where peak could be 0
+        max_drawdown = drawdown.min() * 100 
+    else:
+        max_drawdown = 0
 
+    # Sortino Ratio
     negative_returns_decimal = daily_returns_decimal[daily_returns_decimal < 0]
-    downside_std_dev = negative_returns_decimal.std()
-    sortino_ratio = (annualized_return / 100 - risk_free_rate / 100) / (downside_std_dev * np.sqrt(TRADING_DAYS_PER_YEAR)) if downside_std_dev != 0 and not np.isnan(downside_std_dev) else np.nan
+    # downside_std_dev = negative_returns_decimal.std() # Original, calculating volatility of negative returns
+    # A more precise definition often uses target return, and only considers deviations below a MAR (Minimum Acceptable Return).
+    # For simplicity, assuming MAR = risk_free_rate for now.
+    
+    # Calculate downside deviation relative to risk-free rate
+    downside_returns = daily_returns_decimal[daily_returns_decimal < risk_free_rate_decimal]
+    downside_std_dev = downside_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) # Annualized downside deviation
 
+    sortino_ratio = (annualized_return / 100 - risk_free_rate_decimal) / (downside_std_dev) if downside_std_dev != 0 and not np.isnan(downside_std_dev) else np.nan
+
+    # Round results for display
     return {
-        "Total Return (%)": total_return,
-        "Annualized Return (%)": annualized_return,
-        "Annualized Volatility (%)": annualized_volatility,
-        "Sharpe Ratio": sharpe_ratio,
-        "Max Drawdown (%)": max_drawdown,
-        "Sortino Ratio": sortino_ratio
+        "Total Return (%)": round(total_return, 4),
+        "Annualized Return (%)": round(annualized_return, 4),
+        "Annualized Volatility (%)": round(annualized_volatility, 4),
+        "Sharpe Ratio": round(sharpe_ratio, 4),
+        "Max Drawdown (%)": round(max_drawdown, 4),
+        "Sortino Ratio": round(sortino_ratio, 4)
     }
 
 @st.cache_data(ttl=3600, show_spinner="Calculating historical index values...")
@@ -377,7 +401,7 @@ def generate_factsheet_csv_content(
     content.append("\n--- Performance Metrics ---\n")
     if last_comparison_metrics:
         metrics_df = pd.DataFrame(last_comparison_metrics).T
-        metrics_df = metrics_df.applymap(lambda x: f"{x:.2f}" if pd.notna(x) and isinstance(x, (int, float)) else x)
+        metrics_df = metrics_df.applymap(lambda x: f"{x:.4f}" if pd.notna(x) and isinstance(x, (int, float)) else x) # Format to 4 decimal places for precision
         content.append(metrics_df.to_csv())
     else:
         content.append("No performance metrics available (run a comparison first).\n")
@@ -472,7 +496,7 @@ def generate_factsheet_html_content(
     html_content_parts.append("<h3>Performance Metrics Summary</h3>")
     if last_comparison_metrics:
         metrics_df = pd.DataFrame(last_comparison_metrics).T
-        metrics_html = metrics_df.style.format("{:.2f}").to_html(classes='table')
+        metrics_html = metrics_df.style.format("{:.4f}").to_html(classes='table') # Format to 4 decimal places for precision
         html_content_parts.append(metrics_html)
     else:
         html_content_parts.append("<p class='warning-box'>No performance metrics available (run a comparison first).</p>")
@@ -1213,7 +1237,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
             st.markdown("#### Performance Metrics Summary")
             metrics_df = pd.DataFrame(st.session_state["last_comparison_metrics"]).T
-            st.dataframe(metrics_df.style.format("{:.2f}"), use_container_width=True)
+            st.dataframe(metrics_df.style.format("{:.4f}"), use_container_width=True) # Display metrics with higher precision
 
 
         st.markdown("---")
