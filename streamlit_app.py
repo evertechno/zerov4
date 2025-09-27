@@ -45,6 +45,11 @@ if "current_calculated_index_history" not in st.session_state: # To store histor
     st.session_state["current_calculated_index_history"] = pd.DataFrame()
 if "last_comparison_df" not in st.session_state:
     st.session_state["last_comparison_df"] = pd.DataFrame()
+if "last_comparison_metrics" not in st.session_state: # To store metrics for factsheet
+    st.session_state["last_comparison_metrics"] = {}
+if "last_facts_data" not in st.session_state: # To store data for factsheet download
+    st.session_state["last_facts_data"] = None
+
 
 # --- Load Credentials from Streamlit Secrets ---
 def load_secrets():
@@ -208,6 +213,7 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
 
     num_periods = len(daily_returns_decimal)
     if num_periods > 0 and (1 + daily_returns_decimal).min() > 0:
+        # Annualized return from daily compounding
         annualized_return = ((1 + daily_returns_decimal).prod())**(TRADING_DAYS_PER_YEAR / num_periods) - 1
     else:
         annualized_return = 0
@@ -216,16 +222,16 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
     daily_volatility = daily_returns_decimal.std()
     annualized_volatility = daily_volatility * np.sqrt(TRADING_DAYS_PER_YEAR) * 100 if daily_volatility is not None else 0
 
-    # Ensure risk_free_rate is decimal for calculation
+    # Ensure risk_free_rate is decimal for calculation (e.g., 5% = 0.05)
     sharpe_ratio = (annualized_return / 100 - risk_free_rate / 100) / (annualized_volatility / 100) if annualized_volatility != 0 else np.nan
 
     peak = cumulative_returns.expanding(min_periods=1).max()
-    drawdown = (cumulative_returns - peak) / (peak + 1)
+    drawdown = (cumulative_returns - peak) / (peak + 1) # (current_value - peak) / peak. If peak is 0, use 1 to avoid division by zero.
     max_drawdown = drawdown.min() * 100 if not drawdown.empty else 0
 
     negative_returns_decimal = daily_returns_decimal[daily_returns_decimal < 0]
     downside_std_dev = negative_returns_decimal.std()
-    sortino_ratio = (annualized_return / 100 - risk_free_rate / 100) / (downside_std_dev * np.sqrt(TRADING_DAYS_PER_YEAR)) if downside_std_dev != 0 else np.nan
+    sortino_ratio = (annualized_return / 100 - risk_free_rate / 100) / (downside_std_dev * np.sqrt(TRADING_DAYS_PER_YEAR)) if downside_std_dev != 0 and not np.isnan(downside_std_dev) else np.nan
 
     return {
         "Total Return (%)": total_return,
@@ -589,6 +595,61 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
         else:
             st.info("Historical chart will appear here.")
 
+# New function to generate the factsheet content
+def generate_factsheet_content(
+    current_calculated_index_data: pd.DataFrame,
+    current_calculated_index_history: pd.DataFrame,
+    last_comparison_df: pd.DataFrame,
+    last_comparison_metrics: dict,
+    current_live_value: float,
+    index_name: str = "Custom Index"
+) -> str:
+    """Generates a comprehensive factsheet as a multi-section CSV/text string."""
+    content = []
+    
+    # --- Factsheet Header ---
+    content.append(f"Factsheet for {index_name}\n")
+    content.append(f"Generated On: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    content.append("\n--- Index Overview ---\n")
+    content.append(f"Current Live Calculated Index Value,₹{current_live_value:,.2f}\n")
+    
+    # --- Constituents ---
+    content.append("\n--- Constituents ---\n")
+    if not current_calculated_index_data.empty:
+        # Prepare constituents for export, including live prices if available
+        const_export_df = current_calculated_index_data.copy()
+        if 'Last Price' in const_export_df.columns:
+            const_export_df['Last Price'] = const_export_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+        if 'Weighted Price' in const_export_df.columns:
+            const_export_df['Weighted Price'] = const_export_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+        content.append(const_export_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False))
+    else:
+        content.append("No constituent data available.\n")
+
+    # --- Historical Performance ---
+    content.append("\n--- Historical Performance (Normalized to 100) ---\n")
+    if not current_calculated_index_history.empty:
+        content.append(current_calculated_index_history.to_csv())
+    else:
+        content.append("No historical performance data available.\n")
+
+    # --- Performance Metrics ---
+    content.append("\n--- Performance Metrics ---\n")
+    if last_comparison_metrics:
+        metrics_df = pd.DataFrame(last_comparison_metrics).T
+        content.append(metrics_df.to_csv())
+    else:
+        content.append("No performance metrics available (run a comparison first).\n")
+
+    # --- Comparison Data ---
+    content.append("\n--- Comparison Data (Normalized to 100) ---\n")
+    if not last_comparison_df.empty:
+        content.append(last_comparison_df.to_csv())
+    else:
+        content.append("No comparison data available.\n")
+
+    return "".join(content)
+
 
 def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Client, api_key: str | None, access_token: str | None):
     st.header("📊 Custom Index Creation, Benchmarking & Export")
@@ -715,10 +776,10 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         st.plotly_chart(fig_pie, use_container_width=True)
 
         st.markdown("---")
-        st.subheader("Export Options")
+        st.subheader("Export Options (Constituents & Historical Only)")
         col_export1, col_export2 = st.columns(2)
         with col_export1:
-            csv_constituents = constituents_df[['symbol', 'Name', 'Weights']].to_csv(index=False).encode('utf-8')
+            csv_constituents = constituents_df_display[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="Export Constituents to CSV",
                 data=csv_constituents,
@@ -735,7 +796,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 mime="text/csv",
                 key=f"export_history_{index_id or index_name}"
             )
-
 
     # --- Section: Index Creation ---
     st.markdown("---")
@@ -794,6 +854,29 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
     if st.session_state.get("current_calculated_index_data") is not None and not st.session_state.get("current_calculated_index_history", pd.DataFrame()).empty:
         # Display details for the newly calculated index immediately
+        # We need the live value here for the factsheet, so re-run the display_single_index_details logic
+        # without rendering everything again explicitly.
+        
+        # Calculate current_live_value
+        constituents_df_for_live = st.session_state["current_calculated_index_data"].copy()
+        live_quotes = {}
+        symbols_for_ltp = [sym for sym in constituents_df_for_live["symbol"]]
+        if not st.session_state["instruments_df"].empty and symbols_for_ltp:
+            try:
+                kc_client = get_authenticated_kite_client(api_key, access_token)
+                if kc_client:
+                    instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp]
+                    ltp_data_batch = kc_client.ltp(instrument_identifiers)
+                    for sym in symbols_for_ltp:
+                        key = f"{DEFAULT_EXCHANGE}:{sym}"
+                        live_quotes[sym] = ltp_data_batch.get(key, {}).get("last_price", np.nan)
+            except Exception as e:
+                st.warning(f"Error fetching batch LTP for live value calculation: {e}. Live prices might be partial.")
+        
+        constituents_df_for_live["Last Price"] = constituents_df_for_live["symbol"].map(live_quotes)
+        constituents_df_for_live["Weighted Price"] = constituents_df_for_live["Last Price"] * constituents_df_for_live["Weights"]
+        current_live_value_for_factsheet = constituents_df_for_live["Weighted Price"].sum() if not constituents_df_for_live["Weighted Price"].empty else 0.0
+
         display_single_index_details("Newly Calculated Index", st.session_state["current_calculated_index_data"], st.session_state["current_calculated_index_history"], index_id="new_index")
         
         st.markdown("---")
@@ -958,6 +1041,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
                         st.session_state["last_comparison_df"] = combined_comparison_df
                         st.session_state["last_comparison_metrics"] = all_performance_metrics
+                        st.success("Comparison data generated successfully.")
 
                     else:
                         st.warning("No common starting date found for all selected assets within the chosen comparison period. Please check data availability or adjust dates.")
@@ -984,9 +1068,60 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             metrics_df = pd.DataFrame(st.session_state["last_comparison_metrics"]).T
             st.dataframe(metrics_df.style.format("{:.2f}"), use_container_width=True)
 
+            st.markdown("---")
+            st.subheader("5. Generate and Download Consolidated Factsheet")
+            st.info("The factsheet will include constituents, current live value, historical performance, comparison charts data, and performance metrics for the last calculated comparison.")
+            
+            if st.button("Generate & Download Factsheet", key="generate_download_factsheet_btn"):
+                
+                # Retrieve current_live_value for the factsheet header
+                current_live_value_factsheet = 0.0
+                if st.session_state.get("current_calculated_index_data") is not None:
+                     # This logic duplicates from above, could be refactored into a helper
+                    constituents_df_for_live = st.session_state["current_calculated_index_data"].copy()
+                    live_quotes_for_factsheet = {}
+                    symbols_for_ltp_for_factsheet = [sym for sym in constituents_df_for_live["symbol"]]
+                    if not st.session_state["instruments_df"].empty and symbols_for_ltp_for_factsheet:
+                        try:
+                            kc_client = get_authenticated_kite_client(api_key, access_token)
+                            if kc_client:
+                                instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp_for_factsheet]
+                                ltp_data_batch_for_factsheet = kc_client.ltp(instrument_identifiers)
+                                for sym in symbols_for_ltp_for_factsheet:
+                                    key = f"{DEFAULT_EXCHANGE}:{sym}"
+                                    live_quotes_for_factsheet[sym] = ltp_data_batch_for_factsheet.get(key, {}).get("last_price", np.nan)
+                        except Exception as e:
+                            st.warning(f"Error fetching batch LTP for factsheet live value: {e}. Live prices might be partial.")
+                    
+                    constituents_df_for_live["Last Price"] = constituents_df_for_live["symbol"].map(live_quotes_for_factsheet)
+                    constituents_df_for_live["Weighted Price"] = constituents_df_for_live["Last Price"] * constituents_df_for_live["Weights"]
+                    current_live_value_factsheet = constituents_df_for_live["Weighted Price"].sum() if not constituents_df_for_live["Weighted Price"].empty else 0.0
+
+
+                factsheet_content = generate_factsheet_content(
+                    current_calculated_index_data=st.session_state.get("current_calculated_index_data", pd.DataFrame()),
+                    current_calculated_index_history=st.session_state.get("current_calculated_index_history", pd.DataFrame()),
+                    last_comparison_df=st.session_state.get("last_comparison_df", pd.DataFrame()),
+                    last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
+                    current_live_value=current_live_value_factsheet,
+                    index_name="Consolidated Report" # Or choose a more specific name
+                )
+                
+                st.session_state["last_facts_data"] = factsheet_content.encode('utf-8')
+                st.download_button(
+                    label="Download Consolidated Factsheet (CSV)",
+                    data=st.session_state["last_facts_data"],
+                    file_name=f"InvsionConnect_Factsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="factsheet_download_button_final"
+                )
+                st.success("Factsheet generated and ready for download!")
+            else:
+                st.info("Run a comparison first to generate a factsheet.")
+
 
         st.markdown("---")
-        st.subheader("4. View/Delete Individual Saved Indexes")
+        st.subheader("6. View/Delete Individual Saved Indexes")
         # This section remains for managing individual indexes
         selected_index_to_manage = st.selectbox(
             "Select a single saved index to view details or delete:", 
