@@ -52,7 +52,12 @@ if "last_facts_data" not in st.session_state: # To store data for factsheet down
     st.session_state["last_facts_data"] = None
 if "last_factsheet_html_data" not in st.session_state: # To store HTML for factsheet download
     st.session_state["last_factsheet_html_data"] = None
-
+if "current_market_data" not in st.session_state: # For market data snapshot
+    st.session_state["current_market_data"] = None
+if "holdings_data" not in st.session_state:
+    st.session_state["holdings_data"] = None
+if "historical_data_NIFTY" not in st.session_state:
+    st.session_state["historical_data_NIFTY"] = pd.DataFrame()
 
 # --- Load Credentials from Streamlit Secrets ---
 def load_secrets():
@@ -327,284 +332,6 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
                 return pd.DataFrame({"_error": ["First day's index value is zero, cannot normalize."]})
     return pd.DataFrame({"_error": ["Error in calculating or normalizing historical index values."]})
 
-
-# --- Sidebar: Kite Login ---
-with st.sidebar:
-    st.markdown("### 1. Login to Kite Connect")
-    st.write("Click to open Kite login. You'll be redirected back with a `request_token`.")
-    st.markdown(f"[🔗 Open Kite login]({login_url})")
-
-    # Handle request_token from URL
-    request_token_param = st.query_params.get("request_token")
-    if request_token_param and not st.session_state["kite_access_token"]:
-        st.info("Received request_token — exchanging for access token...")
-        try:
-            data = kite_unauth_client.generate_session(request_token_param, api_secret=KITE_CREDENTIALS["api_secret"])
-            st.session_state["kite_access_token"] = data.get("access_token")
-            st.session_state["kite_login_response"] = data
-            st.sidebar.success("Kite Access token obtained.")
-            st.query_params.clear() # Clear request_token from URL
-            st.rerun() # Rerun to refresh UI
-        except Exception as e:
-            st.sidebar.error(f"Failed to generate Kite session: {e}")
-
-    if st.session_state["kite_access_token"]:
-        # Only render the logout button if authenticated
-        # Using a more unique key based on session state to avoid conflicts on reruns
-        if st.sidebar.button("Logout from Kite", key=f"kite_logout_btn_{st.session_state['kite_access_token'][:5]}"):
-            st.session_state["kite_access_token"] = None
-            st.session_state["kite_login_response"] = None
-            st.session_state["instruments_df"] = pd.DataFrame() # Clear cached instruments
-            st.success("Logged out from Kite. Please login again.")
-            st.rerun()
-        st.success("Kite Authenticated ✅")
-    else:
-        st.info("Not authenticated with Kite yet.")
-
-
-# --- Sidebar: Supabase Authentication ---
-with st.sidebar:
-    st.markdown("### 2. Supabase User Account")
-    
-    # Check/refresh Supabase session
-    def _refresh_supabase_session():
-        try:
-            session_data = supabase.auth.get_session()
-            if session_data and session_data.user:
-                st.session_state["user_session"] = session_data
-                st.session_state["user_id"] = session_data.user.id
-            else:
-                st.session_state["user_session"] = None
-                st.session_state["user_id"] = None
-        except Exception:
-            st.session_state["user_session"] = None
-            st.session_state["user_id"] = None
-
-    _refresh_supabase_session()
-
-    if st.session_state["user_session"]:
-        st.success(f"Logged into Supabase as: {st.session_state['user_session'].user.email}")
-        # Only render the logout button if authenticated
-        if st.button("Logout from Supabase", key=f"supabase_logout_btn_{st.session_state['user_id']}"): # Dynamic key
-            try:
-                supabase.auth.sign_out()
-                _refresh_supabase_session() # Update session state immediately
-                st.sidebar.success("Logged out from Supabase.")
-                st.rerun()
-            except Exception as e:
-                st.sidebar.error(f"Error logging out: {e}")
-    else:
-        # Create a unique key for the form based on whether a user session exists.
-        # If user_session is None, use a generic key. If it transitions, the old key won't conflict.
-        form_key = "supabase_auth_form_logged_out" 
-        with st.form(form_key): # FIX: Dynamic form key
-            st.markdown("##### Email/Password Login/Sign Up")
-            email = st.text_input("Email", key="supabase_email_input", help="Your email for Supabase authentication.")
-            password = st.text_input("Password", type="password", key="supabase_password_input", help="Your password for Supabase authentication.")
-            
-            col_auth1, col_auth2 = st.columns(2)
-            with col_auth1:
-                login_submitted = st.form_submit_button("Login")
-            with col_auth2:
-                signup_submitted = st.form_submit_button("Sign Up")
-
-            if login_submitted:
-                if email and password:
-                    try:
-                        with st.spinner("Logging in..."):
-                            response = supabase.auth.sign_in_with_password({"email": email, "password": password})
-                        _refresh_supabase_session()
-                        st.success("Login successful! Welcome.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Login failed: {e}")
-                else:
-                    st.warning("Please enter both email and password for login.")
-            
-            if signup_submitted:
-                if email and password:
-                    try:
-                        with st.spinner("Signing up..."):
-                            response = supabase.auth.sign_up({"email": email, "password": password})
-                        _refresh_supabase_session()
-                        st.success("Sign up successful! Please check your email to confirm your account.")
-                        st.info("After confirming your email, you can log in.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Sign up failed: {e}")
-                else:
-                    st.warning("Please enter both email and password for sign up.")
-
-    st.markdown("---")
-    st.markdown("### 3. Quick Data Access (Kite)")
-    if st.session_state["kite_access_token"]:
-        current_k_client_for_sidebar = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
-
-        if st.button("Fetch Current Holdings", key="sidebar_fetch_holdings_btn"):
-            try:
-                holdings = current_k_client_for_sidebar.holdings() # Direct call
-                st.session_state["holdings_data"] = pd.DataFrame(holdings)
-                st.success(f"Fetched {len(holdings)} holdings.")
-            except Exception as e:
-                st.error(f"Error fetching holdings: {e}")
-        if st.session_state.get("holdings_data") is not None and not st.session_state["holdings_data"].empty:
-            with st.expander("Show Holdings"):
-                st.dataframe(st.session_state["holdings_data"])
-    else:
-        st.info("Login to Kite to access quick data.")
-
-
-# --- Authenticated KiteConnect client (used by main tabs) ---
-k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
-
-
-# --- Main UI - Tabs for modules ---
-tabs = st.tabs(["Dashboard", "Market & Historical", "Custom Index"])
-tab_dashboard, tab_market, tab_custom_index = tabs
-
-# --- Tab Logic Functions ---
-
-def render_dashboard_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
-    st.header("Personalized Dashboard")
-    st.write("Welcome to your advanced financial analysis dashboard.")
-
-    if not kite_client:
-        st.info("Please login to Kite Connect to view your personalized dashboard.")
-        return
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.subheader("Account Summary")
-        try:
-            profile = kite_client.profile() # Direct call, not cached
-            margins = kite_client.margins() # Direct call, not cached
-            st.metric("Account Holder", profile.get("user_name", "N/A"))
-            st.metric("Available Equity Margin", f"₹{margins.get('equity', {}).get('available', {}).get('live_balance', 0):,.2f}")
-            st.metric("Available Commodity Margin", f"₹{margins.get('commodity', {}).get('available', {}).get('live_balance', 0):,.2f}")
-        except Exception as e:
-            st.warning(f"Could not fetch full account summary: {e}")
-
-    with col2:
-        st.subheader("Market Insight (NIFTY 50)")
-        if api_key and access_token:
-            nifty_ltp_data = get_ltp_price_cached(api_key, access_token, "NIFTY 50", DEFAULT_EXCHANGE) # Use cached LTP
-            if nifty_ltp_data and "_error" not in nifty_ltp_data:
-                nifty_ltp = nifty_ltp_data.get("last_price", 0.0)
-                nifty_change = nifty_ltp_data.get("change", 0.0)
-                st.metric("NIFTY 50 (LTP)", f"₹{nifty_ltp:,.2f}", delta=f"{nifty_change:.2f}%")
-            else:
-                st.warning(f"Could not fetch NIFTY 50 LTP: {nifty_ltp_data.get('_error', 'Unknown error')}")
-        else:
-            st.info("Kite not authenticated to fetch NIFTY 50 LTP.")
-
-        if st.session_state.get("historical_data_NIFTY", pd.DataFrame()).empty:
-            if st.button("Load NIFTY 50 Historical for Chart", key="dashboard_load_nifty_hist_btn"):
-                if api_key and access_token:
-                    with st.spinner("Fetching NIFTY 50 historical data..."):
-                        nifty_df = get_historical_data_cached(api_key, access_token, "NIFTY 50", datetime.now().date() - timedelta(days=180), datetime.now().date(), "day", DEFAULT_EXCHANGE)
-                        if isinstance(nifty_df, pd.DataFrame) and "_error" not in nifty_df.columns:
-                            st.session_state["historical_data_NIFTY"] = nifty_df
-                            st.success("NIFTY 50 historical data loaded.")
-                        else:
-                            st.error(f"Error fetching NIFTY 50 historical: {nifty_df.get('_error', 'Unknown error')}")
-                else:
-                    st.warning("Kite not authenticated to fetch historical data.")
-
-        if not st.session_state.get("historical_data_NIFTY", pd.DataFrame()).empty:
-            nifty_df = st.session_state["historical_data_NIFTY"]
-            fig_nifty = go.Figure(data=[go.Candlestick(x=nifty_df.index, open=nifty_df['open'], high=nifty_df['high'], low=nifty_df['low'], close=nifty_df['close'], name='Candlestick'),
-                                         go.Scatter(x=nifty_df.index, y=ta.trend.sma_indicator(nifty_df['close'], window=20), mode='lines', name='SMA 20', line=dict(color='orange'))]) # Added a simple SMA for more visual data
-            fig_nifty.update_layout(title_text="NIFTY 50 Last 6 Months", xaxis_rangeslider_visible=False, height=300, template="plotly_white")
-            st.plotly_chart(fig_nifty, use_container_width=True)
-
-    with col3:
-        st.subheader("Quick Performance")
-        if st.session_state.get("last_fetched_symbol") and not st.session_state.get("historical_data", pd.DataFrame()).empty:
-            last_symbol = st.session_state["last_fetched_symbol"]
-            returns = st.session_state["historical_data"]["close"].pct_change().dropna() * 100
-            if not returns.empty:
-                perf = calculate_performance_metrics(returns)
-                st.write(f"**{last_symbol}** (Last Fetched)")
-                st.metric("Total Return", f"{perf.get('Total Return (%)', 0):.2f}%")
-                st.metric("Annualized Volatility", f"{perf.get('Annualized Volatility (%)', 0):.2f}%")
-                st.metric("Sharpe Ratio", f"{perf.get('Sharpe Ratio', 0):.2f}")
-            else:
-                st.info("No sufficient historical data for quick performance calculation.")
-        else:
-            st.info("Fetch some historical data in 'Market & Historical' tab to see quick performance here.")
-
-
-def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
-    st.header("Market Data & Historical Candles")
-    if not kite_client:
-        st.info("Login first to fetch market data.")
-        return
-    if not api_key or not access_token: # Additional check for cached functions
-        st.info("Kite authentication details required for cached data access.")
-        return
-
-    st.subheader("Current Market Data Snapshot")
-    col_market_quote1, col_market_quote2 = st.columns([1, 2])
-    with col_market_quote1:
-        q_exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO"], key="market_exchange_tab")
-        q_symbol = st.text_input("Tradingsymbol", value="NIFTY 50", key="market_symbol_tab") # Default to NIFTY 50 for quick demo
-        if st.button("Get Market Data", key="get_market_data_btn"):
-            ltp_data = get_ltp_price_cached(api_key, access_token, q_symbol, q_exchange) # Use cached LTP
-            if ltp_data and "_error" not in ltp_data:
-                st.session_state["current_market_data"] = ltp_data
-                st.success(f"Fetched LTP for {q_symbol}.")
-            else:
-                st.error(f"Market data fetch failed for {q_symbol}: {ltp_data.get('_error', 'Unknown error')}")
-    with col_market_quote2:
-        if st.session_state.get("current_market_data"):
-            st.markdown("##### Latest Quote Details")
-            st.json(st.session_state["current_market_data"])
-        else:
-            st.info("Market data will appear here.")
-
-    st.markdown("---")
-    st.subheader("Historical Price Data")
-    with st.expander("Load Instruments for Symbol Lookup (Recommended)"):
-        exchange_for_lookup = st.selectbox("Exchange to load instruments", ["NSE", "BSE", "NFO"], key="hist_inst_load_exchange_selector")
-        if st.button("Load Instruments into Cache", key="load_inst_cache_btn"):
-            df_instruments = load_instruments_cached(api_key, access_token, exchange_for_lookup) # Use cached instruments
-            if not df_instruments.empty and "_error" not in df_instruments.columns:
-                st.session_state["instruments_df"] = df_instruments
-                st.success(f"Loaded {len(df_instruments)} instruments.")
-            else:
-                st.error(f"Failed to load instruments: {df_instruments.get('_error', 'Unknown error')}")
-
-
-    col_hist_controls, col_hist_plot = st.columns([1, 2])
-    with col_hist_controls:
-        hist_exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO"], key="hist_ex_tab_selector")
-        hist_symbol = st.text_input("Tradingsymbol", value="NIFTY 50", key="hist_sym_tab_input") # Default to NIFTY 50 for quick demo
-        from_date = st.date_input("From Date", value=datetime.now().date() - timedelta(days=90), key="from_dt_tab_input")
-        to_date = st.date_input("To Date", value=datetime.now().date(), key="to_dt_tab_input")
-        interval = st.selectbox("Interval", ["minute", "5minute", "30minute", "day", "week", "month"], index=3, key="hist_interval_selector")
-
-        if st.button("Fetch Historical Data", key="fetch_historical_data_btn"):
-            with st.spinner(f"Fetching {interval} historical data for {hist_symbol}..."):
-                df_hist = get_historical_data_cached(api_key, access_token, hist_symbol, from_date, to_date, interval, hist_exchange) # Use cached historical
-                if isinstance(df_hist, pd.DataFrame) and "_error" not in df_hist.columns:
-                    st.session_state["historical_data"] = df_hist
-                    st.session_state["last_fetched_symbol"] = hist_symbol
-                    st.success(f"Fetched {len(df_hist)} records for {hist_symbol}.")
-                else:
-                    st.error(f"Historical fetch failed: {df_hist.get('_error', 'Unknown error')}")
-
-    with col_hist_plot:
-        if not st.session_state.get("historical_data", pd.DataFrame()).empty:
-            df = st.session_state["historical_data"]
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
-            fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Candlestick'), row=1, col=1)
-            fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='Volume', marker_color='blue'), row=2, col=1)
-            fig.update_layout(title_text=f"Historical Price & Volume for {st.session_state['last_fetched_symbol']}", xaxis_rangeslider_visible=False, height=600, template="plotly_white")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Historical chart will appear here.")
-
 # Function to generate factsheet as multi-section CSV (includes historical data)
 def generate_factsheet_csv_content(
     current_calculated_index_data: pd.DataFrame,
@@ -836,7 +563,7 @@ with st.sidebar:
             else:
                 st.session_state["user_session"] = None
                 st.session_state["user_id"] = None
-        except Exception:
+        except Exception: # Catch any error during session fetching
             st.session_state["user_session"] = None
             st.session_state["user_id"] = None
 
@@ -854,10 +581,11 @@ with st.sidebar:
             except Exception as e:
                 st.sidebar.error(f"Error logging out: {e}")
     else:
-        # Create a unique key for the form based on whether a user session exists.
-        # If user_session is None, use a generic key. If it transitions, the old key won't conflict.
-        form_key = "supabase_auth_form_logged_out" 
-        with st.form(form_key): # FIX: Dynamic form key (now a static one within the 'else' branch)
+        # The form key here needs to be static, as this block is entered only when not logged in.
+        # The previous error likely came from a rerun causing this block to be processed again
+        # while the form was somehow still registered, perhaps due to multiple 'with' blocks or
+        # an unexpected interaction with rerun. Using a static key in this 'else' branch is standard.
+        with st.form("supabase_auth_form_logged_out_static_key"):
             st.markdown("##### Email/Password Login/Sign Up")
             email = st.text_input("Email", key="supabase_email_input", help="Your email for Supabase authentication.")
             password = st.text_input("Password", type="password", key="supabase_password_input", help="Your password for Supabase authentication.")
@@ -1454,21 +1182,24 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     # Find the first date where ALL selected series have data
                     first_common_valid_date = combined_comparison_df.dropna().index.min()
 
-                    if first_common_valid_date:
+                    if first_common_valid_date is not None:
                         # Re-normalize all series based on their value at the first_common_valid_date
                         # This ensures they all start at 100 on the first date they all have data
+                        cols_to_drop_from_chart = []
                         for col in combined_comparison_df.columns:
                             if col in combined_comparison_df.columns and first_common_valid_date in combined_comparison_df.index:
                                 base_value = combined_comparison_df.loc[first_common_valid_date, col]
                                 if base_value != 0 and not pd.isna(base_value):
                                     combined_comparison_df[col] = (combined_comparison_df[col] / base_value) * 100
                                 else:
-                                    st.warning(f"Could not re-normalize {col} at common start date. Skipping from chart.")
-                                    combined_comparison_df.drop(columns=[col], inplace=True)
+                                    st.warning(f"Could not re-normalize {col} at common start date (value is zero or NaN). Skipping from chart.")
+                                    cols_to_drop_from_chart.append(col)
                             else:
                                 st.warning(f"Data for {col} not available at common start date. Skipping from chart.")
-                                combined_comparison_df.drop(columns=[col], inplace=True)
+                                cols_to_drop_from_chart.append(col)
                         
+                        combined_comparison_df.drop(columns=cols_to_drop_from_chart, inplace=True, errors='ignore')
+
                         # Drop rows before the first common valid date
                         combined_comparison_df = combined_comparison_df.loc[first_common_valid_date:]
                         combined_comparison_df.dropna(how='all', inplace=True) # Drop any rows that became all NaN after re-normalization
@@ -1696,6 +1427,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             ["--- Select ---"] + index_names_from_db_for_selector, 
             key="select_single_saved_index_to_manage"
         )
+        st.session_state['selected_index_to_manage'] = selected_index_to_manage # Store for factsheet logic
 
         selected_db_index_data = None
         if selected_index_to_manage != "--- Select ---":
