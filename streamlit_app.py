@@ -20,7 +20,7 @@ st.title("Invsion Connect")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
 # --- Global Constants & Session State Initialization ---
-TRADING_DAYS_PER_YEAR = 252
+TRADING_DAYS_PER_YEAR = 225 # Adjusted to a more common average for Indian markets, or keep 252 if preferred
 DEFAULT_EXCHANGE = "NSE"
 
 # Initialize session state variables if they don't exist
@@ -377,6 +377,7 @@ def generate_factsheet_csv_content(
     content.append("\n--- Performance Metrics ---\n")
     if last_comparison_metrics:
         metrics_df = pd.DataFrame(last_comparison_metrics).T
+        metrics_df = metrics_df.applymap(lambda x: f"{x:.2f}" if pd.notna(x) and isinstance(x, (int, float)) else x)
         content.append(metrics_df.to_csv())
     else:
         content.append("No performance metrics available (run a comparison first).\n")
@@ -410,7 +411,6 @@ def generate_factsheet_html_content(
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Invsion Connect Factsheet</title>
-        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
         <style>
             body { font-family: Arial, sans-serif; margin: 20px; background-color: #1a1a1a; color: #e0e0e0; }
             .container { max-width: 900px; margin: auto; padding: 20px; background-color: #2b2b2b; border-radius: 8px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2); }
@@ -439,7 +439,10 @@ def generate_factsheet_html_content(
     html_content_parts.append(f"<h1>Invsion Connect Factsheet: {index_name}</h1>")
     html_content_parts.append(f"<p><strong>Generated On:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
     html_content_parts.append("<h2>Index Overview</h2>")
-    html_content_parts.append(f"<p class='metric'><strong>Current Live Calculated Index Value:</strong> ₹{current_live_value:,.2f}</p>")
+    if current_live_value > 0:
+        html_content_parts.append(f"<p class='metric'><strong>Current Live Calculated Index Value:</strong> ₹{current_live_value:,.2f}</p>")
+    else:
+        html_content_parts.append("<p class='warning-box'>Current Live Calculated Index Value: N/A (Constituent data not available or comparison report only)</p>")
 
     # --- Constituents ---
     html_content_parts.append("<h3>Constituents</h3>")
@@ -460,7 +463,8 @@ def generate_factsheet_html_content(
         fig_pie = go.Figure(data=[go.Pie(labels=const_display_df['Name'], values=const_display_df['Weights'], hole=.3)])
         fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
         html_content_parts.append("<h3>Index Composition</h3>")
-        html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs=False)}</div>") # include_plotlyjs=False as it's in header
+        # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
+        html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>") 
     else:
         html_content_parts.append("<p class='warning-box'>No constituent data available for this index.</p>")
     
@@ -480,25 +484,31 @@ def generate_factsheet_html_content(
         for col in last_comparison_df.columns:
             fig_comparison.add_trace(go.Scatter(x=last_comparison_df.index, y=last_comparison_df[col], mode='lines', name=col))
         
+        # Adjust title based on whether it's a specific index report or a generic comparison
+        chart_title = "Multi-Index & Benchmark Performance"
+        if index_name != "Consolidated Report" and index_name != "Comparison Report":
+            chart_title = f"{index_name} vs Benchmarks Performance"
+
         fig_comparison.update_layout(
-            title_text="Multi-Index & Benchmark Performance",
+            title_text=chart_title,
             xaxis_title="Date",
             yaxis_title="Normalized Value (Base 100)",
             height=600,
             template="plotly_dark",
             hovermode="x unified"
         )
-        html_content_parts.append(f"<div class='plotly-graph'>{fig_comparison.to_html(full_html=False, include_plotlyjs=False)}</div>") # include_plotlyjs=False
+        # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
+        html_content_parts.append(f"<div class='plotly-graph'>{fig_comparison.to_html(full_html=False, include_plotlyjs='cdn')}</div>") 
     else:
         html_content_parts.append("<p class='warning-box'>No comparison data available.</p>")
 
     # --- Optional: Historical Performance Chart for the main index (if applicable and not too large) ---
-    # Moved the check here, so current_calculated_index_history is used.
     if not current_calculated_index_history.empty and current_calculated_index_history.shape[0] < 730: # Limit for HTML, e.g., 2 years daily data
         html_content_parts.append("<h3>Index Historical Performance (Normalized to 100)</h3>")
         fig_hist_index = go.Figure(data=[go.Scatter(x=current_calculated_index_history.index, y=current_calculated_index_history['index_value'], mode='lines', name=index_name)])
         fig_hist_index.update_layout(title_text=f"{index_name} Historical Performance", template="plotly_dark", height=400)
-        html_content_parts.append(f"<div class='plotly-graph'>{fig_hist_index.to_html(full_html=False, include_plotlyjs=False)}</div>")
+        # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
+        html_content_parts.append(f"<div class='plotly-graph'>{fig_hist_index.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
     elif not current_calculated_index_history.empty:
         html_content_parts.append(f"<p class='info-box'>Historical performance chart for {index_name} is too large for the HTML factsheet. Please refer to the CSV download.</p>")
 
@@ -824,7 +834,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         """
         Fetches and normalized historical data for a custom index or a benchmark symbol
         within a specified comparison date range.
-        Returns a DataFrame with 'date' and 'normalized_value'.
+        Returns a DataFrame with 'date', 'normalized_value', and 'raw_values'.
         """
         hist_df = pd.DataFrame()
         if data_type == "custom_index":
@@ -931,14 +941,17 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 key=f"export_constituents_{index_id or index_name}"
             )
         with col_export2:
-            csv_history = index_history_df.to_csv().encode('utf-8')
-            st.download_button(
-                label="Export Historical Performance to CSV",
-                data=csv_history,
-                file_name=f"{index_name}_historical_performance.csv",
-                mime="text/csv",
-                key=f"export_history_{index_id or index_name}"
-            )
+            if not index_history_df.empty:
+                csv_history = index_history_df.to_csv().encode('utf-8')
+                st.download_button(
+                    label="Export Historical Performance to CSV",
+                    data=csv_history,
+                    file_name=f"{index_name}_historical_performance.csv",
+                    mime="text/csv",
+                    key=f"export_history_{index_id or index_name}"
+                )
+            else:
+                st.info("No historical data to export for this index.")
 
     # --- Section: Index Creation ---
     st.markdown("---")
@@ -997,17 +1010,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
     # --- After calculation for a new index ---
     # Retrieve current_calculated_index_data and history, ensuring they are DataFrames
-    current_calculated_index_data_raw = st.session_state.get("current_calculated_index_data")
-    if not isinstance(current_calculated_index_data_raw, pd.DataFrame): # Explicit check
-        current_calculated_index_data_df = pd.DataFrame()
-    else:
-        current_calculated_index_data_df = current_calculated_index_data_raw
-
-    current_calculated_index_history_raw = st.session_state.get("current_calculated_index_history")
-    if not isinstance(current_calculated_index_history_raw, pd.DataFrame): # Explicit check
-        current_calculated_index_history_df = pd.DataFrame()
-    else:
-        current_calculated_index_history_df = current_calculated_index_history_raw
+    current_calculated_index_data_df = st.session_state.get("current_calculated_index_data", pd.DataFrame())
+    current_calculated_index_history_df = st.session_state.get("current_calculated_index_history", pd.DataFrame())
 
     if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
         
@@ -1177,46 +1181,19 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 if all_normalized_data:
                     # Combine all normalized series into a single DataFrame
                     combined_comparison_df = pd.DataFrame(all_normalized_data)
+                    combined_comparison_df.dropna(how='all', inplace=True) # Drop rows where all are NaN
                     
-                    # Ensure all series start from the same point for visual comparison
-                    # Find the first date where ALL selected series have data
-                    first_common_valid_date = combined_comparison_df.dropna().index.min()
-
-                    if first_common_valid_date is not None:
-                        # Re-normalize all series based on their value at the first_common_valid_date
-                        # This ensures they all start at 100 on the first date they all have data
-                        cols_to_drop_from_chart = []
-                        for col in combined_comparison_df.columns:
-                            if col in combined_comparison_df.columns and first_common_valid_date in combined_comparison_df.index:
-                                base_value = combined_comparison_df.loc[first_common_valid_date, col]
-                                if base_value != 0 and not pd.isna(base_value):
-                                    combined_comparison_df[col] = (combined_comparison_df[col] / base_value) * 100
-                                else:
-                                    st.warning(f"Could not re-normalize {col} at common start date (value is zero or NaN). Skipping from chart.")
-                                    cols_to_drop_from_chart.append(col)
-                            else:
-                                st.warning(f"Data for {col} not available at common start date. Skipping from chart.")
-                                cols_to_drop_from_chart.append(col)
-                        
-                        combined_comparison_df.drop(columns=cols_to_drop_from_chart, inplace=True, errors='ignore')
-
-                        # Drop rows before the first common valid date
-                        combined_comparison_df = combined_comparison_df.loc[first_common_valid_date:]
-                        combined_comparison_df.dropna(how='all', inplace=True) # Drop any rows that became all NaN after re-normalization
-
+                    if not combined_comparison_df.empty:
                         st.session_state["last_comparison_df"] = combined_comparison_df
                         st.session_state["last_comparison_metrics"] = all_performance_metrics
                         st.success("Comparison data generated successfully.")
-
                     else:
-                        st.warning("No common starting date found for all selected assets within the chosen comparison period. Please check data availability or adjust dates.")
+                        st.warning("No common or sufficient data found for comparison. Please check selected indexes/benchmarks and date range.")
                 else:
                     st.info("No data selected or fetched for comparison.")
 
         # Ensure last_comparison_df is a DataFrame
-        last_comparison_df = st.session_state.get("last_comparison_df")
-        if not isinstance(last_comparison_df, pd.DataFrame):
-            last_comparison_df = pd.DataFrame()
+        last_comparison_df = st.session_state.get("last_comparison_df", pd.DataFrame())
 
         if not last_comparison_df.empty:
             st.markdown("#### Cumulative Performance Comparison (Normalized to 100)")
@@ -1246,11 +1223,11 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         # --- Factsheet data preparation logic ---
         factsheet_constituents_df_final = pd.DataFrame()
         factsheet_history_df_final = pd.DataFrame()
-        factsheet_index_name_final = "Consolidated Report"
+        factsheet_index_name_final = "Consolidated Report" # Default for a general comparison report
         current_live_value_for_factsheet_final = 0.0
         
         # Prioritize newly calculated index for the factsheet if available
-        if not current_calculated_index_data_df.empty:
+        if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
             factsheet_constituents_df_final = current_calculated_index_data_df.copy()
             factsheet_history_df_final = current_calculated_index_history_df.copy()
             factsheet_index_name_final = "Newly Calculated Index" 
@@ -1282,7 +1259,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             current_live_value_for_factsheet_final = factsheet_constituents_df_final["Weighted Price"].sum() if not factsheet_constituents_df_final["Weighted Price"].empty else 0.0
         
         # If no newly calculated index, but a specific saved index is selected for management (section 6), use that
-        elif 'selected_index_to_manage' in st.session_state and st.session_state['selected_index_to_manage'] != "--- Select ---":
+        elif st.session_state.get('selected_index_to_manage') and st.session_state['selected_index_to_manage'] != "--- Select ---":
             # Find the data for the selected saved index
             selected_db_index_data_for_factsheet = next((idx for idx in saved_indexes if idx['index_name'] == st.session_state['selected_index_to_manage']), None)
             if selected_db_index_data_for_factsheet:
@@ -1335,12 +1312,18 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         index_name=factsheet_index_name_final
                     )
                     st.session_state["last_facts_data"] = factsheet_csv_content.encode('utf-8')
+                    # This download button will be shown dynamically after content is ready
+                    # It's crucial for Streamlit that the button data is ready *before* it's rendered in the page for the first time
+                    # To avoid issues, we'll store the data and provide the button immediately.
+                    # This part is a bit tricky with how Streamlit manages button states and reruns.
+                    # A common pattern is to have the download button always present, but only enabled/useful when data is ready.
                     st.download_button(
                         label="Download CSV Factsheet",
                         data=st.session_state["last_facts_data"],
                         file_name=f"InvsionConnect_Factsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv",
-                        key="factsheet_download_button_final_csv"
+                        key="factsheet_download_button_final_csv",
+                        help="Includes constituents, historical data, comparison data, and metrics."
                     )
                     st.success("CSV Factsheet generated and ready for download!")
                 else:
@@ -1365,7 +1348,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         data=st.session_state["last_factsheet_html_data"],
                         file_name=f"InvsionConnect_Factsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
                         mime="text/html",
-                        key="factsheet_download_button_final_html"
+                        key="factsheet_download_button_final_html",
+                        help="Includes charts for performance and composition. Open in browser to Print to PDF."
                     )
                     st.success("HTML Factsheet generated and ready for download! (Open in browser, then 'Print to PDF')")
                 else:
@@ -1393,7 +1377,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         data=st.session_state["last_factsheet_html_data"],
                         file_name=f"InvsionConnect_ComparisonFactsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
                         mime="text/html",
-                        key="factsheet_download_button_comparison_only_final_html"
+                        key="factsheet_download_button_comparison_only_final_html",
+                        help="Includes charts for performance comparison only. Open in browser to Print to PDF."
                     )
                     st.success("Comparison HTML factsheet generated and ready for download! (Open in browser, then 'Print to PDF')")
             with col_comp_csv_dl: # Also provide CSV option for comparison only
@@ -1412,7 +1397,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         data=st.session_state["last_facts_data"],
                         file_name=f"InvsionConnect_ComparisonFactsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv",
-                        key="factsheet_download_button_comparison_only_final_csv"
+                        key="factsheet_download_button_comparison_only_final_csv",
+                        help="Includes comparison data and metrics only."
                     )
                     st.success("Comparison CSV factsheet generated and ready for download!")
 
