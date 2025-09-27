@@ -1,5 +1,4 @@
 import streamlit as st
-from kiteconnect import KiteConnect
 import pandas as pd
 import json
 import threading 
@@ -13,6 +12,7 @@ import base64 # For encoding HTML for download
 
 # Supabase imports
 from supabase import create_client, Client
+from kiteconnect import KiteConnect # Moved import to top for consistency
 
 # --- Streamlit Page Configuration ---
 st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
@@ -20,7 +20,7 @@ st.title("Invsion Connect")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
 # --- Global Constants & Session State Initialization ---
-TRADING_DAYS_PER_YEAR = 252 # Reverted to 252, as it's a more commonly accepted general figure for equity markets. Can be adjusted.
+TRADING_DAYS_PER_YEAR = 252 # Commonly accepted general figure for equity markets. Can be adjusted for specific regions.
 DEFAULT_EXCHANGE = "NSE"
 
 # Initialize session state variables if they don't exist
@@ -231,8 +231,10 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
     # Annualized Return (Geometric Mean for stability)
     # Expm1 and Log1p for numerical stability with small returns
     if num_periods > 0 and (1 + daily_returns_decimal > 0).all(): # Ensure values are > -1 to prevent log(negative)
+        # Calculate geometric mean daily return
         geometric_mean_daily_return = np.expm1(np.log1p(daily_returns_decimal).mean())
-        annualized_return = np.expm1((1 + geometric_mean_daily_return) ** TRADING_DAYS_PER_YEAR - 1) * 100
+        # Annualize the geometric mean daily return
+        annualized_return = ((1 + geometric_mean_daily_return) ** TRADING_DAYS_PER_YEAR - 1) * 100
     else:
         annualized_return = 0
 
@@ -246,25 +248,31 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
     # Max Drawdown
     if not cumulative_returns.empty:
         peak = cumulative_returns.expanding(min_periods=1).max()
-        # Ensure peak is not zero to avoid division by zero. If peak is 0, max_drawdown is 0.
-        drawdown = ((cumulative_returns - peak) / peak).replace([np.inf, -np.inf], np.nan).fillna(0) # Handle cases where peak could be 0
+        # Handle division by zero if peak is 0 (occurs if all values are 0 or negative relative to start)
+        # In such cases, drawdown is 0 if no gains were made from which to draw down.
+        drawdown_values = []
+        for i in range(len(cumulative_returns)):
+            if peak.iloc[i] > 0:
+                drawdown_values.append((cumulative_returns.iloc[i] - peak.iloc[i]) / peak.iloc[i])
+            else: # If peak is 0 or negative, assume no meaningful drawdown from positive value.
+                drawdown_values.append(0) # Or np.nan, depending on desired strictness
+
+        drawdown = pd.Series(drawdown_values, index=cumulative_returns.index)
         max_drawdown = drawdown.min() * 100 
     else:
         max_drawdown = 0
 
     # Sortino Ratio
-    negative_returns_decimal = daily_returns_decimal[daily_returns_decimal < 0]
-    # downside_std_dev = negative_returns_decimal.std() # Original, calculating volatility of negative returns
-    # A more precise definition often uses target return, and only considers deviations below a MAR (Minimum Acceptable Return).
-    # For simplicity, assuming MAR = risk_free_rate for now.
-    
     # Calculate downside deviation relative to risk-free rate
+    # Only consider returns below the risk-free rate for downside deviation
     downside_returns = daily_returns_decimal[daily_returns_decimal < risk_free_rate_decimal]
-    downside_std_dev = downside_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) # Annualized downside deviation
+    
+    downside_std_dev_daily = downside_returns.std()
+    annualized_downside_std_dev = downside_std_dev_daily * np.sqrt(TRADING_DAYS_PER_YEAR) if not np.isnan(downside_std_dev_daily) else np.nan
 
-    sortino_ratio = (annualized_return / 100 - risk_free_rate_decimal) / (downside_std_dev) if downside_std_dev != 0 and not np.isnan(downside_std_dev) else np.nan
+    sortino_ratio = (annualized_return / 100 - risk_free_rate_decimal) / (annualized_downside_std_dev) if annualized_downside_std_dev != 0 and not np.isnan(annualized_downside_std_dev) else np.nan
 
-    # Round results for display
+    # Round results for display and consistency
     return {
         "Total Return (%)": round(total_return, 4),
         "Annualized Return (%)": round(annualized_return, 4),
@@ -1242,7 +1250,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
         st.markdown("---")
         st.subheader("5. Generate and Download Consolidated Factsheet")
-        st.info("The factsheet will include constituents, current live value, historical performance, comparison charts data, and performance metrics for the last calculated comparison.")
+        st.info("This will generate a factsheet. If a new index is calculated or a single saved index is selected, it will create a detailed report for that index. Otherwise, it will generate a comparison-only factsheet if comparison data is available.")
         
         # --- Factsheet data preparation logic ---
         factsheet_constituents_df_final = pd.DataFrame()
@@ -1336,11 +1344,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         index_name=factsheet_index_name_final
                     )
                     st.session_state["last_facts_data"] = factsheet_csv_content.encode('utf-8')
-                    # This download button will be shown dynamically after content is ready
-                    # It's crucial for Streamlit that the button data is ready *before* it's rendered in the page for the first time
-                    # To avoid issues, we'll store the data and provide the button immediately.
-                    # This part is a bit tricky with how Streamlit manages button states and reruns.
-                    # A common pattern is to have the download button always present, but only enabled/useful when data is ready.
                     st.download_button(
                         label="Download CSV Factsheet",
                         data=st.session_state["last_facts_data"],
@@ -1379,52 +1382,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 else:
                     st.warning("No data available to generate a factsheet. Please calculate a new index, load a saved index, or run a comparison first.")
 
-
-        # --- Conditional download button for comparison only if no specific index is selected ---
-        if factsheet_constituents_df_final.empty and not last_comparison_df.empty:
-            st.info("No specific index is currently selected for a detailed factsheet, but you can download a comparison-only factsheet.")
-            # This separate download button now provides the HTML/PDF for comparison only
-            col_comp_html_dl, col_comp_csv_dl = st.columns(2)
-            with col_comp_html_dl:
-                if st.button("Download Comparison Factsheet (HTML/PDF)", key="factsheet_download_button_comparison_only_html_visible"):
-                    factsheet_html_content_comp_only = generate_factsheet_html_content(
-                        current_calculated_index_data=pd.DataFrame(), # No specific index data
-                        current_calculated_index_history=pd.DataFrame(), # No specific index history (for chart)
-                        last_comparison_df=last_comparison_df,
-                        last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
-                        current_live_value=0.0, # N/A for generic comparison
-                        index_name="Comparison Report"
-                    )
-                    st.session_state["last_factsheet_html_data"] = factsheet_html_content_comp_only.encode('utf-8')
-                    st.download_button(
-                        label="Download Comparison HTML Factsheet",
-                        data=st.session_state["last_factsheet_html_data"],
-                        file_name=f"InvsionConnect_ComparisonFactsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
-                        mime="text/html",
-                        key="factsheet_download_button_comparison_only_final_html",
-                        help="Includes charts for performance comparison only. Open in browser to Print to PDF."
-                    )
-                    st.success("Comparison HTML factsheet generated and ready for download! (Open in browser, then 'Print to PDF')")
-            with col_comp_csv_dl: # Also provide CSV option for comparison only
-                if st.button("Download Comparison Factsheet (CSV Only)", key="factsheet_download_button_comparison_only_csv_visible"):
-                    factsheet_csv_content_comp_only = generate_factsheet_csv_content(
-                        current_calculated_index_data=pd.DataFrame(), # No specific index data
-                        current_calculated_index_history=pd.DataFrame(), # No specific index history
-                        last_comparison_df=last_comparison_df,
-                        last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
-                        current_live_value=0.0, # N/A for generic comparison
-                        index_name="Comparison Report"
-                    )
-                    st.session_state["last_facts_data"] = factsheet_csv_content_comp_only.encode('utf-8')
-                    st.download_button(
-                        label="Download Comparison CSV Factsheet",
-                        data=st.session_state["last_facts_data"],
-                        file_name=f"InvsionConnect_ComparisonFactsheet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv",
-                        key="factsheet_download_button_comparison_only_final_csv",
-                        help="Includes comparison data and metrics only."
-                    )
-                    st.success("Comparison CSV factsheet generated and ready for download!")
+        # --- Removed the conditional comparison-only buttons ---
+        # The main download buttons now handle the case where only comparison data is available.
 
         st.markdown("---")
         st.subheader("6. View/Delete Individual Saved Indexes")
