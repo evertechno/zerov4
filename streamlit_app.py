@@ -349,13 +349,14 @@ with st.sidebar:
             st.sidebar.error(f"Failed to generate Kite session: {e}")
 
     if st.session_state["kite_access_token"]:
-        st.success("Kite Authenticated ✅")
+        # Only render the logout button if authenticated
         if st.sidebar.button("Logout from Kite", key="kite_logout_btn"):
             st.session_state["kite_access_token"] = None
             st.session_state["kite_login_response"] = None
             st.session_state["instruments_df"] = pd.DataFrame() # Clear cached instruments
             st.success("Logged out from Kite. Please login again.")
             st.rerun()
+        st.success("Kite Authenticated ✅")
     else:
         st.info("Not authenticated with Kite yet.")
 
@@ -382,6 +383,7 @@ with st.sidebar:
 
     if st.session_state["user_session"]:
         st.success(f"Logged into Supabase as: {st.session_state['user_session'].user.email}")
+        # Only render the logout button if authenticated
         if st.button("Logout from Supabase", key="supabase_logout_btn"):
             try:
                 supabase.auth.sign_out()
@@ -507,7 +509,8 @@ def render_dashboard_tab(kite_client: KiteConnect | None, api_key: str | None, a
 
         if not st.session_state.get("historical_data_NIFTY", pd.DataFrame()).empty:
             nifty_df = st.session_state["historical_data_NIFTY"]
-            fig_nifty = go.Figure(data=[go.Candlestick(x=nifty_df.index, open=nifty_df['open'], high=nifty_df['high'], low=nifty_df['low'], close=nifty_df['close'], name='NIFTY 50')])
+            fig_nifty = go.Figure(data=[go.Candlestick(x=nifty_df.index, open=nifty_df['open'], high=nifty_df['high'], low=nifty_df['low'], close=nifty_df['close'], name='Candlestick'),
+                                         go.Scatter(x=nifty_df.index, y=ta.trend.sma_indicator(nifty_df['close'], window=20), mode='lines', name='SMA 20', line=dict(color='orange'))]) # Added a simple SMA for more visual data
             fig_nifty.update_layout(title_text="NIFTY 50 Last 6 Months", xaxis_rangeslider_visible=False, height=300, template="plotly_white")
             st.plotly_chart(fig_nifty, use_container_width=True)
 
@@ -659,6 +662,7 @@ def generate_factsheet_csv_content(
 # Function to generate factsheet as HTML (without historical time series)
 def generate_factsheet_html_content(
     current_calculated_index_data: pd.DataFrame,
+    current_calculated_index_history: pd.DataFrame, # Pass history to potentially derive chart
     last_comparison_df: pd.DataFrame,
     last_comparison_metrics: dict,
     current_live_value: float,
@@ -672,7 +676,10 @@ def generate_factsheet_html_content(
     <!DOCTYPE html>
     <html>
     <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Invsion Connect Factsheet</title>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
         <style>
             body { font-family: Arial, sans-serif; margin: 20px; background-color: #1a1a1a; color: #e0e0e0; }
             .container { max-width: 900px; margin: auto; padding: 20px; background-color: #2b2b2b; border-radius: 8px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2); }
@@ -684,6 +691,13 @@ def generate_factsheet_html_content(
             .plotly-graph { margin-top: 20px; border: 1px solid #444; border-radius: 5px; overflow: hidden; }
             .info-box { background-color: #334455; border-left: 5px solid #6699cc; padding: 10px; margin-top: 10px; border-radius: 4px; }
             .warning-box { background-color: #554433; border-left: 5px solid #cc9966; padding: 10px; margin-top: 10px; border-radius: 4px; }
+            @media print {
+                body { background-color: #fff; color: #000; }
+                .container { box-shadow: none; border: 1px solid #eee; background-color: #fff; }
+                h1, h2, h3, h4 { color: #000; border-bottom-color: #ccc; }
+                th, td { border-color: #ccc; }
+                .plotly-graph { border: none; }
+            }
         </style>
     </head>
     <body>
@@ -701,11 +715,9 @@ def generate_factsheet_html_content(
     if not current_calculated_index_data.empty:
         const_display_df = current_calculated_index_data.copy()
         
-        # Ensure 'Name' column exists
         if 'Name' not in const_display_df.columns:
-            const_display_df['Name'] = const_display_df['symbol'] # Fallback
+            const_display_df['Name'] = const_display_df['symbol'] 
 
-        # Format numerical columns
         if 'Last Price' in const_display_df.columns:
             const_display_df['Last Price'] = const_display_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
         if 'Weighted Price' in const_display_df.columns:
@@ -717,10 +729,10 @@ def generate_factsheet_html_content(
         fig_pie = go.Figure(data=[go.Pie(labels=const_display_df['Name'], values=const_display_df['Weights'], hole=.3)])
         fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
         html_content_parts.append("<h3>Index Composition</h3>")
-        html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
+        html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs=False)}</div>") # include_plotlyjs=False as it's in header
     else:
-        html_content_parts.append("<p class='warning-box'>No constituent data available.</p>")
-
+        html_content_parts.append("<p class='warning-box'>No constituent data available for this index.</p>")
+    
     # --- Performance Metrics ---
     html_content_parts.append("<h3>Performance Metrics Summary</h3>")
     if last_comparison_metrics:
@@ -745,13 +757,24 @@ def generate_factsheet_html_content(
             template="plotly_dark",
             hovermode="x unified"
         )
-        html_content_parts.append(f"<div class='plotly-graph'>{fig_comparison.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
+        html_content_parts.append(f"<div class='plotly-graph'>{fig_comparison.to_html(full_html=False, include_plotlyjs=False)}</div>") # include_plotlyjs=False
     else:
         html_content_parts.append("<p class='warning-box'>No comparison data available.</p>")
 
+    # --- Optional: Historical Performance Chart for the main index (if applicable and not too large) ---
+    if not current_calculated_index_history.empty and current_calculated_index_history.shape[0] < 730: # Limit for HTML, e.g., 2 years daily data
+        html_content_parts.append("<h3>Index Historical Performance (Normalized to 100)</h3>")
+        fig_hist_index = go.Figure(data=[go.Scatter(x=current_calculated_index_history.index, y=current_calculated_index_history['index_value'], mode='lines', name=index_name)])
+        fig_hist_index.update_layout(title_text=f"{index_name} Historical Performance", template="plotly_dark", height=400)
+        html_content_parts.append(f"<div class='plotly-graph'>{fig_hist_index.to_html(full_html=False, include_plotlyjs=False)}</div>")
+    elif not current_calculated_index_history.empty:
+        html_content_parts.append(f"<p class='info-box'>Historical performance chart for {index_name} is too large for the HTML factsheet. Please refer to the CSV download.</p>")
+
+
     html_content_parts.append("""
         <div class="info-box">
-            <p><strong>Note:</strong> Raw historical time series data is excluded from this HTML/PDF factsheet due to its large size. Please download the CSV factsheet for full historical data.</p>
+            <p><strong>Note:</strong> Raw historical time series data (tables) is intentionally excluded from this HTML/PDF factsheet to keep it concise and visually focused. For the full historical data, please download the CSV factsheet.</p>
+            <p>To convert this HTML file to PDF, open it in your web browser (e.g., Chrome, Firefox) and use the browser's "Print" function. Then select "Save as PDF" from the printer options.</p>
         </div>
         </div>
     </body>
@@ -781,13 +804,14 @@ with st.sidebar:
             st.sidebar.error(f"Failed to generate Kite session: {e}")
 
     if st.session_state["kite_access_token"]:
-        st.success("Kite Authenticated ✅")
+        # Only render the logout button if authenticated
         if st.sidebar.button("Logout from Kite", key="kite_logout_btn"):
             st.session_state["kite_access_token"] = None
             st.session_state["kite_login_response"] = None
             st.session_state["instruments_df"] = pd.DataFrame() # Clear cached instruments
             st.success("Logged out from Kite. Please login again.")
             st.rerun()
+        st.success("Kite Authenticated ✅")
     else:
         st.info("Not authenticated with Kite yet.")
 
@@ -814,6 +838,7 @@ with st.sidebar:
 
     if st.session_state["user_session"]:
         st.success(f"Logged into Supabase as: {st.session_state['user_session'].user.email}")
+        # Only render the logout button if authenticated
         if st.button("Logout from Supabase", key="supabase_logout_btn"):
             try:
                 supabase.auth.sign_out()
@@ -939,7 +964,464 @@ def render_dashboard_tab(kite_client: KiteConnect | None, api_key: str | None, a
 
         if not st.session_state.get("historical_data_NIFTY", pd.DataFrame()).empty:
             nifty_df = st.session_state["historical_data_NIFTY"]
-            fig_nifty = go.Figure(data=[go.Candlestick(x=nifty_df.index, open=nifty_df['open'], high=nifty_df['high'], low=nifty_df['low'], close=nifty_df['close'], name='NIFTY 50')])
+            fig_nifty = go.Figure(data=[go.Candlestick(x=nifty_df.index, open=nifty_df['open'], high=nifty_df['high'], low=nifty_df['low'], close=nifty_df['close'], name='Candlestick'),
+                                         go.Scatter(x=nifty_df.index, y=ta.trend.sma_indicator(nifty_df['close'], window=20), mode='lines', name='SMA 20', line=dict(color='orange'))]) # Added a simple SMA for more visual data
+            fig_nifty.update_layout(title_text="NIFTY 50 Last 6 Months", xaxis_rangeslider_visible=False, height=300, template="plotly_white")
+            st.plotly_chart(fig_nifty, use_container_width=True)
+
+    with col3:
+        st.subheader("Quick Performance")
+        if st.session_state.get("last_fetched_symbol") and not st.session_state.get("historical_data", pd.DataFrame()).empty:
+            last_symbol = st.session_state["last_fetched_symbol"]
+            returns = st.session_state["historical_data"]["close"].pct_change().dropna() * 100
+            if not returns.empty:
+                perf = calculate_performance_metrics(returns)
+                st.write(f"**{last_symbol}** (Last Fetched)")
+                st.metric("Total Return", f"{perf.get('Total Return (%)', 0):.2f}%")
+                st.metric("Annualized Volatility", f"{perf.get('Annualized Volatility (%)', 0):.2f}%")
+                st.metric("Sharpe Ratio", f"{perf.get('Sharpe Ratio', 0):.2f}")
+            else:
+                st.info("No sufficient historical data for quick performance calculation.")
+        else:
+            st.info("Fetch some historical data in 'Market & Historical' tab to see quick performance here.")
+
+
+def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
+    st.header("Market Data & Historical Candles")
+    if not kite_client:
+        st.info("Login first to fetch market data.")
+        return
+    if not api_key or not access_token: # Additional check for cached functions
+        st.info("Kite authentication details required for cached data access.")
+        return
+
+    st.subheader("Current Market Data Snapshot")
+    col_market_quote1, col_market_quote2 = st.columns([1, 2])
+    with col_market_quote1:
+        q_exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO"], key="market_exchange_tab")
+        q_symbol = st.text_input("Tradingsymbol", value="NIFTY 50", key="market_symbol_tab") # Default to NIFTY 50 for quick demo
+        if st.button("Get Market Data", key="get_market_data_btn"):
+            ltp_data = get_ltp_price_cached(api_key, access_token, q_symbol, q_exchange) # Use cached LTP
+            if ltp_data and "_error" not in ltp_data:
+                st.session_state["current_market_data"] = ltp_data
+                st.success(f"Fetched LTP for {q_symbol}.")
+            else:
+                st.error(f"Market data fetch failed for {q_symbol}: {ltp_data.get('_error', 'Unknown error')}")
+    with col_market_quote2:
+        if st.session_state.get("current_market_data"):
+            st.markdown("##### Latest Quote Details")
+            st.json(st.session_state["current_market_data"])
+        else:
+            st.info("Market data will appear here.")
+
+    st.markdown("---")
+    st.subheader("Historical Price Data")
+    with st.expander("Load Instruments for Symbol Lookup (Recommended)"):
+        exchange_for_lookup = st.selectbox("Exchange to load instruments", ["NSE", "BSE", "NFO"], key="hist_inst_load_exchange_selector")
+        if st.button("Load Instruments into Cache", key="load_inst_cache_btn"):
+            df_instruments = load_instruments_cached(api_key, access_token, exchange_for_lookup) # Use cached instruments
+            if not df_instruments.empty and "_error" not in df_instruments.columns:
+                st.session_state["instruments_df"] = df_instruments
+                st.success(f"Loaded {len(df_instruments)} instruments.")
+            else:
+                st.error(f"Failed to load instruments: {df_instruments.get('_error', 'Unknown error')}")
+
+
+    col_hist_controls, col_hist_plot = st.columns([1, 2])
+    with col_hist_controls:
+        hist_exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO"], key="hist_ex_tab_selector")
+        hist_symbol = st.text_input("Tradingsymbol", value="NIFTY 50", key="hist_sym_tab_input") # Default to NIFTY 50 for quick demo
+        from_date = st.date_input("From Date", value=datetime.now().date() - timedelta(days=90), key="from_dt_tab_input")
+        to_date = st.date_input("To Date", value=datetime.now().date(), key="to_dt_tab_input")
+        interval = st.selectbox("Interval", ["minute", "5minute", "30minute", "day", "week", "month"], index=3, key="hist_interval_selector")
+
+        if st.button("Fetch Historical Data", key="fetch_historical_data_btn"):
+            with st.spinner(f"Fetching {interval} historical data for {hist_symbol}..."):
+                df_hist = get_historical_data_cached(api_key, access_token, hist_symbol, from_date, to_date, interval, hist_exchange) # Use cached historical
+                if isinstance(df_hist, pd.DataFrame) and "_error" not in df_hist.columns:
+                    st.session_state["historical_data"] = df_hist
+                    st.session_state["last_fetched_symbol"] = hist_symbol
+                    st.success(f"Fetched {len(df_hist)} records for {hist_symbol}.")
+                else:
+                    st.error(f"Historical fetch failed: {df_hist.get('_error', 'Unknown error')}")
+
+    with col_hist_plot:
+        if not st.session_state.get("historical_data", pd.DataFrame()).empty:
+            df = st.session_state["historical_data"]
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+            fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Candlestick'), row=1, col=1)
+            fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='Volume', marker_color='blue'), row=2, col=1)
+            fig.update_layout(title_text=f"Historical Price & Volume for {st.session_state['last_fetched_symbol']}", xaxis_rangeslider_visible=False, height=600, template="plotly_white")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Historical chart will appear here.")
+
+# Function to generate factsheet as multi-section CSV (includes historical data)
+def generate_factsheet_csv_content(
+    current_calculated_index_data: pd.DataFrame,
+    current_calculated_index_history: pd.DataFrame,
+    last_comparison_df: pd.DataFrame,
+    last_comparison_metrics: dict,
+    current_live_value: float,
+    index_name: str = "Custom Index"
+) -> str:
+    """Generates a comprehensive factsheet as a multi-section CSV string, including historical data."""
+    content = []
+    
+    # --- Factsheet Header ---
+    content.append(f"Factsheet for {index_name}\n")
+    content.append(f"Generated On: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    content.append("\n--- Index Overview ---\n")
+    content.append(f"Current Live Calculated Index Value,₹{current_live_value:,.2f}\n")
+    
+    # --- Constituents ---
+    content.append("\n--- Constituents ---\n")
+    if not current_calculated_index_data.empty:
+        const_export_df = current_calculated_index_data.copy()
+        if 'Last Price' not in const_export_df.columns:
+            const_export_df['Last Price'] = np.nan
+        if 'Weighted Price' not in const_export_df.columns:
+            const_export_df['Weighted Price'] = np.nan
+        
+        const_export_df['Last Price'] = const_export_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+        const_export_df['Weighted Price'] = const_export_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+        
+        content.append(const_export_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False))
+    else:
+        content.append("No constituent data available.\n")
+
+    # --- Historical Performance (CSV ONLY) ---
+    content.append("\n--- Historical Performance (Normalized to 100) ---\n")
+    if not current_calculated_index_history.empty:
+        content.append(current_calculated_index_history.to_csv())
+    else:
+        content.append("No historical performance data available.\n")
+
+    # --- Performance Metrics ---
+    content.append("\n--- Performance Metrics ---\n")
+    if last_comparison_metrics:
+        metrics_df = pd.DataFrame(last_comparison_metrics).T
+        content.append(metrics_df.to_csv())
+    else:
+        content.append("No performance metrics available (run a comparison first).\n")
+
+    # --- Comparison Data ---
+    content.append("\n--- Comparison Data (Normalized to 100) ---\n")
+    if not last_comparison_df.empty:
+        content.append(last_comparison_df.to_csv())
+    else:
+        content.append("No comparison data available.\n")
+
+    return "".join(content)
+
+# Function to generate factsheet as HTML (without historical time series)
+def generate_factsheet_html_content(
+    current_calculated_index_data: pd.DataFrame,
+    current_calculated_index_history: pd.DataFrame, # Pass history to potentially derive chart
+    last_comparison_df: pd.DataFrame,
+    last_comparison_metrics: dict,
+    current_live_value: float,
+    index_name: str = "Custom Index"
+) -> str:
+    """Generates a comprehensive factsheet as an HTML string, including visualizations but NOT raw historical data."""
+    html_content_parts = []
+
+    # Basic HTML structure and styling
+    html_content_parts.append("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Invsion Connect Factsheet</title>
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; background-color: #1a1a1a; color: #e0e0e0; }
+            .container { max-width: 900px; margin: auto; padding: 20px; background-color: #2b2b2b; border-radius: 8px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2); }
+            h1, h2, h3, h4 { color: #f0f0f0; border-bottom: 2px solid #444; padding-bottom: 5px; margin-top: 20px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+            th, td { border: 1px solid #444; padding: 8px; text-align: left; }
+            th { background-color: #3a3a3a; }
+            .metric { font-size: 1.1em; margin-bottom: 5px; }
+            .plotly-graph { margin-top: 20px; border: 1px solid #444; border-radius: 5px; overflow: hidden; }
+            .info-box { background-color: #334455; border-left: 5px solid #6699cc; padding: 10px; margin-top: 10px; border-radius: 4px; }
+            .warning-box { background-color: #554433; border-left: 5px solid #cc9966; padding: 10px; margin-top: 10px; border-radius: 4px; }
+            @media print {
+                body { background-color: #fff; color: #000; }
+                .container { box-shadow: none; border: 1px solid #eee; background-color: #fff; }
+                h1, h2, h3, h4 { color: #000; border-bottom-color: #ccc; }
+                th, td { border-color: #ccc; }
+                .plotly-graph { border: none; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+    """)
+
+    # --- Factsheet Header ---
+    html_content_parts.append(f"<h1>Invsion Connect Factsheet: {index_name}</h1>")
+    html_content_parts.append(f"<p><strong>Generated On:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
+    html_content_parts.append("<h2>Index Overview</h2>")
+    html_content_parts.append(f"<p class='metric'><strong>Current Live Calculated Index Value:</strong> ₹{current_live_value:,.2f}</p>")
+
+    # --- Constituents ---
+    html_content_parts.append("<h3>Constituents</h3>")
+    if not current_calculated_index_data.empty:
+        const_display_df = current_calculated_index_data.copy()
+        
+        if 'Name' not in const_display_df.columns:
+            const_display_df['Name'] = const_display_df['symbol'] 
+
+        if 'Last Price' in const_display_df.columns:
+            const_display_df['Last Price'] = const_display_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+        if 'Weighted Price' in const_display_df.columns:
+            const_display_df['Weighted Price'] = const_display_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+        
+        html_content_parts.append(const_display_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_html(index=False, classes='table'))
+
+        # Index Composition Pie Chart
+        fig_pie = go.Figure(data=[go.Pie(labels=const_display_df['Name'], values=const_display_df['Weights'], hole=.3)])
+        fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
+        html_content_parts.append("<h3>Index Composition</h3>")
+        html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs=False)}</div>") # include_plotlyjs=False as it's in header
+    else:
+        html_content_parts.append("<p class='warning-box'>No constituent data available for this index.</p>")
+    
+    # --- Performance Metrics ---
+    html_content_parts.append("<h3>Performance Metrics Summary</h3>")
+    if last_comparison_metrics:
+        metrics_df = pd.DataFrame(last_comparison_metrics).T
+        metrics_html = metrics_df.style.format("{:.2f}").to_html(classes='table')
+        html_content_parts.append(metrics_html)
+    else:
+        html_content_parts.append("<p class='warning-box'>No performance metrics available (run a comparison first).</p>")
+
+    # --- Comparison Data (Chart Only) ---
+    html_content_parts.append("<h3>Cumulative Performance Comparison (Normalized to 100)</h3>")
+    if not last_comparison_df.empty:
+        fig_comparison = go.Figure()
+        for col in last_comparison_df.columns:
+            fig_comparison.add_trace(go.Scatter(x=last_comparison_df.index, y=last_comparison_df[col], mode='lines', name=col))
+        
+        fig_comparison.update_layout(
+            title_text="Multi-Index & Benchmark Performance",
+            xaxis_title="Date",
+            yaxis_title="Normalized Value (Base 100)",
+            height=600,
+            template="plotly_dark",
+            hovermode="x unified"
+        )
+        html_content_parts.append(f"<div class='plotly-graph'>{fig_comparison.to_html(full_html=False, include_plotlyjs=False)}</div>") # include_plotlyjs=False
+    else:
+        html_content_parts.append("<p class='warning-box'>No comparison data available.</p>")
+
+    # --- Optional: Historical Performance Chart for the main index (if applicable and not too large) ---
+    if not current_calculated_index_history.empty and current_calculated_index_history.shape[0] < 730: # Limit for HTML, e.g., 2 years daily data
+        html_content_parts.append("<h3>Index Historical Performance (Normalized to 100)</h3>")
+        fig_hist_index = go.Figure(data=[go.Scatter(x=current_calculated_index_history.index, y=current_calculated_index_history['index_value'], mode='lines', name=index_name)])
+        fig_hist_index.update_layout(title_text=f"{index_name} Historical Performance", template="plotly_dark", height=400)
+        html_content_parts.append(f"<div class='plotly-graph'>{fig_hist_index.to_html(full_html=False, include_plotlyjs=False)}</div>")
+    elif not current_calculated_index_history.empty:
+        html_content_parts.append(f"<p class='info-box'>Historical performance chart for {index_name} is too large for the HTML factsheet. Please refer to the CSV download.</p>")
+
+
+    html_content_parts.append("""
+        <div class="info-box">
+            <p><strong>Note:</strong> Raw historical time series data (tables) is intentionally excluded from this HTML/PDF factsheet to keep it concise and visually focused. For the full historical data, please download the CSV factsheet.</p>
+            <p>To convert this HTML file to PDF, open it in your web browser (e.g., Chrome, Firefox) and use the browser's "Print" function. Then select "Save as PDF" from the printer options.</p>
+        </div>
+        </div>
+    </body>
+    </html>
+    """)
+    return "".join(html_content_parts)
+
+
+# --- Sidebar: Kite Login ---
+with st.sidebar:
+    st.markdown("### 1. Login to Kite Connect")
+    st.write("Click to open Kite login. You'll be redirected back with a `request_token`.")
+    st.markdown(f"[🔗 Open Kite login]({login_url})")
+
+    # Handle request_token from URL
+    request_token_param = st.query_params.get("request_token")
+    if request_token_param and not st.session_state["kite_access_token"]:
+        st.info("Received request_token — exchanging for access token...")
+        try:
+            data = kite_unauth_client.generate_session(request_token_param, api_secret=KITE_CREDENTIALS["api_secret"])
+            st.session_state["kite_access_token"] = data.get("access_token")
+            st.session_state["kite_login_response"] = data
+            st.sidebar.success("Kite Access token obtained.")
+            st.query_params.clear() # Clear request_token from URL
+            st.rerun() # Rerun to refresh UI
+        except Exception as e:
+            st.sidebar.error(f"Failed to generate Kite session: {e}")
+
+    if st.session_state["kite_access_token"]:
+        # Only render the logout button if authenticated
+        # Using a more unique key based on session state to avoid conflicts on reruns
+        if st.sidebar.button("Logout from Kite", key=f"kite_logout_btn_{st.session_state['kite_access_token'][:5]}"):
+            st.session_state["kite_access_token"] = None
+            st.session_state["kite_login_response"] = None
+            st.session_state["instruments_df"] = pd.DataFrame() # Clear cached instruments
+            st.success("Logged out from Kite. Please login again.")
+            st.rerun()
+        st.success("Kite Authenticated ✅")
+    else:
+        st.info("Not authenticated with Kite yet.")
+
+
+# --- Sidebar: Supabase Authentication ---
+with st.sidebar:
+    st.markdown("### 2. Supabase User Account")
+    
+    # Check/refresh Supabase session
+    def _refresh_supabase_session():
+        try:
+            session_data = supabase.auth.get_session()
+            if session_data and session_data.user:
+                st.session_state["user_session"] = session_data
+                st.session_state["user_id"] = session_data.user.id
+            else:
+                st.session_state["user_session"] = None
+                st.session_state["user_id"] = None
+        except Exception:
+            st.session_state["user_session"] = None
+            st.session_state["user_id"] = None
+
+    _refresh_supabase_session()
+
+    if st.session_state["user_session"]:
+        st.success(f"Logged into Supabase as: {st.session_state['user_session'].user.email}")
+        # Only render the logout button if authenticated
+        if st.button("Logout from Supabase", key=f"supabase_logout_btn_{st.session_state['user_id']}"): # Dynamic key
+            try:
+                supabase.auth.sign_out()
+                _refresh_supabase_session() # Update session state immediately
+                st.sidebar.success("Logged out from Supabase.")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Error logging out: {e}")
+    else:
+        with st.form("supabase_auth_form"):
+            st.markdown("##### Email/Password Login/Sign Up")
+            email = st.text_input("Email", key="supabase_email_input", help="Your email for Supabase authentication.")
+            password = st.text_input("Password", type="password", key="supabase_password_input", help="Your password for Supabase authentication.")
+            
+            col_auth1, col_auth2 = st.columns(2)
+            with col_auth1:
+                login_submitted = st.form_submit_button("Login")
+            with col_auth2:
+                signup_submitted = st.form_submit_button("Sign Up")
+
+            if login_submitted:
+                if email and password:
+                    try:
+                        with st.spinner("Logging in..."):
+                            response = supabase.auth.sign_in_with_password({"email": email, "password": password})
+                        _refresh_supabase_session()
+                        st.success("Login successful! Welcome.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Login failed: {e}")
+                else:
+                    st.warning("Please enter both email and password for login.")
+            
+            if signup_submitted:
+                if email and password:
+                    try:
+                        with st.spinner("Signing up..."):
+                            response = supabase.auth.sign_up({"email": email, "password": password})
+                        _refresh_supabase_session()
+                        st.success("Sign up successful! Please check your email to confirm your account.")
+                        st.info("After confirming your email, you can log in.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Sign up failed: {e}")
+                else:
+                    st.warning("Please enter both email and password for sign up.")
+
+    st.markdown("---")
+    st.markdown("### 3. Quick Data Access (Kite)")
+    if st.session_state["kite_access_token"]:
+        current_k_client_for_sidebar = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
+
+        if st.button("Fetch Current Holdings", key="sidebar_fetch_holdings_btn"):
+            try:
+                holdings = current_k_client_for_sidebar.holdings() # Direct call
+                st.session_state["holdings_data"] = pd.DataFrame(holdings)
+                st.success(f"Fetched {len(holdings)} holdings.")
+            except Exception as e:
+                st.error(f"Error fetching holdings: {e}")
+        if st.session_state.get("holdings_data") is not None and not st.session_state["holdings_data"].empty:
+            with st.expander("Show Holdings"):
+                st.dataframe(st.session_state["holdings_data"])
+    else:
+        st.info("Login to Kite to access quick data.")
+
+
+# --- Authenticated KiteConnect client (used by main tabs) ---
+k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
+
+
+# --- Main UI - Tabs for modules ---
+tabs = st.tabs(["Dashboard", "Market & Historical", "Custom Index"])
+tab_dashboard, tab_market, tab_custom_index = tabs
+
+# --- Tab Logic Functions ---
+
+def render_dashboard_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
+    st.header("Personalized Dashboard")
+    st.write("Welcome to your advanced financial analysis dashboard.")
+
+    if not kite_client:
+        st.info("Please login to Kite Connect to view your personalized dashboard.")
+        return
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.subheader("Account Summary")
+        try:
+            profile = kite_client.profile() # Direct call, not cached
+            margins = kite_client.margins() # Direct call, not cached
+            st.metric("Account Holder", profile.get("user_name", "N/A"))
+            st.metric("Available Equity Margin", f"₹{margins.get('equity', {}).get('available', {}).get('live_balance', 0):,.2f}")
+            st.metric("Available Commodity Margin", f"₹{margins.get('commodity', {}).get('available', {}).get('live_balance', 0):,.2f}")
+        except Exception as e:
+            st.warning(f"Could not fetch full account summary: {e}")
+
+    with col2:
+        st.subheader("Market Insight (NIFTY 50)")
+        if api_key and access_token:
+            nifty_ltp_data = get_ltp_price_cached(api_key, access_token, "NIFTY 50", DEFAULT_EXCHANGE) # Use cached LTP
+            if nifty_ltp_data and "_error" not in nifty_ltp_data:
+                nifty_ltp = nifty_ltp_data.get("last_price", 0.0)
+                nifty_change = nifty_ltp_data.get("change", 0.0)
+                st.metric("NIFTY 50 (LTP)", f"₹{nifty_ltp:,.2f}", delta=f"{nifty_change:.2f}%")
+            else:
+                st.warning(f"Could not fetch NIFTY 50 LTP: {nifty_ltp_data.get('_error', 'Unknown error')}")
+        else:
+            st.info("Kite not authenticated to fetch NIFTY 50 LTP.")
+
+        if st.session_state.get("historical_data_NIFTY", pd.DataFrame()).empty:
+            if st.button("Load NIFTY 50 Historical for Chart", key="dashboard_load_nifty_hist_btn"):
+                if api_key and access_token:
+                    with st.spinner("Fetching NIFTY 50 historical data..."):
+                        nifty_df = get_historical_data_cached(api_key, access_token, "NIFTY 50", datetime.now().date() - timedelta(days=180), datetime.now().date(), "day", DEFAULT_EXCHANGE)
+                        if isinstance(nifty_df, pd.DataFrame) and "_error" not in nifty_df.columns:
+                            st.session_state["historical_data_NIFTY"] = nifty_df
+                            st.success("NIFTY 50 historical data loaded.")
+                        else:
+                            st.error(f"Error fetching NIFTY 50 historical: {nifty_df.get('_error', 'Unknown error')}")
+                else:
+                    st.warning("Kite not authenticated to fetch historical data.")
+
+        if not st.session_state.get("historical_data_NIFTY", pd.DataFrame()).empty:
+            nifty_df = st.session_state["historical_data_NIFTY"]
+            fig_nifty = go.Figure(data=[go.Candlestick(x=nifty_df.index, open=nifty_df['open'], high=nifty_df['high'], low=nifty_df['low'], close=nifty_df['close'], name='Candlestick'),
+                                         go.Scatter(x=nifty_df.index, y=ta.trend.sma_indicator(nifty_df['close'], window=20), mode='lines', name='SMA 20', line=dict(color='orange'))]) # Added a simple SMA for more visual data
             fig_nifty.update_layout(title_text="NIFTY 50 Last 6 Months", xaxis_rangeslider_visible=False, height=300, template="plotly_white")
             st.plotly_chart(fig_nifty, use_container_width=True)
 
@@ -1585,6 +2067,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 if not factsheet_constituents_df_final.empty or not last_comparison_df.empty:
                     factsheet_html_content = generate_factsheet_html_content(
                         current_calculated_index_data=factsheet_constituents_df_final,
+                        current_calculated_index_history=factsheet_history_df_final, # Pass history to potentially show chart
                         last_comparison_df=last_comparison_df,
                         last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
                         current_live_value=current_live_value_for_factsheet_final,
@@ -1614,6 +2097,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 if st.button("Download Comparison Factsheet (HTML/PDF)", key="factsheet_download_button_comparison_only_html_visible"):
                     factsheet_html_content_comp_only = generate_factsheet_html_content(
                         current_calculated_index_data=pd.DataFrame(), # No specific index data
+                        current_calculated_index_history=pd.DataFrame(), # No specific index history (for chart)
                         last_comparison_df=last_comparison_df,
                         last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
                         current_live_value=0.0, # N/A for generic comparison
