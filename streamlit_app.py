@@ -14,7 +14,7 @@ import ta  # Technical Analysis library
 from supabase import create_client, Client
 
 # --- Streamlit Page Configuration ---
-st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded") # CORRECTED LINE
+st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
 st.title("Invsion Connect")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
@@ -618,11 +618,6 @@ def generate_factsheet_content(
     if not current_calculated_index_data.empty: # .empty is safe here
         # Prepare constituents for export, including live prices if available
         const_export_df = current_calculated_index_data.copy()
-        # Add 'Last Price' and 'Weighted Price' columns if they exist and are populated
-        # This part depends on how 'current_calculated_index_data' is populated when passed.
-        # It's safer to ensure these columns exist *before* mapping or applying format.
-        # For the factsheet, we need to ensure the `current_live_value_factsheet` logic
-        # populates these correctly or passes a DataFrame that already has them.
         
         # To avoid issues, let's ensure these columns are added before formatting,
         # even if they are filled with NaN, and then format them.
@@ -866,8 +861,12 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
     # --- After calculation for a new index ---
     # Retrieve current_calculated_index_data and history, ensuring they are DataFrames
-    current_calculated_index_data_df = st.session_state.get("current_calculated_index_data", pd.DataFrame())
-    current_calculated_index_history_df = st.session_state.get("current_calculated_index_history", pd.DataFrame())
+    # Use explicit type checking or a helper to ensure it's a DataFrame
+    current_calculated_index_data_raw = st.session_state.get("current_calculated_index_data")
+    current_calculated_index_data_df = pd.DataFrame() if current_calculated_index_data_raw is None else current_calculated_index_data_raw
+
+    current_calculated_index_history_raw = st.session_state.get("current_calculated_index_history")
+    current_calculated_index_history_df = pd.DataFrame() if current_calculated_index_history_raw is None else current_calculated_index_history_raw
 
     if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
         
@@ -1101,9 +1100,9 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         current_live_value_for_factsheet = 0.0
 
         # Preference: If a new index was just calculated, use that data
-        if st.session_state.get("current_calculated_index_data") is not None and not st.session_state["current_calculated_index_data"].empty:
-            factsheet_constituents_df = st.session_state["current_calculated_index_data"].copy()
-            factsheet_history_df = st.session_state.get("current_calculated_index_history", pd.DataFrame())
+        if not current_calculated_index_data_df.empty: # Use the local df variable
+            factsheet_constituents_df = current_calculated_index_data_df.copy()
+            factsheet_history_df = current_calculated_index_history_df.copy() # Use the local df variable
             factsheet_index_name = "Newly Calculated Index" 
             
             # Recalculate live value for the newly calculated index's constituents for the factsheet
@@ -1137,7 +1136,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         # To make it accessible, we would need to store `selected_db_index_data` in session state or recalculate.
         # For simplicity in this fix, we'll ensure factsheet_constituents_df is handled gracefully.
 
-        # If a new index has been calculated or a saved one explicitly selected for display:
         if st.button("Generate & Download Factsheet", key="generate_download_factsheet_btn"):
             
             # Re-evaluating factsheet_constituents_df and current_live_value_for_factsheet
@@ -1152,7 +1150,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             # Let's encapsulate that for the factsheet generation if `current_calculated_index_data` is available.
             
             # If `current_calculated_index_data` is available, this is likely what the user wants a factsheet for.
-            if not current_calculated_index_data_df.empty:
+            if not current_calculated_index_data_df.empty: # Use the locally ensured DataFrame
                 factsheet_constituents_df_final = current_calculated_index_data_df.copy()
                 factsheet_history_df_final = current_calculated_index_history_df.copy()
                 factsheet_index_name_final = "Newly Calculated Index"
