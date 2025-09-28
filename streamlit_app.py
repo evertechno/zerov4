@@ -17,7 +17,7 @@ from kiteconnect import KiteConnect # Moved import to top for consistency
 # --- Streamlit Page Configuration ---
 st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
 st.title("Invsion Connect")
-st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
+st.markdown("Aprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
 # --- Global Constants & Session State Initialization ---
 TRADING_DAYS_PER_YEAR = 252 # Commonly accepted general figure for equity markets. Can be adjusted for specific regions.
@@ -611,9 +611,11 @@ def generate_factsheet_html_content(
     """)
 
     # Index Composition Pie Chart - This should still be conditional on data actually existing
+    # Ensure const_display_df is available if the condition for data existed previously
     if not current_calculated_index_data.empty and current_calculated_index_data['Weights'].sum() > 0:
         html_content_parts.append("<h3>Index Composition</h3>")
-        # Use current_calculated_index_data as it's the one passed to this function
+        # Use current_calculated_index_data as it's the one passed to this function and already formatted
+        # if the 'if' block above was true. For pie chart, original df passed is fine.
         fig_pie = go.Figure(data=[go.Pie(labels=current_calculated_index_data['Name'], values=current_calculated_index_data['Weights'], hole=.3)])
         fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
         # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
@@ -672,7 +674,7 @@ def generate_factsheet_html_content(
             <div class="ai-agent-section">
                 <h3>Embedded AI Agent</h3>
         """)
-        html_content_parts.append(ai_agent_snippet)
+        html_content_parts.append(ai_agent_embed_snippet) # Corrected variable name
         html_content_parts.append("</div>")
 
     html_content_parts.append("""
@@ -918,7 +920,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         hist_df = pd.DataFrame()
         if data_type == "custom_index":
             if constituents_df is None or constituents_df.empty:
-                return pd.DataFrame({"_error": [f"No constituents for custom index {name}."]})
+                return pd.DataFrame({"_error": ["No constituents for custom index {name}."]})
             # Always recalculate for the exact comparison range to ensure consistency
             hist_df = _calculate_historical_index_value(api_key, access_token, constituents_df, comparison_start_date, comparison_end_date, exchange)
             if "_error" in hist_df.columns:
