@@ -109,6 +109,19 @@ def get_authenticated_kite_client(api_key: str | None, access_token: str | None)
         return k_instance
     return None
 
+# Moved _refresh_supabase_session here, outside any `with` block
+def _refresh_supabase_session():
+    try:
+        session_data = supabase.auth.get_session()
+        if session_data and session_data.user:
+            st.session_state["user_session"] = session_data
+            st.session_state["user_id"] = session_data.user.id
+        else:
+            st.session_state["user_session"] = None
+            st.session_state["user_id"] = None
+    except Exception: # Catch any error during session fetching
+        st.session_state["user_session"] = None
+        st.session_state["user_id"] = None
 
 @st.cache_data(ttl=86400, show_spinner="Loading instruments...") # Cache for 24 hours
 def load_instruments_cached(api_key: str, access_token: str, exchange: str = None) -> pd.DataFrame:
@@ -540,7 +553,7 @@ def generate_factsheet_html_content(
         
         # Adjust title based on whether it's a specific index report or a generic comparison
         chart_title = "Multi-Index & Benchmark Performance"
-        if index_name != "Consolidated Report" and index_name != "Comparison Report":
+        if index_name != "Consolidated Report" and index_name != "Comparison Report" and index_name != "Combined Index Constituents Report": # Added "Combined Index Constituents Report"
             chart_title = f"{index_name} vs Benchmarks Performance"
 
         fig_comparison.update_layout(
@@ -559,14 +572,20 @@ def generate_factsheet_html_content(
     # --- Optional: Historical Performance Chart for the main index (if applicable and not too large) ---
     # We will only show this if a SINGLE index is selected for constituents.
     # If multiple are chosen for constituents, it becomes ambiguous.
-    if not factsheet_history_df_final.empty and factsheet_constituents_df_final.shape[0] > 0 and index_name != "Consolidated Report" and index_name != "Combined Index Constituents Report" and factsheet_history_df_final.shape[0] < 730: # Limit for HTML, e.g., 2 years daily data
+    # Updated condition to check for a single selected index in factsheet_selected_constituents_index_names
+    if (len(st.session_state["factsheet_selected_constituents_index_names"]) == 1 and 
+        not factsheet_history_df_final.empty and 
+        factsheet_history_df_final.shape[0] < 730): 
         html_content_parts.append("<h3>Index Historical Performance (Normalized to 100)</h3>")
         fig_hist_index = go.Figure(data=[go.Scatter(x=factsheet_history_df_final.index, y=factsheet_history_df_final['index_value'], mode='lines', name=index_name)])
         fig_hist_index.update_layout(title_text=f"{index_name} Historical Performance", template="plotly_dark", height=400)
         # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
         html_content_parts.append(f"<div class='plotly-graph'>{fig_hist_index.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
-    elif not factsheet_history_df_final.empty and factsheet_constituents_df_final.shape[0] > 0 and index_name != "Consolidated Report" and index_name != "Combined Index Constituents Report":
+    elif not factsheet_history_df_final.empty and len(st.session_state["factsheet_selected_constituents_index_names"]) == 1:
         html_content_parts.append(f"<p class='info-box'>Historical performance chart for {index_name} is too large for the HTML factsheet. Please refer to the CSV download.</p>")
+    elif len(st.session_state["factsheet_selected_constituents_index_names"]) > 1:
+         html_content_parts.append(f"<p class='info-box'>Historical performance chart for individual index constituents is not shown when multiple indexes are selected for the constituents section. Please refer to the CSV download for full historical data or the comparison chart above.</p>")
+
 
     # --- AI Agent Embed Snippet ---
     if ai_agent_embed_snippet:
@@ -1218,7 +1237,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             
             # Add data for other selected saved indexes
             for index_name in selected_constituents_for_factsheet:
-                if index_name == "Newly Calculated Index": # Already handled
+                if index_name == "Newly Calculated Index": # Already handled if present
                     continue
                 selected_db_index_data = next((idx for idx in saved_indexes if idx['index_name'] == index_name), None)
                 if selected_db_index_data:
