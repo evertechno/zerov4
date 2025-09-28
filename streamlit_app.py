@@ -62,6 +62,8 @@ if "selected_index_to_manage" not in st.session_state: # Added for consistent fa
     st.session_state["selected_index_to_manage"] = "--- Select ---"
 if "displayed_constituents_df" not in st.session_state: # New state for displaying constituents in tab
     st.session_state["displayed_constituents_df"] = pd.DataFrame()
+if "all_comparison_constituents_for_factsheet" not in st.session_state: # New state for constituents in comparison factsheet
+    st.session_state["all_comparison_constituents_for_factsheet"] = []
 
 
 # --- Load Credentials from Streamlit Secrets ---
@@ -450,7 +452,8 @@ def generate_factsheet_csv_content(
     last_comparison_metrics: dict,
     current_live_value: float,
     index_name: str = "Consolidated Report", # Default changed to be more descriptive
-    ai_agent_embed_snippet: str = None # Added for consistency, though won't be in CSV
+    ai_agent_embed_snippet: str = None, # Added for consistency, though won't be in CSV
+    comparison_constituents_list: list[dict] = None # New parameter for comparison report constituents
 ) -> str:
     """Generates a comprehensive factsheet as a multi-section CSV string, including historical data."""
     content = []
@@ -483,8 +486,25 @@ def generate_factsheet_csv_content(
         const_export_df['Weighted Price'] = const_export_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
         
         content.append(const_export_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False))
+    elif index_name == "Comparison Report" and comparison_constituents_list: # For comparison report, list all constituents
+        for idx_constituents_dict in comparison_constituents_list:
+            index_name_for_const = idx_constituents_dict['index_name']
+            const_df = pd.DataFrame(idx_constituents_dict['constituents_data'])
+            
+            content.append(f"\nConstituents for {index_name_for_const}:\n")
+            if 'Name' not in const_df.columns: # Ensure 'Name' for display
+                const_df['Name'] = const_df['symbol']
+            
+            # These columns might not exist if fetched from DB directly without live data processing
+            if 'Last Price' not in const_df.columns: const_df['Last Price'] = np.nan
+            if 'Weighted Price' not in const_df.columns: const_df['Weighted Price'] = np.nan
+
+            const_df['Last Price'] = const_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+            const_df['Weighted Price'] = const_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+
+            content.append(const_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False))
     else:
-        content.append("No constituent data available.\n")
+        content.append("No constituent data available for this report.\n")
 
     # --- Historical Performance (CSV ONLY) ---
     content.append("\n--- Historical Performance (Normalized to 100) ---\n")
@@ -519,7 +539,8 @@ def generate_factsheet_html_content(
     last_comparison_metrics: dict,
     current_live_value: float,
     index_name: str = "Consolidated Report", # Default changed to be more descriptive
-    ai_agent_embed_snippet: str = None # New argument for AI agent snippet
+    ai_agent_embed_snippet: str = None, # New argument for AI agent snippet
+    comparison_constituents_list: list[dict] = None # New parameter for comparison report constituents
 ) -> str:
     """Generates a comprehensive factsheet as an HTML string, including visualizations but NOT raw historical data."""
     html_content_parts = []
@@ -585,7 +606,7 @@ def generate_factsheet_html_content(
             <div style="margin-top: 10px;">
     """)
 
-    if not current_calculated_index_data.empty:
+    if not current_calculated_index_data.empty: # For a single primary index (newly calculated or selected from Section 6)
         const_display_df = current_calculated_index_data.copy()
         
         if 'Name' not in const_display_df.columns:
@@ -602,9 +623,35 @@ def generate_factsheet_html_content(
         const_display_df['Weighted Price'] = const_display_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
         
         html_content_parts.append(const_display_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_html(index=False, classes='table'))
+    elif index_name == "Comparison Report" and comparison_constituents_list: # For a Comparison Report, list all selected custom indexes' constituents
+        html_content_parts.append("<h4>Constituents of Compared Custom Indexes:</h4>")
+        for idx_constituents_dict in comparison_constituents_list:
+            idx_name = idx_constituents_dict['index_name']
+            const_df = pd.DataFrame(idx_constituents_dict['constituents_data'])
+            
+            # Enrich with live data for display within the report, if instruments are loaded
+            if not st.session_state["instruments_df"].empty:
+                enriched_const_df, _ = _get_live_constituent_data(
+                    const_df, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], st.session_state["instruments_df"]
+                )
+            else:
+                enriched_const_df = const_df.copy()
+                enriched_const_df['Last Price'] = np.nan
+                enriched_const_df['Weighted Price'] = np.nan
+                if 'Name' not in enriched_const_df.columns:
+                    enriched_const_df['Name'] = enriched_const_df['symbol']
+
+
+            # Format these columns for display in HTML table
+            enriched_const_df['Last Price'] = enriched_const_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+            enriched_const_df['Weighted Price'] = enriched_const_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+
+            html_content_parts.append(f"<p><strong>{idx_name}</strong></p>")
+            html_content_parts.append(enriched_const_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_html(index=False, classes='table'))
+            html_content_parts.append("<br>") # Add a break between tables
     else:
         # If no data, display the message inside the details tag
-        html_content_parts.append("<p class='warning-box'>No constituent data available for this report (this is expected for comparison-only reports without a primary index, or if constituent data could not be loaded).</p>")
+        html_content_parts.append("<p class='warning-box'>No constituent data available for this report (this is expected for comparison-only reports without selected custom indexes, or if constituent data could not be loaded).</p>")
     
     # Close the <div> and <details> tags
     html_content_parts.append("""
@@ -612,12 +659,9 @@ def generate_factsheet_html_content(
         </details>
     """)
 
-    # Index Composition Pie Chart - This should still be conditional on data actually existing
-    # Ensure const_display_df is available if the condition for data existed previously
-    if not current_calculated_index_data.empty and current_calculated_index_data['Weights'].sum() > 0:
+    # Index Composition Pie Chart - This should only appear for a single primary index report
+    if not current_calculated_index_data.empty and current_calculated_index_data['Weights'].sum() > 0 and index_name != "Comparison Report":
         html_content_parts.append("<h3>Index Composition</h3>")
-        # Use current_calculated_index_data as it's the one passed to this function and already formatted
-        # if the 'if' block above was true. For pie chart, original df passed is fine.
         fig_pie = go.Figure(data=[go.Pie(labels=current_calculated_index_data['Name'], values=current_calculated_index_data['Weights'], hole=.3)])
         fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
         # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
@@ -1174,6 +1218,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             else:
                 all_normalized_data = {}
                 all_performance_metrics = {}
+                # Initialize for comparison constituents
+                st.session_state["all_comparison_constituents_for_factsheet"] = [] 
                 
                 # Load instruments once for all lookups in this tab
                 if st.session_state["instruments_df"].empty:
@@ -1203,6 +1249,12 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                             all_normalized_data[index_name] = normalized_df_result['normalized_value']
                             # Use raw values for performance metrics calculation
                             all_performance_metrics[index_name] = calculate_performance_metrics(normalized_df_result['raw_values'].pct_change().dropna() * 100)
+                            
+                            # Store constituents for this index for the factsheet
+                            st.session_state["all_comparison_constituents_for_factsheet"].append({
+                                'index_name': index_name,
+                                'constituents_data': constituents_df.to_dict(orient='records')
+                            })
                         else:
                             st.error(f"Error processing custom index {index_name}: {normalized_df_result.loc[0, '_error']}")
 
@@ -1272,6 +1324,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         factsheet_history_df_final = pd.DataFrame()
         factsheet_index_name_final = "Consolidated Report" # Default for a general comparison report
         current_live_value_for_factsheet_final = 0.0
+        comparison_constituents_list_for_factsheet = st.session_state["all_comparison_constituents_for_factsheet"]
         
         # Prioritize newly calculated index for the factsheet if available
         if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
@@ -1281,6 +1334,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             )
             factsheet_history_df_final = current_calculated_index_history_df.copy()
             factsheet_index_name_final = "Newly Calculated Index" 
+            # Clear comparison constituents if a single index report is being generated
+            comparison_constituents_list_for_factsheet = []
         
         # If no newly calculated index, but a specific saved index is selected for management (section 6), use that
         elif st.session_state.get('selected_index_to_manage') and st.session_state['selected_index_to_manage'] != "--- Select ---":
@@ -1302,6 +1357,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     factsheet_history_df_final.sort_index(inplace=True)
                 
                 factsheet_index_name_final = selected_db_index_data_for_factsheet['index_name']
+                # Clear comparison constituents if a single index report is being generated
+                comparison_constituents_list_for_factsheet = []
 
         # If neither a new index nor a specific saved index is chosen, but comparison data exists,
         # generate a generic comparison factsheet.
@@ -1323,7 +1380,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
         with col_factsheet_download_options_1:
             if st.button("Generate & Download Factsheet (CSV)", key="generate_download_factsheet_csv_btn"):
-                if not factsheet_constituents_df_final.empty or not last_comparison_df.empty:
+                if not factsheet_constituents_df_final.empty or not last_comparison_df.empty or comparison_constituents_list_for_factsheet:
                     factsheet_csv_content = generate_factsheet_csv_content(
                         current_calculated_index_data=factsheet_constituents_df_final,
                         current_calculated_index_history=factsheet_history_df_final, # Include history in CSV
@@ -1331,7 +1388,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
                         current_live_value=current_live_value_for_factsheet_final,
                         index_name=factsheet_index_name_final,
-                        ai_agent_embed_snippet=None # CSV doesn't support HTML embeds
+                        ai_agent_embed_snippet=None, # CSV doesn't support HTML embeds
+                        comparison_constituents_list=comparison_constituents_list_for_factsheet
                     )
                     st.session_state["last_facts_data"] = factsheet_csv_content.encode('utf-8')
                     st.download_button(
@@ -1348,7 +1406,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
         with col_factsheet_download_options_2:
             if st.button("Generate & Download Factsheet (HTML/PDF)", key="generate_download_factsheet_html_btn"):
-                if not factsheet_constituents_df_final.empty or not last_comparison_df.empty:
+                if not factsheet_constituents_df_final.empty or not last_comparison_df.empty or comparison_constituents_list_for_factsheet:
                     factsheet_html_content = generate_factsheet_html_content(
                         current_calculated_index_data=factsheet_constituents_df_final,
                         current_calculated_index_history=factsheet_history_df_final, # Pass history to potentially show chart
@@ -1356,7 +1414,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
                         current_live_value=current_live_value_for_factsheet_final,
                         index_name=factsheet_index_name_final,
-                        ai_agent_embed_snippet=ai_agent_snippet_input if ai_agent_snippet_input.strip() else None # Pass the user's snippet
+                        ai_agent_embed_snippet=ai_agent_snippet_input if ai_agent_snippet_input.strip() else None, # Pass the user's snippet
+                        comparison_constituents_list=comparison_constituents_list_for_factsheet
                     )
                     st.session_state["last_factsheet_html_data"] = factsheet_html_content.encode('utf-8')
 
@@ -1390,25 +1449,13 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         if selected_index_to_manage != "--- Select ---":
             selected_db_index_data = next((idx for idx in saved_indexes if idx['index_name'] == selected_index_to_manage), None)
             if selected_db_index_data:
-                # Placeholder for displaying constituents of the selected index
-                # We need to load instruments first for accurate name/token mapping
-                if st.session_state["instruments_df"].empty:
-                    st.session_state["instruments_df"] = load_instruments_cached(api_key, access_token, DEFAULT_EXCHANGE)
-                    if "_error" in st.session_state["instruments_df"].columns:
-                         st.error(f"Failed to load instruments for constituent lookup: {st.session_state['instruments_df'].loc[0, '_error']}")
-                         # Cannot proceed with fetching live data if instruments fail
-                         loaded_constituents_df = pd.DataFrame()
-                         current_live_value_for_selected = 0.0
-                    else:
-                        base_constituents_df = pd.DataFrame(selected_db_index_data['constituents'])
-                        loaded_constituents_df, current_live_value_for_selected = _get_live_constituent_data(
-                            base_constituents_df, api_key, access_token, st.session_state["instruments_df"]
-                        )
-                else: # Instruments already loaded
-                    base_constituents_df = pd.DataFrame(selected_db_index_data['constituents'])
-                    loaded_constituents_df, current_live_value_for_selected = _get_live_constituent_data(
-                        base_constituents_df, api_key, access_token, st.session_state["instruments_df"]
-                    )
+                # Initialize loaded_constituents_df_base to an empty DataFrame to prevent NameError
+                loaded_constituents_df_base = pd.DataFrame(selected_db_index_data['constituents'])
+                
+                # Get live data for the selected index for display
+                loaded_constituents_df, current_live_value_for_selected = _get_live_constituent_data(
+                    loaded_constituents_df_base, api_key, access_token, st.session_state["instruments_df"]
+                )
 
                 # Store the loaded and enriched constituents for display in the app UI
                 st.session_state["displayed_constituents_df"] = loaded_constituents_df
@@ -1433,6 +1480,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 if loaded_historical_df.empty:
                     min_date = (datetime.now().date() - timedelta(days=365))
                     max_date = datetime.now().date()
+                    # Ensure loaded_constituents_df_base is properly initialized before this call
                     recalculated_historical_df = _calculate_historical_index_value(api_key, access_token, loaded_constituents_df_base, min_date, max_date, DEFAULT_EXCHANGE)
                     
                     if not recalculated_historical_df.empty and "_error" not in recalculated_historical_df.columns:
