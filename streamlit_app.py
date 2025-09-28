@@ -604,8 +604,8 @@ def generate_factsheet_html_content(
     html_content_parts.append(f"<p><strong>Generated On:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
     html_content_parts.append("<h2>Index Overview</h2>")
     
-    # Check if current_live_value is truly meaningful AND if there's constituent data associated
-    if current_live_value > 0 and not current_calculated_index_data.empty: 
+    # Check if current_live_value is truly meaningful AND if there's constituent data associated for a single primary index
+    if current_live_value > 0 and not current_calculated_index_data.empty and index_name != "Comparison Report": 
         html_content_parts.append(f"<p class='metric'><strong>Current Live Calculated Index Value:</strong> ₹{current_live_value:,.2f}</p>")
     else:
         html_content_parts.append("<p class='warning-box'>Current Live Calculated Index Value: N/A (Constituent data not available or comparison report only)</p>")
@@ -620,7 +620,7 @@ def generate_factsheet_html_content(
             <div style="margin-top: 10px;">
     """)
 
-    if index_name != "Comparison Report" and not current_calculated_index_data.empty: # For a single primary index (newly calculated or selected from Section 6)
+    if index_name != "Comparison Report" and not current_calculated_index_data.empty: # For a single primary index
         const_display_df = current_calculated_index_data.copy()
         
         if 'Name' not in const_display_df.columns:
@@ -1341,33 +1341,28 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         factsheet_index_name_final = "Consolidated Report" # Default for a general comparison report
         current_live_value_for_factsheet_final = 0.0
         
-        # Get the list of constituents for comparison report if available from last run
-        comparison_constituents_list_for_factsheet = st.session_state["all_comparison_constituents_for_factsheet"]
+        # Determine the primary context for the factsheet
+        # This order of if/elif is crucial for prioritization
         
-        # Prioritize newly calculated index for the factsheet if available
+        # Context 1: Newly calculated index (highest priority for detailed report)
         if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
-            # Call helper to get enriched constituents and live value
             factsheet_constituents_df_final, current_live_value_for_factsheet_final = _get_live_constituent_data(
                 current_calculated_index_data_df, api_key, access_token, st.session_state["instruments_df"]
             )
             factsheet_history_df_final = current_calculated_index_history_df.copy()
-            factsheet_index_name_final = "Newly Calculated Index" 
-            # Clear comparison constituents if a single index report is being generated
-            comparison_constituents_list_for_factsheet = [] # Ensure it's not passed if not a comparison report
+            factsheet_index_name_final = "Newly Calculated Index"
+            
+            # For this context, no comparison constituents are relevant for the detailed report
+            comparison_constituents_list_for_factsheet = [] 
         
-        # If no newly calculated index, but a specific saved index is selected for management (section 6), use that
+        # Context 2: A specific saved index selected for management (second highest priority for detailed report)
         elif st.session_state.get('selected_index_to_manage') and st.session_state['selected_index_to_manage'] != "--- Select ---":
-            # Find the data for the selected saved index
             selected_db_index_data_for_factsheet = next((idx for idx in saved_indexes if idx['index_name'] == st.session_state['selected_index_to_manage']), None)
             if selected_db_index_data_for_factsheet:
                 base_constituents_df = pd.DataFrame(selected_db_index_data_for_factsheet['constituents']).copy()
-                
-                # Call helper to get enriched constituents and live value
                 factsheet_constituents_df_final, current_live_value_for_factsheet_final = _get_live_constituent_data(
                     base_constituents_df, api_key, access_token, st.session_state["instruments_df"]
                 )
-                
-                # Load historical performance for the selected saved index
                 factsheet_history_df_final = pd.DataFrame(selected_db_index_data_for_factsheet.get('historical_performance', []))
                 if not factsheet_history_df_final.empty:
                     factsheet_history_df_final['date'] = pd.to_datetime(factsheet_history_df_final['date'])
@@ -1375,17 +1370,19 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     factsheet_history_df_final.sort_index(inplace=True)
                 
                 factsheet_index_name_final = selected_db_index_data_for_factsheet['index_name']
-                # Clear comparison constituents if a single index report is being generated
-                comparison_constituents_list_for_factsheet = [] # Ensure it's not passed if not a comparison report
+                # For this context, no comparison constituents are relevant for the detailed report
+                comparison_constituents_list_for_factsheet = [] 
 
-        # If neither a new index nor a specific saved index is chosen, but comparison data exists,
-        # generate a generic comparison factsheet.
-        # In this case, factsheet_constituents_df_final will remain empty, but comparison_constituents_list_for_factsheet
-        # will contain the necessary data if a comparison was run.
-        if (factsheet_constituents_df_final.empty and factsheet_history_df_final.empty) and not last_comparison_df.empty:
+        # Context 3: A comparison report (lowest priority, relies on previously run comparison)
+        elif not last_comparison_df.empty: # Only if a comparison was run, and no single index report is prioritized
             factsheet_index_name_final = "Comparison Report"
             current_live_value_for_factsheet_final = 0.0 # No single live value for a comparison-only report
-            # comparison_constituents_list_for_factsheet is already set if a comparison was run
+            # The comparison_constituents_list_for_factsheet is already populated from the 'Run Multi-Index' button click
+            comparison_constituents_list_for_factsheet = st.session_state["all_comparison_constituents_for_factsheet"]
+        else: # No data/context for a factsheet
+            factsheet_index_name_final = "Consolidated Report"
+            current_live_value_for_factsheet_final = 0.0
+            comparison_constituents_list_for_factsheet = []
 
 
         # AI Agent Embed Snippet input
@@ -1454,6 +1451,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 else:
                     st.warning("No data available to generate a factsheet. Please calculate a new index, load a saved index, or run a comparison first.")
 
+        # --- Section 6: View/Delete Individual Saved Indexes (MOVED AFTER SECTION 5) ---
         st.markdown("---")
         st.subheader("6. View/Delete Individual Saved Indexes")
         
@@ -1468,7 +1466,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         st.session_state['selected_index_to_manage'] = selected_index_to_manage # Store for factsheet logic
 
         selected_db_index_data = None
-        # Initialize loaded_constituents_df_base here to prevent NameError
+        # Initialize loaded_constituents_df_base to an empty DataFrame to prevent NameError
         loaded_constituents_df_base = pd.DataFrame() 
 
         if selected_index_to_manage != "--- Select ---":
@@ -1477,10 +1475,23 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 loaded_constituents_df_base = pd.DataFrame(selected_db_index_data['constituents'])
                 
                 # Get live data for the selected index for display
-                loaded_constituents_df, current_live_value_for_selected = _get_live_constituent_data(
-                    loaded_constituents_df_base, api_key, access_token, st.session_state["instruments_df"]
-                )
-
+                # We need to load instruments first for accurate name/token mapping
+                if st.session_state["instruments_df"].empty:
+                    with st.spinner("Loading instruments for live price lookup..."):
+                        st.session_state["instruments_df"] = load_instruments_cached(api_key, access_token, DEFAULT_EXCHANGE)
+                        if "_error" in st.session_state["instruments_df"].columns:
+                            st.error(f"Failed to load instruments for constituent lookup: {st.session_state['instruments_df'].loc[0, '_error']}")
+                            loaded_constituents_df = pd.DataFrame() # Ensure it's defined
+                            current_live_value_for_selected = 0.0 # Ensure it's defined
+                        else:
+                            loaded_constituents_df, current_live_value_for_selected = _get_live_constituent_data(
+                                loaded_constituents_df_base, api_key, access_token, st.session_state["instruments_df"]
+                            )
+                else: # Instruments already loaded
+                    loaded_constituents_df, current_live_value_for_selected = _get_live_constituent_data(
+                        loaded_constituents_df_base, api_key, access_token, st.session_state["instruments_df"]
+                    )
+                
                 # Store the loaded and enriched constituents for display in the app UI
                 st.session_state["displayed_constituents_df"] = loaded_constituents_df
 
@@ -1534,14 +1545,14 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             st.info("Select a saved index from the dropdown above to view its details or delete it.")
             st.session_state["displayed_constituents_df"] = pd.DataFrame() # Clear previous display
 
-        # New: Always display the "Load Constituent Data" button and its output area
-        # This section comes after the selection logic, but before the factsheet generation.
-        st.markdown("#### Load Constituent Data for Selected Index")
+        # New: Display the "Load Constituent Data" button and its output area
+        st.markdown("#### Load Constituent Data for Selected Index (for immediate view in app)")
+        # This button is explicitly for displaying in the Streamlit tab, not directly for factsheet generation.
         if st.session_state['selected_index_to_manage'] != "--- Select ---":
-            if st.button(f"Load Constituent Data for '{st.session_state['selected_index_to_manage']}'", key="load_const_data_button_in_tab"):
-                selected_db_index_data_for_display = next((idx for idx in saved_indexes if idx['index_name'] == st.session_state['selected_index_to_manage']), None)
-                if selected_db_index_data_for_display:
-                    base_constituents_df_to_load = pd.DataFrame(selected_db_index_data_for_display['constituents']).copy()
+            if st.button(f"Load & Display Constituents for '{st.session_state['selected_index_to_manage']}'", key="load_const_data_button_in_tab"):
+                selected_db_index_data_for_display_button = next((idx for idx in saved_indexes if idx['index_name'] == st.session_state['selected_index_to_manage']), None)
+                if selected_db_index_data_for_display_button:
+                    base_constituents_df_to_load = pd.DataFrame(selected_db_index_data_for_display_button['constituents']).copy()
                     
                     if st.session_state["instruments_df"].empty:
                         with st.spinner("Loading instruments for constituent display..."):
@@ -1571,7 +1582,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             elif st.session_state['selected_index_to_manage'] != "--- Select ---":
                 st.info("Click the button above to load constituent data for the selected index.")
         else:
-            st.info("Select an index from the 'View/Delete Individual Saved Indexes' dropdown above to load its constituents.")
+            st.info("Select an index from the 'View/Delete Individual Saved Indexes' dropdown above to load its constituents for display.")
 
 
 # --- Main Application Logic (Tab Rendering) ---
