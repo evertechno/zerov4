@@ -906,7 +906,11 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
     # Helper function to render an index's details, charts, and export options
     def display_single_index_details(index_name: str, constituents_df: pd.DataFrame, index_history_df: pd.DataFrame, index_id: str | None = None, is_recalculated_live=False):
-        st.markdown(f"#### Details for Index: **{index_name}** {'<span style=\'color:yellow; font-size:0.8em;\'>(Historical data recalculated live)</span>' if is_recalculated_live else ''}", unsafe_allow_html=True)
+        
+        # Define the HTML snippet separately
+        recalculated_html_snippet = '<span style="color:yellow; font-size:0.8em;">(Historical data recalculated live)</span>'
+
+        st.markdown(f"#### Details for Index: **{index_name}** {recalculated_html_snippet if is_recalculated_live else ''}", unsafe_allow_html=True)
         
         st.subheader("Constituents and Current Live Value")
         
