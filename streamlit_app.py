@@ -310,23 +310,25 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
         symbol = row['symbol']
         progress_text_placeholder.text(f"Fetching historical data for {symbol} ({i+1}/{len(constituents_df)})...")
         
-        # Use the cached historical data function
-        hist_df = get_historical_data_cached(api_key, access_token, symbol, start_date, end_date, "day", exchange)
-        
-        if isinstance(hist_df, pd.DataFrame) and "_error" not in hist_df.columns and not hist_df.empty:
-            all_historical_closes[symbol] = hist_df['close']
-        else:
-            error_msg = hist_df.get('_error', ['Unknown error'])[0] if isinstance(hist_df, pd.DataFrame) else 'Unknown error'
-            st.warning(f"Could not fetch historical data for {symbol}. Skipping for historical calculation. Error: {error_msg}")
-        progress_bar_placeholder.progress((i + 1) / len(constituents_df))
+  # Use the cached historical data function
+hist_df = get_historical_data_cached(api_key, access_token, symbol, start_date, end_date, "day", exchange)
 
-    progress_text_placeholder.empty()
-            progress_bar_placeholder.empty()
+if isinstance(hist_df, pd.DataFrame) and "_error" not in hist_df.columns and not hist_df.empty:
+    all_historical_closes[symbol] = hist_df['close']
+else:
+    error_msg = hist_df.get('_error', ['Unknown error'])[0] if isinstance(hist_df, pd.DataFrame) else 'Unknown error'
+    st.warning(f"Could not fetch historical data for {symbol}. Skipping for historical calculation. Error: {error_msg}")
 
-    if not all_historical_closes:
-        return pd.DataFrame({"_error": ["No historical data available for any constituent to build index."]})
+progress_bar_placeholder.progress((i + 1) / len(constituents_df))
 
-    combined_closes = pd.DataFrame(all_historical_closes)
+# ✅ These should align with `progress_bar_placeholder.progress`, not be indented further
+progress_text_placeholder.empty()
+progress_bar_placeholder.empty()
+
+if not all_historical_closes:
+    return pd.DataFrame({"_error": ["No historical data available for any constituent to build index."]})
+
+combined_closes = pd.DataFrame(all_historical_closes)
     
     # Forward-fill and then back-fill any missing daily prices to be more robust
     combined_closes = combined_closes.ffill().bfill()
