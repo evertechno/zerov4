@@ -593,7 +593,7 @@ def generate_factsheet_html_content(
             <div class="ai-agent-section">
                 <h3>Embedded AI Agent</h3>
         """)
-        html_content_parts.append(ai_agent_snippet)
+        html_content_parts.append(ai_agent_embed_snippet) # FIX: Changed from 'ai_agent_snippet' to 'ai_agent_embed_snippet'
         html_content_parts.append("</div>")
 
     html_content_parts.append("""
@@ -839,7 +839,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         hist_df = pd.DataFrame()
         if data_type == "custom_index":
             if constituents_df is None or constituents_df.empty:
-                return pd.DataFrame({"_error": ["No constituents for custom index {name}."]})
+                return pd.DataFrame({"_error": [f"No constituents for custom index {name}."]})
             # Always recalculate for the exact comparison range to ensure consistency
             hist_df = _calculate_historical_index_value(api_key, access_token, constituents_df, comparison_start_date, comparison_end_date, exchange)
             if "_error" in hist_df.columns:
@@ -998,10 +998,13 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         st.session_state["current_calculated_index_data"] = df_constituents_new
                         st.session_state["current_calculated_index_history"] = index_history_df_new
                         st.success("Historical index values calculated successfully.")
+                        # Set newly calculated index as the default selection for factsheet constituents
+                        st.session_state["factsheet_selected_constituents_index_names"] = ["Newly Calculated Index"] 
                     else:
                         st.error(f"Failed to calculate historical index values for new index: {index_history_df_new.get('_error', ['Unknown error'])[0]}")
                         st.session_state["current_calculated_index_data"] = pd.DataFrame() # Ensure it's a DataFrame
                         st.session_state["current_calculated_index_history"] = pd.DataFrame()
+                        st.session_state["factsheet_selected_constituents_index_names"] = [] # Clear selection if calculation fails
                         
         except pd.errors.EmptyDataError:
             st.error("The uploaded CSV file is empty.")
@@ -1066,6 +1069,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                             st.session_state["saved_indexes"] = [] 
                             st.session_state["current_calculated_index_data"] = pd.DataFrame() # Reset to empty DataFrame
                             st.session_state["current_calculated_index_history"] = pd.DataFrame() # Reset to empty DataFrame
+                            st.session_state["factsheet_selected_constituents_index_names"] = [] # Reset factsheet selection
                             st.rerun()
                 except Exception as e:
                     st.error(f"Error saving new index: {e}")
