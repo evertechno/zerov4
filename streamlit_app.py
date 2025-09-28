@@ -698,41 +698,6 @@ with st.sidebar:
             st.rerun()
         st.success("Kite Authenticated ✅")
     else:
-        st.info("Not authenticated with Kite yet.")
-
-
-# --- Sidebar: Supabase Authentication ---
-with st.sidebar:
-    st.markdown("### 2. Supabase User Account")
-    
-    # Check/refresh Supabase session
-    def _refresh_supabase_session():
-        try:
-            session_data = supabase.auth.get_session()
-            if session_data and session_data.user:
-                st.session_state["user_session"] = session_data
-                st.session_state["user_id"] = session_data.user.id
-            else:
-                st.session_state["user_session"] = None
-                st.session_state["user_id"] = None
-        except Exception: # Catch any error during session fetching
-            st.session_state["user_session"] = None
-            st.session_state["user_id"] = None
-
-    _refresh_supabase_session()
-
-    if st.session_state["user_session"]:
-        st.success(f"Logged into Supabase as: {st.session_state['user_session'].user.email}")
-        # Only render the logout button if authenticated
-        if st.button("Logout from Supabase", key=f"supabase_logout_btn_{st.session_state['user_id']}"): # Dynamic key
-            try:
-                supabase.auth.sign_out()
-                _refresh_supabase_session() # Update session state immediately
-                st.sidebar.success("Logged out from Supabase.")
-                st.rerun()
-            except Exception as e:
-                st.sidebar.error(f"Error logging out: {e}")
-    else:
         # The form key here needs to be static, as this block is entered only when not logged in.
         # The previous error likely came from a rerun causing this block to be processed again
         # while the form was somehow still registered, perhaps due to multiple 'with' blocks or
@@ -941,7 +906,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
     # Helper function to render an index's details, charts, and export options
     def display_single_index_details(index_name: str, constituents_df: pd.DataFrame, index_history_df: pd.DataFrame, index_id: str | None = None, is_recalculated_live=False):
-        st.markdown(f"#### Details for Index: **{index_name}** {'<span style="color:yellow; font-size:0.8em;">(Historical data recalculated live)</span>' if is_recalculated_live else ''}", unsafe_allow_html=True)
+        st.markdown(f"#### Details for Index: **{index_name}** {'<span style=\'color:yellow; font-size:0.8em;\'>(Historical data recalculated live)</span>' if is_recalculated_live else ''}", unsafe_allow_html=True)
         
         st.subheader("Constituents and Current Live Value")
         
@@ -1434,5 +1399,3 @@ access_token = st.session_state["kite_access_token"]
 # Removed render_dashboard_tab(k, api_key, access_token)
 with tab_market: render_market_historical_tab(k, api_key, access_token)
 with tab_custom_index: render_custom_index_tab(k, supabase, api_key, access_token)
-
-```
