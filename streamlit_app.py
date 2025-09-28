@@ -64,6 +64,8 @@ if "displayed_constituents_df" not in st.session_state: # New state for displayi
     st.session_state["displayed_constituents_df"] = pd.DataFrame()
 if "all_comparison_constituents_for_factsheet" not in st.session_state: # New state for constituents in comparison factsheet
     st.session_state["all_comparison_constituents_for_factsheet"] = []
+if "selected_custom_indexes_for_comparison" not in st.session_state: # New state to hold multiselect value
+    st.session_state["selected_custom_indexes_for_comparison"] = []
 
 
 # --- Load Credentials from Streamlit Secrets ---
@@ -467,10 +469,14 @@ def generate_factsheet_csv_content(
     content.append(f"Factsheet for {index_name}\n")
     content.append(f"Generated On: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     content.append("\n--- Index Overview ---\n")
-    if current_live_value > 0 and not current_calculated_index_data.empty:
+    
+    # Only show current live value if it's a single index report and data is available
+    if index_name != "Comparison Report" and current_live_value > 0 and not current_calculated_index_data.empty:
         content.append(f"Current Live Calculated Index Value,₹{current_live_value:,.2f}\n")
+    elif index_name == "Comparison Report":
+        content.append("Current Live Calculated Index Value,N/A (Comparison report does not have a single live value)\n")
     else:
-        content.append("Current Live Calculated Index Value,N/A (Constituent data not available or comparison report only)\n")
+        content.append("Current Live Calculated Index Value,N/A (Constituent data not available)\n")
     
     # --- Constituents ---
     content.append("\n--- Constituents ---\n")
@@ -522,8 +528,10 @@ def generate_factsheet_csv_content(
 
     # --- Historical Performance (CSV ONLY) ---
     content.append("\n--- Historical Performance (Normalized to 100) ---\n")
-    if not current_calculated_index_history.empty:
+    if not current_calculated_index_history.empty and index_name != "Comparison Report":
         content.append(current_calculated_index_history.to_csv())
+    elif not last_comparison_df.empty and index_name == "Comparison Report": # For comparison report, its own combined history
+         content.append(last_comparison_df.to_csv())
     else:
         content.append("No historical performance data available.\n")
 
@@ -537,11 +545,14 @@ def generate_factsheet_csv_content(
         content.append("No performance metrics available (run a comparison first).\n")
 
     # --- Comparison Data ---
-    content.append("\n--- Comparison Data (Normalized to 100) ---\n")
-    if not last_comparison_df.empty:
-        content.append(last_comparison_df.to_csv())
-    else:
-        content.append("No comparison data available.\n")
+    # This section is essentially redundant if current_calculated_index_history already included last_comparison_df,
+    # but keep it for clarity if factsheet_index_name_final wasn't "Comparison Report"
+    if index_name != "Comparison Report": # Only include if it's a single index factsheet and comparison data exists
+        content.append("\n--- Comparison Data (Normalized to 100, if applicable) ---\n")
+        if not last_comparison_df.empty:
+            content.append(last_comparison_df.to_csv())
+        else:
+            content.append("No comparison data available for this report type.\n")
 
     return "".join(content)
 
@@ -604,11 +615,13 @@ def generate_factsheet_html_content(
     html_content_parts.append(f"<p><strong>Generated On:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
     html_content_parts.append("<h2>Index Overview</h2>")
     
-    # Check if current_live_value is truly meaningful AND if there's constituent data associated for a single primary index
-    if current_live_value > 0 and not current_calculated_index_data.empty and index_name != "Comparison Report": 
+    # Only show current live value if it's a single index report and data is available
+    if index_name != "Comparison Report" and current_live_value > 0 and not current_calculated_index_data.empty: 
         html_content_parts.append(f"<p class='metric'><strong>Current Live Calculated Index Value:</strong> ₹{current_live_value:,.2f}</p>")
+    elif index_name == "Comparison Report":
+        html_content_parts.append("<p class='warning-box'>Current Live Calculated Index Value: N/A (Comparison report does not have a single live value)</p>")
     else:
-        html_content_parts.append("<p class='warning-box'>Current Live Calculated Index Value: N/A (Constituent data not available or comparison report only)</p>")
+        html_content_parts.append("<p class='warning-box'>Current Live Calculated Index Value: N/A (Constituent data not available).</p>")
 
     # --- Constituents ---
     html_content_parts.append("<h3>Constituents</h3>")
@@ -720,7 +733,7 @@ def generate_factsheet_html_content(
 
     # --- Optional: Historical Performance Chart for the main index (if applicable and not too large) ---
     # Only show this chart if it's an index-specific report AND there's history AND it's not too big.
-    if index_name != "Consolidated Report" and not current_calculated_index_history.empty and current_calculated_index_history.shape[0] < 730: # Limit for HTML, e.g., 2 years daily data
+    if index_name != "Comparison Report" and not current_calculated_index_history.empty and current_calculated_index_history.shape[0] < 730: # Limit for HTML, e.g., 2 years daily data
         html_content_parts.append("<h3>Index Historical Performance (Normalized to 100)</h3>")
         fig_hist_index = go.Figure(data=[go.Scatter(x=current_calculated_index_history.index, y=current_calculated_index_history['index_value'], mode='lines', name=index_name)])
         fig_hist_index.update_layout(title_text=f"{index_name} Historical Performance", template="plotly_dark", height=400)
@@ -1197,11 +1210,15 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
     if saved_indexes:
         index_names_from_db = [idx['index_name'] for idx in saved_indexes]
         
+        # Use a consistent session state for the multiselect
         selected_custom_indexes_names = st.multiselect(
             "Select saved custom indexes to include in comparison:", 
             options=index_names_from_db, 
-            key="select_saved_indexes_for_comparison"
+            key="select_saved_indexes_for_comparison",
+            default=st.session_state["selected_custom_indexes_for_comparison"] # Maintain selection across reruns
         )
+        st.session_state["selected_custom_indexes_for_comparison"] = selected_custom_indexes_names
+
 
         st.markdown("---")
         st.subheader("3. Configure & Run Multi-Index & Benchmark Comparison")
@@ -1333,57 +1350,58 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
         st.markdown("---")
         st.subheader("5. Generate and Download Consolidated Factsheet")
-        st.info("This will generate a factsheet. If a new index is calculated or a single saved index is selected, it will create a detailed report for that index. Otherwise, it will generate a comparison-only factsheet if comparison data is available.")
+        st.info("This will generate a factsheet. Select the mode below.")
         
-        # --- Factsheet data preparation logic ---
+        # --- NEW: Factsheet Mode Selector ---
+        factsheet_mode = st.radio(
+            "Select Factsheet Type:",
+            ["Single Index Report", "Comparison Report"],
+            index=0, # Default to single index
+            key="factsheet_mode_selector"
+        )
+
+        # --- Factsheet data preparation logic (updated) ---
         factsheet_constituents_df_final = pd.DataFrame()
         factsheet_history_df_final = pd.DataFrame()
-        factsheet_index_name_final = "Consolidated Report" # Default for a general comparison report
+        factsheet_index_name_final = ""
         current_live_value_for_factsheet_final = 0.0
-        
-        # Determine the primary context for the factsheet
-        # This order of if/elif is crucial for prioritization
-        
-        # Context 1: Newly calculated index (highest priority for detailed report)
-        if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
-            factsheet_constituents_df_final, current_live_value_for_factsheet_final = _get_live_constituent_data(
-                current_calculated_index_data_df, api_key, access_token, st.session_state["instruments_df"]
-            )
-            factsheet_history_df_final = current_calculated_index_history_df.copy()
-            factsheet_index_name_final = "Newly Calculated Index"
-            
-            # For this context, no comparison constituents are relevant for the detailed report
-            comparison_constituents_list_for_factsheet = [] 
-        
-        # Context 2: A specific saved index selected for management (second highest priority for detailed report)
-        elif st.session_state.get('selected_index_to_manage') and st.session_state['selected_index_to_manage'] != "--- Select ---":
-            selected_db_index_data_for_factsheet = next((idx for idx in saved_indexes if idx['index_name'] == st.session_state['selected_index_to_manage']), None)
-            if selected_db_index_data_for_factsheet:
-                base_constituents_df = pd.DataFrame(selected_db_index_data_for_factsheet['constituents']).copy()
+        comparison_constituents_list_for_factsheet_output = [] # This will be passed to generate_factsheet functions
+
+        if factsheet_mode == "Single Index Report":
+            # Prioritize newly calculated index
+            if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
                 factsheet_constituents_df_final, current_live_value_for_factsheet_final = _get_live_constituent_data(
-                    base_constituents_df, api_key, access_token, st.session_state["instruments_df"]
+                    current_calculated_index_data_df, api_key, access_token, st.session_state["instruments_df"]
                 )
-                factsheet_history_df_final = pd.DataFrame(selected_db_index_data_for_factsheet.get('historical_performance', []))
-                if not factsheet_history_df_final.empty:
-                    factsheet_history_df_final['date'] = pd.to_datetime(factsheet_history_df_final['date'])
-                    factsheet_history_df_final.set_index('date', inplace=True)
-                    factsheet_history_df_final.sort_index(inplace=True)
-                
-                factsheet_index_name_final = selected_db_index_data_for_factsheet['index_name']
-                # For this context, no comparison constituents are relevant for the detailed report
-                comparison_constituents_list_for_factsheet = [] 
+                factsheet_history_df_final = current_calculated_index_history_df.copy()
+                factsheet_index_name_final = "Newly Calculated Index"
+            # Fallback to selected saved index
+            elif st.session_state.get('selected_index_to_manage') and st.session_state['selected_index_to_manage'] != "--- Select ---":
+                selected_db_index_data_for_factsheet = next((idx for idx in saved_indexes if idx['index_name'] == st.session_state['selected_index_to_manage']), None)
+                if selected_db_index_data_for_factsheet:
+                    base_constituents_df = pd.DataFrame(selected_db_index_data_for_factsheet['constituents']).copy()
+                    factsheet_constituents_df_final, current_live_value_for_factsheet_final = _get_live_constituent_data(
+                        base_constituents_df, api_key, access_token, st.session_state["instruments_df"]
+                    )
+                    factsheet_history_df_final = pd.DataFrame(selected_db_index_data_for_factsheet.get('historical_performance', []))
+                    if not factsheet_history_df_final.empty:
+                        factsheet_history_df_final['date'] = pd.to_datetime(factsheet_history_df_final['date'])
+                        factsheet_history_df_final.set_index('date', inplace=True)
+                        factsheet_history_df_final.sort_index(inplace=True)
+                    factsheet_index_name_final = selected_db_index_data_for_factsheet['index_name']
+            else:
+                st.warning("No single index available for a 'Single Index Report'. Please calculate a new index or select a saved index for management.")
+                factsheet_index_name_final = "No Index Selected"
 
-        # Context 3: A comparison report (lowest priority, relies on previously run comparison)
-        elif not last_comparison_df.empty: # Only if a comparison was run, and no single index report is prioritized
-            factsheet_index_name_final = "Comparison Report"
-            current_live_value_for_factsheet_final = 0.0 # No single live value for a comparison-only report
-            # The comparison_constituents_list_for_factsheet is already populated from the 'Run Multi-Index' button click
-            comparison_constituents_list_for_factsheet = st.session_state["all_comparison_constituents_for_factsheet"]
-        else: # No data/context for a factsheet
-            factsheet_index_name_final = "Consolidated Report"
-            current_live_value_for_factsheet_final = 0.0
-            comparison_constituents_list_for_factsheet = []
-
+        elif factsheet_mode == "Comparison Report":
+            if not last_comparison_df.empty:
+                factsheet_index_name_final = "Comparison Report"
+                current_live_value_for_factsheet_final = 0.0 # Not applicable for consolidated comparison
+                # Use the constituents gathered during the comparison run
+                comparison_constituents_list_for_factsheet_output = st.session_state["all_comparison_constituents_for_factsheet"]
+            else:
+                st.warning("No comparison data available. Please run a multi-index comparison first.")
+                factsheet_index_name_final = "No Comparison Data"
 
         # AI Agent Embed Snippet input
         ai_agent_snippet_input = st.text_area(
@@ -1397,17 +1415,23 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
         with col_factsheet_download_options_1:
             if st.button("Generate & Download Factsheet (CSV)", key="generate_download_factsheet_csv_btn"):
-                # Check if there's *any* data to put in the factsheet
-                if not factsheet_constituents_df_final.empty or not last_comparison_df.empty or comparison_constituents_list_for_factsheet:
+                # Check if there's *any* data to put in the factsheet based on the selected mode
+                has_data_for_factsheet = False
+                if factsheet_mode == "Single Index Report" and (not factsheet_constituents_df_final.empty or not factsheet_history_df_final.empty):
+                    has_data_for_factsheet = True
+                elif factsheet_mode == "Comparison Report" and (not last_comparison_df.empty or comparison_constituents_list_for_factsheet_output):
+                    has_data_for_factsheet = True
+
+                if has_data_for_factsheet:
                     factsheet_csv_content = generate_factsheet_csv_content(
                         current_calculated_index_data=factsheet_constituents_df_final,
                         current_calculated_index_history=factsheet_history_df_final, # Include history in CSV
-                        last_comparison_df=last_comparison_df,
+                        last_comparison_df=last_comparison_df, # Always pass for potential inclusion
                         last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
                         current_live_value=current_live_value_for_factsheet_final,
                         index_name=factsheet_index_name_final,
                         ai_agent_embed_snippet=None, # CSV doesn't support HTML embeds
-                        comparison_constituents_list=comparison_constituents_list_for_factsheet
+                        comparison_constituents_list=comparison_constituents_list_for_factsheet_output
                     )
                     st.session_state["last_facts_data"] = factsheet_csv_content.encode('utf-8')
                     st.download_button(
@@ -1420,21 +1444,27 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     )
                     st.success("CSV Factsheet generated and ready for download!")
                 else:
-                    st.warning("No data available to generate a factsheet. Please calculate a new index, load a saved index, or run a comparison first.")
+                    st.warning("No data available to generate a factsheet based on your selection. Please check your data sources or run a comparison.")
 
         with col_factsheet_download_options_2:
             if st.button("Generate & Download Factsheet (HTML/PDF)", key="generate_download_factsheet_html_btn"):
-                # Check if there's *any* data to put in the factsheet
-                if not factsheet_constituents_df_final.empty or not last_comparison_df.empty or comparison_constituents_list_for_factsheet:
+                # Check if there's *any* data to put in the factsheet based on the selected mode
+                has_data_for_factsheet = False
+                if factsheet_mode == "Single Index Report" and (not factsheet_constituents_df_final.empty or not factsheet_history_df_final.empty):
+                    has_data_for_factsheet = True
+                elif factsheet_mode == "Comparison Report" and (not last_comparison_df.empty or comparison_constituents_list_for_factsheet_output):
+                    has_data_for_factsheet = True
+
+                if has_data_for_factsheet:
                     factsheet_html_content = generate_factsheet_html_content(
                         current_calculated_index_data=factsheet_constituents_df_final,
                         current_calculated_index_history=factsheet_history_df_final, # Pass history to potentially show chart
-                        last_comparison_df=last_comparison_df,
+                        last_comparison_df=last_comparison_df, # Always pass for potential inclusion
                         last_comparison_metrics=st.session_state.get("last_comparison_metrics", {}),
                         current_live_value=current_live_value_for_factsheet_final,
                         index_name=factsheet_index_name_final,
                         ai_agent_embed_snippet=ai_agent_snippet_input if ai_agent_snippet_input.strip() else None, # Pass the user's snippet
-                        comparison_constituents_list=comparison_constituents_list_for_factsheet
+                        comparison_constituents_list=comparison_constituents_list_for_factsheet_output
                     )
                     st.session_state["last_factsheet_html_data"] = factsheet_html_content.encode('utf-8')
 
@@ -1449,7 +1479,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     )
                     st.success("HTML Factsheet generated and ready for download! (Open in browser, then 'Print to PDF')")
                 else:
-                    st.warning("No data available to generate a factsheet. Please calculate a new index, load a saved index, or run a comparison first.")
+                    st.warning("No data available to generate a factsheet based on your selection. Please check your data sources or run a comparison.")
 
         # --- Section 6: View/Delete Individual Saved Indexes (MOVED AFTER SECTION 5) ---
         st.markdown("---")
