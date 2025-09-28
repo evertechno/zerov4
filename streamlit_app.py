@@ -108,6 +108,20 @@ def get_authenticated_kite_client(api_key: str | None, access_token: str | None)
         return k_instance
     return None
 
+# Supabase session refresh function - MOVED TO GLOBAL SCOPE
+def _refresh_supabase_session():
+    try:
+        session_data = supabase.auth.get_session()
+        if session_data and session_data.user:
+            st.session_state["user_session"] = session_data
+            st.session_state["user_id"] = session_data.user.id
+        else:
+            st.session_state["user_session"] = None
+            st.session_state["user_id"] = None
+    except Exception: # Catch any error during session fetching
+        st.session_state["user_session"] = None
+        st.session_state["user_id"] = None
+
 
 @st.cache_data(ttl=86400, show_spinner="Loading instruments...") # Cache for 24 hours
 def load_instruments_cached(api_key: str, access_token: str, exchange: str = None) -> pd.DataFrame:
@@ -433,7 +447,7 @@ def generate_factsheet_csv_content(
     last_comparison_df: pd.DataFrame,
     last_comparison_metrics: dict,
     current_live_value: float,
-    index_name: str = "Custom Index",
+    index_name: str = "Consolidated Report", # Default changed to be more descriptive
     ai_agent_embed_snippet: str = None # Added for consistency, though won't be in CSV
 ) -> str:
     """Generates a comprehensive factsheet as a multi-section CSV string, including historical data."""
@@ -697,6 +711,27 @@ with st.sidebar:
             st.success("Logged out from Kite. Please login again.")
             st.rerun()
         st.success("Kite Authenticated ✅")
+    else:
+        st.info("Not authenticated with Kite yet.")
+
+
+# --- Sidebar: Supabase Authentication ---
+with st.sidebar:
+    st.markdown("### 2. Supabase User Account")
+    
+    _refresh_supabase_session() # Call the global function
+
+    if st.session_state["user_session"]:
+        st.success(f"Logged into Supabase as: {st.session_state['user_session'].user.email}")
+        # Only render the logout button if authenticated
+        if st.button("Logout from Supabase", key=f"supabase_logout_btn_{st.session_state['user_id']}"): # Dynamic key
+            try:
+                supabase.auth.sign_out()
+                _refresh_supabase_session() # Update session state immediately
+                st.sidebar.success("Logged out from Supabase.")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Error logging out: {e}")
     else:
         # The form key here needs to be static, as this block is entered only when not logged in.
         # The previous error likely came from a rerun causing this block to be processed again
