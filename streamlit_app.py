@@ -691,8 +691,37 @@ def generate_factsheet_html_content(
     # Index Composition Pie Chart - This should appear for a single primary index report OR for each index in a comparison report
     if index_name != "Comparison Report" and not current_calculated_index_data.empty and current_calculated_index_data['Weights'].sum() > 0:
         html_content_parts.append("<h3>Index Composition</h3>")
-        fig_pie = go.Figure(data=[go.Pie(labels=current_calculated_index_data['Name'], values=current_calculated_index_data['Weights'], hole=.3)])
-        fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
+        fig_pie = go.Figure(data=[go.Pie(
+            labels=current_calculated_index_data['Name'], 
+            values=current_calculated_index_data['Weights'], 
+            hole=.3,
+            # Add these updates for better label management
+            textinfo='percent+label', # Show both percent and label
+            insidetextorientation='radial', # Orient labels radially
+            # uniformtext_minsize=10, # Minimum font size
+            # uniformtext_mode='hide', # Hide if text doesn't fit
+            # Ensure customdata is passed for hover if needed
+            hovertemplate="<b>%{label}</b><br>Weight: %{percent}<extra></extra>"
+        )])
+        fig_pie.update_layout(
+            title_text='Constituent Weights', 
+            height=400, 
+            template="plotly_dark",
+            # Enable automargin for better layout
+            margin=dict(l=20, r=20, t=50, b=20),
+            # Explicitly set legend properties to avoid overlap if many items
+            legend=dict(
+                orientation="v",
+                yanchor="auto", # or "top"
+                y=1,
+                xanchor="left", # or "right"
+                x=1.02, # Position slightly outside the chart
+                traceorder="normal",
+                font=dict(size=10),
+                itemwidth=30,
+                groupclick="toggleitem" # Allow toggling items by clicking on legend
+            )
+        )
         # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
         html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>") 
     elif index_name == "Comparison Report" and comparison_constituents_list:
@@ -711,8 +740,33 @@ def generate_factsheet_html_content(
                     else:
                         const_df['Name'] = const_df['symbol'] # Fallback
                 
-                fig_pie = go.Figure(data=[go.Pie(labels=const_df['Name'], values=const_df['Weights'], hole=.3)])
-                fig_pie.update_layout(title_text=f'Constituent Weights: {idx_name}', height=400, template="plotly_dark")
+                fig_pie = go.Figure(data=[go.Pie(
+                    labels=const_df['Name'], 
+                    values=const_df['Weights'], 
+                    hole=.3,
+                    textinfo='percent+label', # Show both percent and label
+                    insidetextorientation='radial', # Orient labels radially
+                    # uniformtext_minsize=10, # Minimum font size
+                    # uniformtext_mode='hide', # Hide if text doesn't fit
+                    hovertemplate="<b>%{label}</b><br>Weight: %{percent}<extra></extra>"
+                )])
+                fig_pie.update_layout(
+                    title_text=f'Constituent Weights: {idx_name}', 
+                    height=400, 
+                    template="plotly_dark",
+                    margin=dict(l=20, r=20, t=50, b=20),
+                    legend=dict(
+                        orientation="v",
+                        yanchor="auto",
+                        y=1,
+                        xanchor="left",
+                        x=1.02,
+                        traceorder="normal",
+                        font=dict(size=10),
+                        itemwidth=30,
+                        groupclick="toggleitem"
+                    )
+                )
                 html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
                 html_content_parts.append("<br>") # Add spacing between charts
             else:
@@ -1079,8 +1133,36 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             enriched_constituents_df['Name'] = enriched_constituents_df['symbol']
 
         if not enriched_constituents_df.empty and enriched_constituents_df['Weights'].sum() > 0:
-            fig_pie = go.Figure(data=[go.Pie(labels=enriched_constituents_df['Name'], values=enriched_constituents_df['Weights'], hole=.3)])
-            fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
+            fig_pie = go.Figure(data=[go.Pie(
+                labels=enriched_constituents_df['Name'], 
+                values=enriched_constituents_df['Weights'], 
+                hole=.3,
+                textinfo='percent+label', # Show both percent and label
+                insidetextorientation='radial', # Orient labels radially
+                # Set a minimum font size for labels and hide if they don't fit
+                uniformtext_minsize=10, 
+                uniformtext_mode='hide',
+                hovertemplate="<b>%{label}</b><br>Weight: %{percent}<extra></extra>"
+            )])
+            fig_pie.update_layout(
+                title_text='Constituent Weights', 
+                height=400, 
+                template="plotly_dark",
+                # Enable automargin for better layout
+                margin=dict(l=20, r=20, t=50, b=20),
+                # Explicitly set legend properties to avoid overlap if many items
+                legend=dict(
+                    orientation="v",
+                    yanchor="auto", 
+                    y=1,
+                    xanchor="left", 
+                    x=1.02, # Position slightly outside the chart
+                    traceorder="normal",
+                    font=dict(size=10),
+                    itemwidth=30,
+                    groupclick="toggleitem" # Allow toggling items by clicking on legend
+                )
+            )
             st.plotly_chart(fig_pie, use_container_width=True)
         else:
             st.info("No constituents or weights available for composition chart.")
