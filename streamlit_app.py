@@ -689,65 +689,80 @@ def generate_factsheet_html_content(
     """)
 
     # Index Composition Pie Chart - This should appear for a single primary index report OR for each index in a comparison report
-    if index_name != "Comparison Report" and not current_calculated_index_data.empty and current_calculated_index_data['Weights'].sum() > 0:
+    if index_name != "Comparison Report" and not current_calculated_index_data.empty and 'Weights' in current_calculated_index_data.columns and current_calculated_index_data['Weights'].sum() > 0:
         html_content_parts.append("<h3>Index Composition</h3>")
-        fig_pie = go.Figure(data=[go.Pie(
-            labels=current_calculated_index_data['Name'], 
-            values=current_calculated_index_data['Weights'], 
-            hole=.3,
-            # Add these updates for better label management
-            textinfo='percent+label', # Show both percent and label
-            insidetextorientation='radial', # Orient labels radially
-            # uniformtext_minsize=10, # Minimum font size
-            # uniformtext_mode='hide', # Hide if text doesn't fit
-            # Ensure customdata is passed for hover if needed
-            hovertemplate="<b>%{label}</b><br>Weight: %{percent}<extra></extra>"
-        )])
-        fig_pie.update_layout(
-            title_text='Constituent Weights', 
-            height=400, 
-            template="plotly_dark",
-            # Enable automargin for better layout
-            margin=dict(l=20, r=20, t=50, b=20),
-            # Explicitly set legend properties to avoid overlap if many items
-            legend=dict(
-                orientation="v",
-                yanchor="auto", # or "top"
-                y=1,
-                xanchor="left", # or "right"
-                x=1.02, # Position slightly outside the chart
-                traceorder="normal",
-                font=dict(size=10),
-                itemwidth=30,
-                groupclick="toggleitem" # Allow toggling items by clicking on legend
+        
+        plot_df = current_calculated_index_data.copy()
+        # Ensure 'Name' column exists for pie chart
+        if 'Name' not in plot_df.columns:
+            plot_df['Name'] = plot_df['symbol']
+
+        # Ensure weights are numeric and drop NaNs if any slipped through
+        plot_df['Weights'] = pd.to_numeric(plot_df['Weights'], errors='coerce').fillna(0)
+        plot_df = plot_df[plot_df['Weights'] > 0] # Only plot positive weights
+        
+        if not plot_df.empty: # Re-check after cleanup
+            fig_pie = go.Figure(data=[go.Pie(
+                labels=plot_df['Name'], 
+                values=plot_df['Weights'], 
+                hole=.3,
+                textinfo='percent+label', # Show both percent and label
+                insidetextorientation='radial', # Orient labels radially
+                uniformtext_minsize=10, # Minimum font size
+                uniformtext_mode='hide', # Hide if text doesn't fit
+                hovertemplate="<b>%{label}</b><br>Weight: %{percent}<extra></extra>"
+            )])
+            fig_pie.update_layout(
+                title_text='Constituent Weights', 
+                height=400, 
+                template="plotly_dark",
+                margin=dict(l=20, r=20, t=50, b=20),
+                legend=dict(
+                    orientation="v",
+                    yanchor="auto",
+                    y=1,
+                    xanchor="left",
+                    x=1.02, # Position slightly outside the chart
+                    traceorder="normal",
+                    font=dict(size=10),
+                    itemwidth=30,
+                    groupclick="toggleitem"
+                )
             )
-        )
-        # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
-        html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>") 
+            html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>") 
+        else:
+            html_content_parts.append("<p class='warning-box'>No valid constituents or weights available for composition chart.</p>")
+
     elif index_name == "Comparison Report" and comparison_constituents_list:
         html_content_parts.append("<h3>Index Composition of Compared Indexes</h3>")
         for idx_constituents_dict in comparison_constituents_list:
             idx_name = idx_constituents_dict['index_name']
             const_df = pd.DataFrame(idx_constituents_dict['constituents_data'])
             
-            if not const_df.empty and const_df['Weights'].sum() > 0:
-                # Ensure 'Name' column exists for pie chart
-                if 'Name' not in const_df.columns:
-                    instruments_df = st.session_state["instruments_df"] # Use loaded instruments
-                    if not instruments_df.empty:
-                        instrument_names = instruments_df.set_index('tradingsymbol')['name'].to_dict()
-                        const_df['Name'] = const_df['symbol'].map(instrument_names).fillna(const_df['symbol'])
-                    else:
-                        const_df['Name'] = const_df['symbol'] # Fallback
-                
+            # Ensure 'Name' column exists for pie chart
+            if 'Name' not in const_df.columns:
+                instruments_df = st.session_state["instruments_df"] # Use loaded instruments
+                if not instruments_df.empty:
+                    instrument_names = instruments_df.set_index('tradingsymbol')['name'].to_dict()
+                    const_df['Name'] = const_df['symbol'].map(instrument_names).fillna(const_df['symbol'])
+                else:
+                    const_df['Name'] = const_df['symbol'] # Fallback
+            
+            # Ensure weights are numeric and drop NaNs if any slipped through
+            plot_df_comp = const_df.copy()
+            plot_df_comp['Weights'] = pd.to_numeric(plot_df_comp['Weights'], errors='coerce').fillna(0)
+            plot_df_comp = plot_df_comp[plot_df_comp['Weights'] > 0] # Only plot positive weights
+
+
+            if not plot_df_comp.empty: # Re-check after cleanup
                 fig_pie = go.Figure(data=[go.Pie(
-                    labels=const_df['Name'], 
-                    values=const_df['Weights'], 
+                    labels=plot_df_comp['Name'], 
+                    values=plot_df_comp['Weights'], 
                     hole=.3,
                     textinfo='percent+label', # Show both percent and label
                     insidetextorientation='radial', # Orient labels radially
-                    # uniformtext_minsize=10, # Minimum font size
-                    # uniformtext_mode='hide', # Hide if text doesn't fit
+                    uniformtext_minsize=10, # Minimum font size
+                    uniformtext_mode='hide', # Hide if text doesn't fit
                     hovertemplate="<b>%{label}</b><br>Weight: %{percent}<extra></extra>"
                 )])
                 fig_pie.update_layout(
@@ -770,7 +785,7 @@ def generate_factsheet_html_content(
                 html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
                 html_content_parts.append("<br>") # Add spacing between charts
             else:
-                html_content_parts.append(f"<p class='warning-box'>No constituent data or weights available for composition chart of {idx_name}.</p>")
+                html_content_parts.append(f"<p class='warning-box'>No valid constituent data or weights available for composition chart of {idx_name}.</p>")
         
     
     # --- Performance Metrics ---
@@ -826,7 +841,7 @@ def generate_factsheet_html_content(
             <div class="ai-agent-section">
                 <h3>Embedded AI Agent</h3>
         """)
-        html_content_parts.append(ai_agent_embed_snippet) # Corrected variable name
+        html_content_parts.append(ai_agent_snippet) # Corrected variable name
         html_content_parts.append("</div>")
 
     html_content_parts.append("""
@@ -1132,40 +1147,42 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         if 'Name' not in enriched_constituents_df.columns:
             enriched_constituents_df['Name'] = enriched_constituents_df['symbol']
 
-        if not enriched_constituents_df.empty and enriched_constituents_df['Weights'].sum() > 0:
+        # Ensure weights are numeric and drop NaNs if any slipped through
+        plot_df = enriched_constituents_df.copy()
+        plot_df['Weights'] = pd.to_numeric(plot_df['Weights'], errors='coerce').fillna(0)
+        plot_df = plot_df[plot_df['Weights'] > 0] # Only plot positive weights
+        
+        if not plot_df.empty: # Re-check after cleanup
             fig_pie = go.Figure(data=[go.Pie(
-                labels=enriched_constituents_df['Name'], 
-                values=enriched_constituents_df['Weights'], 
+                labels=plot_df['Name'], 
+                values=plot_df['Weights'], 
                 hole=.3,
                 textinfo='percent+label', # Show both percent and label
                 insidetextorientation='radial', # Orient labels radially
-                # Set a minimum font size for labels and hide if they don't fit
-                uniformtext_minsize=10, 
-                uniformtext_mode='hide',
+                uniformtext_minsize=10, # Minimum font size
+                uniformtext_mode='hide', # Hide if text doesn't fit
                 hovertemplate="<b>%{label}</b><br>Weight: %{percent}<extra></extra>"
             )])
             fig_pie.update_layout(
                 title_text='Constituent Weights', 
                 height=400, 
                 template="plotly_dark",
-                # Enable automargin for better layout
                 margin=dict(l=20, r=20, t=50, b=20),
-                # Explicitly set legend properties to avoid overlap if many items
                 legend=dict(
                     orientation="v",
-                    yanchor="auto", 
+                    yanchor="auto",
                     y=1,
-                    xanchor="left", 
+                    xanchor="left",
                     x=1.02, # Position slightly outside the chart
                     traceorder="normal",
                     font=dict(size=10),
                     itemwidth=30,
-                    groupclick="toggleitem" # Allow toggling items by clicking on legend
+                    groupclick="toggleitem"
                 )
             )
             st.plotly_chart(fig_pie, use_container_width=True)
         else:
-            st.info("No constituents or weights available for composition chart.")
+            st.info("No valid constituents or weights available for composition chart.")
 
 
         st.markdown("---")
@@ -1677,8 +1694,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 st.warning(f"Could not find data for index '{selected_index_to_manage}'. It might have been deleted.")
                 st.session_state["displayed_constituents_df"] = pd.DataFrame()
         else: # If "--- Select ---" is chosen
-            st.info("Select a saved index from the dropdown above to view its details or delete it.")
-            st.session_state["displayed_constituents_df"] = pd.DataFrame() # Clear previous display
+            st.info("Select an index from the 'View/Delete Individual Saved Indexes' dropdown above to load its constituents for display.")
 
         # New: Display the "Load Constituent Data" button and its output area
         st.markdown("#### Load Constituent Data for Selected Index (for immediate view in app)")
