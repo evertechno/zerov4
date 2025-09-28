@@ -567,14 +567,22 @@ def generate_factsheet_html_content(
     html_content_parts.append(f"<p><strong>Generated On:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
     html_content_parts.append("<h2>Index Overview</h2>")
     
-    # Check if current_live_value is truly meaningful before displaying
-    if current_live_value > 0 and not current_calculated_index_data.empty: # Check for non-zero and actual constituent data
+    # Check if current_live_value is truly meaningful AND if there's constituent data associated
+    if current_live_value > 0 and not current_calculated_index_data.empty: 
         html_content_parts.append(f"<p class='metric'><strong>Current Live Calculated Index Value:</strong> ₹{current_live_value:,.2f}</p>")
     else:
         html_content_parts.append("<p class='warning-box'>Current Live Calculated Index Value: N/A (Constituent data not available or comparison report only)</p>")
 
     # --- Constituents ---
     html_content_parts.append("<h3>Constituents</h3>")
+    
+    # Always render the details/summary, then put conditional content inside
+    html_content_parts.append("""
+        <details>
+            <summary>Click to view Constituent Data</summary>
+            <div style="margin-top: 10px;">
+    """)
+
     if not current_calculated_index_data.empty:
         const_display_df = current_calculated_index_data.copy()
         
@@ -591,27 +599,22 @@ def generate_factsheet_html_content(
         const_display_df['Last Price'] = const_display_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
         const_display_df['Weighted Price'] = const_display_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
         
-        # Wrap the constituents table in a <details> tag for a collapsible "Load Constituents" button
-        html_content_parts.append("""
-            <details>
-                <summary>Click to view Constituent Data</summary>
-                <div style="margin-top: 10px;">
-        """)
         html_content_parts.append(const_display_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_html(index=False, classes='table'))
-        html_content_parts.append("""
-                </div>
-            </details>
-        """)
-
-        # Index Composition Pie Chart - only if weights are meaningful
-        if const_display_df['Weights'].sum() > 0:
-            fig_pie = go.Figure(data=[go.Pie(labels=const_display_df['Name'], values=const_display_df['Weights'], hole=.3)])
-            fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
-            html_content_parts.append("<h3>Index Composition</h3>")
-            # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
-            html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>") 
     else:
         html_content_parts.append("<p class='warning-box'>No constituent data available for this index.</p>")
+    
+    html_content_parts.append("""
+            </div>
+        </details>
+    """)
+
+    # Index Composition Pie Chart - only if constituents and weights are meaningful
+    if not current_calculated_index_data.empty and current_calculated_index_data['Weights'].sum() > 0:
+        html_content_parts.append("<h3>Index Composition</h3>")
+        fig_pie = go.Figure(data=[go.Pie(labels=current_calculated_index_data['Name'], values=current_calculated_index_data['Weights'], hole=.3)])
+        fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
+        # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
+        html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>") 
     
     # --- Performance Metrics ---
     html_content_parts.append("<h3>Performance Metrics Summary</h3>")
@@ -666,7 +669,7 @@ def generate_factsheet_html_content(
             <div class="ai-agent-section">
                 <h3>Embedded AI Agent</h3>
         """)
-        html_content_parts.append(ai_agent_embed_snippet)
+        html_content_parts.append(ai_agent_snippet)
         html_content_parts.append("</div>")
 
     html_content_parts.append("""
