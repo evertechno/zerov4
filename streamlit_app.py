@@ -321,7 +321,7 @@ else:
 
 progress_bar_placeholder.progress((i + 1) / len(constituents_df))
 
-# ✅ These should align with `progress_bar_placeholder.progress`, not be indented further
+# Cleanup placeholders
 progress_text_placeholder.empty()
 progress_bar_placeholder.empty()
 
@@ -329,10 +329,7 @@ if not all_historical_closes:
     return pd.DataFrame({"_error": ["No historical data available for any constituent to build index."]})
 
 combined_closes = pd.DataFrame(all_historical_closes)
-    
-    # Forward-fill and then back-fill any missing daily prices to be more robust
-    combined_closes = combined_closes.ffill().bfill()
-    combined_closes.dropna(how='all', inplace=True) # Drop rows where all are still NaN
+combined_closes = combined_closes.ffill().bfill()   # ✅ same indent as the line above
 
     if combined_closes.empty:
         return pd.DataFrame({"_error": ["Insufficient common historical data for index calculation after cleaning."]})
