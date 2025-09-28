@@ -593,7 +593,7 @@ def generate_factsheet_html_content(
             <div class="ai-agent-section">
                 <h3>Embedded AI Agent</h3>
         """)
-        html_content_parts.append(ai_agent_embed_snippet)
+        html_content_parts.append(ai_agent_snippet)
         html_content_parts.append("</div>")
 
     html_content_parts.append("""
@@ -638,6 +638,28 @@ with st.sidebar:
             st.success("Logged out from Kite. Please login again.")
             st.rerun()
         st.success("Kite Authenticated ✅")
+    else:
+        st.info("Not authenticated with Kite yet.")
+
+
+# --- Sidebar: Supabase Authentication ---
+with st.sidebar:
+    st.markdown("### 2. Supabase User Account")
+    
+    # Call the globally defined _refresh_supabase_session
+    _refresh_supabase_session()
+
+    if st.session_state["user_session"]:
+        st.success(f"Logged into Supabase as: {st.session_state['user_session'].user.email}")
+        # Only render the logout button if authenticated
+        if st.button("Logout from Supabase", key=f"supabase_logout_btn_{st.session_state['user_id']}"): # Dynamic key
+            try:
+                supabase.auth.sign_out()
+                _refresh_supabase_session() # Update session state immediately
+                st.sidebar.success("Logged out from Supabase.")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Error logging out: {e}")
     else:
         # The form key here needs to be static, as this block is entered only when not logged in.
         # The previous error likely came from a rerun causing this block to be processed again
@@ -817,7 +839,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         hist_df = pd.DataFrame()
         if data_type == "custom_index":
             if constituents_df is None or constituents_df.empty:
-                return pd.DataFrame({"_error": [f"No constituents for custom index {name}."]})
+                return pd.DataFrame({"_error": ["No constituents for custom index {name}."]})
             # Always recalculate for the exact comparison range to ensure consistency
             hist_df = _calculate_historical_index_value(api_key, access_token, constituents_df, comparison_start_date, comparison_end_date, exchange)
             if "_error" in hist_df.columns:
@@ -976,13 +998,10 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         st.session_state["current_calculated_index_data"] = df_constituents_new
                         st.session_state["current_calculated_index_history"] = index_history_df_new
                         st.success("Historical index values calculated successfully.")
-                        # Set newly calculated index as the default selection for factsheet constituents
-                        st.session_state["factsheet_selected_constituents_index_names"] = ["Newly Calculated Index"] 
                     else:
                         st.error(f"Failed to calculate historical index values for new index: {index_history_df_new.get('_error', ['Unknown error'])[0]}")
                         st.session_state["current_calculated_index_data"] = pd.DataFrame() # Ensure it's a DataFrame
                         st.session_state["current_calculated_index_history"] = pd.DataFrame()
-                        st.session_state["factsheet_selected_constituents_index_names"] = [] # Clear selection if calculation fails
                         
         except pd.errors.EmptyDataError:
             st.error("The uploaded CSV file is empty.")
@@ -1047,7 +1066,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                             st.session_state["saved_indexes"] = [] 
                             st.session_state["current_calculated_index_data"] = pd.DataFrame() # Reset to empty DataFrame
                             st.session_state["current_calculated_index_history"] = pd.DataFrame() # Reset to empty DataFrame
-                            st.session_state["factsheet_selected_constituents_index_names"] = [] # Reset factsheet selection
                             st.rerun()
                 except Exception as e:
                     st.error(f"Error saving new index: {e}")
@@ -1209,7 +1227,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         current_live_value_for_factsheet_final = 0.0
         
         # UI for selecting which index's constituents to show in the factsheet
-        available_constituents_for_factsheet = ["None"]
+        available_constituents_for_factsheet = ["None"] # Keep "None" as an option
         if not current_calculated_index_data_df.empty:
             available_constituents_for_factsheet.append("Newly Calculated Index")
         if saved_indexes: # Add all saved index names
@@ -1424,7 +1442,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         supabase_client.table("custom_indexes").delete().eq("id", selected_db_index_data['id']).execute()
                         st.success(f"Index '{selected_index_to_manage}' deleted successfully.")
                         st.session_state["saved_indexes"] = [] # Force reload
-                        st.session_state["factsheet_selected_constituents_index_names"] = [] # Reset factsheet selection
                         st.rerun()
                     except Exception as e: st.error(f"Error deleting index: {e}")
     else:
