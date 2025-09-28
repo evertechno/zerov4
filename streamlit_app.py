@@ -75,7 +75,7 @@ def load_secrets():
         errors.append("Supabase credentials (url, anon_key)")
 
     if errors:
-        st.error(f"Missing required credentials in `.streamlit/secrets.toml`: {', '.join(errors)}.") # Changed .in_sidebar to .join
+        st.error(f"Missing required credentials in `.streamlit/secrets.toml`: {', '.join(errors)}.")
         st.info("Example `secrets.toml`:\n```toml\n[kite]\napi_key=\"YOUR_KITE_API_KEY\"\napi_secret=\"YOUR_KITE_SECRET\"\nredirect_uri=\"http://localhost:8501\"\n\n[supabase]\nurl=\"YOUR_SUPABASE_URL\"\nanon_key=\"YOUR_SUPABASE_ANON_KEY\"\n```")
         st.stop()
     return kite_conf, supabase_conf
@@ -526,6 +526,9 @@ def generate_factsheet_html_content(
             .warning-box { background-color: #554433; border-left: 5px solid #cc9966; padding: 10px; margin-top: 10px; border-radius: 4px; }
             .ai-agent-section { margin-top: 30px; padding: 15px; background-color: #333344; border-radius: 8px; }
             .ai-agent-section h3 { color: #add8e6; border-bottom: 1px solid #555; padding-bottom: 5px; }
+            details { margin-top: 15px; background-color: #3a3a3a; border-radius: 5px; padding: 5px 10px; cursor: pointer; }
+            summary { font-weight: bold; padding: 5px 0; outline: none; }
+            details[open] summary { border-bottom: 1px solid #555; margin-bottom: 10px; }
             @media print {
                 body { background-color: #fff; color: #000; }
                 .container { box-shadow: none; border: 1px solid #eee; background-color: #fff; }
@@ -533,6 +536,8 @@ def generate_factsheet_html_content(
                 th, td { border-color: #ccc; }
                 .plotly-graph { border: none; }
                 .ai-agent-section { display: none; /* Hide AI agent in print view if not desired */ }
+                details { background-color: #f0f0f0; color: #000; border: 1px solid #ccc; } /* Print style for details */
+                details[open] summary { border-bottom-color: #bbb; }
             }
         </style>
     </head>
@@ -569,8 +574,17 @@ def generate_factsheet_html_content(
         const_display_df['Last Price'] = const_display_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
         const_display_df['Weighted Price'] = const_display_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
         
-        # Use pandas to_html for the table
+        # Wrap the constituents table in a <details> tag for a collapsible "Load Constituents" button
+        html_content_parts.append("""
+            <details>
+                <summary>Click to view Constituent Data</summary>
+                <div style="margin-top: 10px;">
+        """)
         html_content_parts.append(const_display_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_html(index=False, classes='table'))
+        html_content_parts.append("""
+                </div>
+            </details>
+        """)
 
         # Index Composition Pie Chart - only if weights are meaningful
         if const_display_df['Weights'].sum() > 0:
@@ -758,23 +772,24 @@ with st.sidebar:
                 else:
                     st.warning("Please enter both email and password for sign up.")
 
-    st.markdown("---")
-    st.markdown("### 3. Quick Data Access (Kite)")
-    if st.session_state["kite_access_token"]:
-        current_k_client_for_sidebar = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
+    # Removed the "3. Quick Data Access (Kite)" section and its contents entirely.
+    # st.markdown("---")
+    # st.markdown("### 3. Quick Data Access (Kite)")
+    # if st.session_state["kite_access_token"]:
+    #     current_k_client_for_sidebar = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
 
-        if st.button("Fetch Current Holdings", key="sidebar_fetch_holdings_btn"):
-            try:
-                holdings = current_k_client_for_sidebar.holdings() # Direct call
-                st.session_state["holdings_data"] = pd.DataFrame(holdings)
-                st.success(f"Fetched {len(holdings)} holdings.")
-            except Exception as e:
-                st.error(f"Error fetching holdings: {e}")
-        if st.session_state.get("holdings_data") is not None and not st.session_state["holdings_data"].empty:
-            with st.expander("Show Holdings"):
-                st.dataframe(st.session_state["holdings_data"])
-    else:
-        st.info("Login to Kite to access quick data.")
+    #     if st.button("Fetch Current Holdings", key="sidebar_fetch_holdings_btn"):
+    #         try:
+    #             holdings = current_k_client_for_sidebar.holdings() # Direct call
+    #             st.session_state["holdings_data"] = pd.DataFrame(holdings)
+    #             st.success(f"Fetched {len(holdings)} holdings.")
+    #         except Exception as e:
+    #             st.error(f"Error fetching holdings: {e}")
+    #     if st.session_state.get("holdings_data") is not None and not st.session_state["holdings_data"].empty:
+    #         with st.expander("Show Holdings"):
+    #             st.dataframe(st.session_state["holdings_data"])
+    # else:
+    #     st.info("Login to Kite to access quick data.")
 
 
 # --- Authenticated KiteConnect client (used by main tabs) ---
