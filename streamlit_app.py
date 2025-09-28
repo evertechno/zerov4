@@ -48,7 +48,7 @@ if "last_comparison_df" not in st.session_state:
     st.session_state["last_comparison_df"] = pd.DataFrame()
 if "last_comparison_metrics" not in st.session_state: # To store metrics for factsheet
     st.session_state["last_comparison_metrics"] = {}
-if "last_facts_data" not in st.session_state:
+if "last_facts_data" not in st.session_state: # To store data for factsheet download
     st.session_state["last_facts_data"] = None
 if "last_factsheet_html_data" not in st.session_state: # To store HTML for factsheet download
     st.session_state["last_factsheet_html_data"] = None
@@ -1033,6 +1033,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
     if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
         
         # Call the new helper function for display purposes in the main tab
+        # This will enrich current_calculated_index_data_df with live prices for immediate display
         enriched_constituents_df_for_display, current_live_value_for_display = _get_live_constituent_data(
             current_calculated_index_data_df, api_key, access_token, st.session_state["instruments_df"]
         )
@@ -1229,13 +1230,12 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         
         # Prioritize newly calculated index for the factsheet if available
         if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
-            factsheet_index_name_final = "Newly Calculated Index" 
-            
-            # Fetch live prices and enrich the constituents DataFrame
+            # Call helper to get enriched constituents and live value
             factsheet_constituents_df_final, current_live_value_for_factsheet_final = _get_live_constituent_data(
                 current_calculated_index_data_df, api_key, access_token, st.session_state["instruments_df"]
             )
             factsheet_history_df_final = current_calculated_index_history_df.copy()
+            factsheet_index_name_final = "Newly Calculated Index" 
         
         # If no newly calculated index, but a specific saved index is selected for management (section 6), use that
         elif st.session_state.get('selected_index_to_manage') and st.session_state['selected_index_to_manage'] != "--- Select ---":
@@ -1244,7 +1244,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             if selected_db_index_data_for_factsheet:
                 base_constituents_df = pd.DataFrame(selected_db_index_data_for_factsheet['constituents']).copy()
                 
-                # Fetch live prices and enrich the constituents DataFrame
+                # Call helper to get enriched constituents and live value
                 factsheet_constituents_df_final, current_live_value_for_factsheet_final = _get_live_constituent_data(
                     base_constituents_df, api_key, access_token, st.session_state["instruments_df"]
                 )
