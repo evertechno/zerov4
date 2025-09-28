@@ -474,7 +474,7 @@ def generate_factsheet_csv_content(
     
     # --- Constituents ---
     content.append("\n--- Constituents ---\n")
-    if not current_calculated_index_data.empty:
+    if index_name != "Comparison Report" and not current_calculated_index_data.empty: # For a single primary index
         const_export_df = current_calculated_index_data.copy()
         # Ensure 'Name' column exists
         if 'Name' not in const_export_df.columns:
@@ -493,10 +493,14 @@ def generate_factsheet_csv_content(
         content.append(const_export_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False))
     elif index_name == "Comparison Report" and comparison_constituents_list: # For comparison report, list all constituents
         # Ensure instruments are loaded for accurate name/token mapping when creating CSV
+        instruments_df = pd.DataFrame()
         if st.session_state["instruments_df"].empty:
-            st.session_state["instruments_df"] = load_instruments_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], DEFAULT_EXCHANGE)
-            if "_error" in st.session_state["instruments_df"].columns:
-                st.warning(f"Could not load instruments for CSV constituent export: {st.session_state['instruments_df'].loc[0, '_error']}. Names/Live Prices might be missing.")
+            instruments_df = load_instruments_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], DEFAULT_EXCHANGE)
+            if "_error" in instruments_df.columns:
+                content.append(f"Warning: Could not load instruments for CSV constituent export: {instruments_df.loc[0, '_error']}. Names/Live Prices might be missing.\n")
+        else:
+            instruments_df = st.session_state["instruments_df"]
+
 
         for idx_constituents_dict in comparison_constituents_list:
             index_name_for_const = idx_constituents_dict['index_name']
@@ -504,7 +508,7 @@ def generate_factsheet_csv_content(
             
             # Enrich with live data for display within the report, if instruments are loaded
             enriched_const_df, _ = _get_live_constituent_data(
-                const_df, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], st.session_state["instruments_df"]
+                const_df, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], instruments_df
             )
 
             # Format these columns for display in CSV table
@@ -616,7 +620,7 @@ def generate_factsheet_html_content(
             <div style="margin-top: 10px;">
     """)
 
-    if not current_calculated_index_data.empty: # For a single primary index (newly calculated or selected from Section 6)
+    if index_name != "Comparison Report" and not current_calculated_index_data.empty: # For a single primary index (newly calculated or selected from Section 6)
         const_display_df = current_calculated_index_data.copy()
         
         if 'Name' not in const_display_df.columns:
@@ -636,10 +640,14 @@ def generate_factsheet_html_content(
     elif index_name == "Comparison Report" and comparison_constituents_list: # For a Comparison Report, list all selected custom indexes' constituents
         html_content_parts.append("<h4>Constituents of Compared Custom Indexes:</h4>")
         # Ensure instruments are loaded for accurate name/token mapping
+        instruments_df = pd.DataFrame()
         if st.session_state["instruments_df"].empty:
-            st.session_state["instruments_df"] = load_instruments_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], DEFAULT_EXCHANGE)
-            if "_error" in st.session_state["instruments_df"].columns:
-                html_content_parts.append(f"<p class='warning-box'>Could not load instruments for constituent display: {st.session_state['instruments_df'].loc[0, '_error']}. Names/Live Prices might be missing.</p>")
+            instruments_df = load_instruments_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], DEFAULT_EXCHANGE)
+            if "_error" in instruments_df.columns:
+                html_content_parts.append(f"<p class='warning-box'>Could not load instruments for constituent display: {instruments_df.loc[0, '_error']}. Names/Live Prices might be missing.</p>")
+        else:
+            instruments_df = st.session_state["instruments_df"]
+
 
         for idx_constituents_dict in comparison_constituents_list:
             idx_name = idx_constituents_dict['index_name']
@@ -647,7 +655,7 @@ def generate_factsheet_html_content(
             
             # Enrich with live data for display within the report, if instruments are loaded
             enriched_const_df, _ = _get_live_constituent_data(
-                const_df, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], st.session_state["instruments_df"]
+                const_df, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], instruments_df
             )
 
             # Format these columns for display in HTML table
@@ -1261,7 +1269,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                             # Store constituents for this index for the factsheet
                             st.session_state["all_comparison_constituents_for_factsheet"].append({
                                 'index_name': index_name,
-                                'constituents_data': constituents_df.to_dict(orient='records')
+                                'constituents_data': constituents_df.to_dict(orient='records') # Store as dicts for JSON compatibility
                             })
                         else:
                             st.error(f"Error processing custom index {index_name}: {normalized_df_result.loc[0, '_error']}")
@@ -1332,6 +1340,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         factsheet_history_df_final = pd.DataFrame()
         factsheet_index_name_final = "Consolidated Report" # Default for a general comparison report
         current_live_value_for_factsheet_final = 0.0
+        
+        # Get the list of constituents for comparison report if available from last run
         comparison_constituents_list_for_factsheet = st.session_state["all_comparison_constituents_for_factsheet"]
         
         # Prioritize newly calculated index for the factsheet if available
@@ -1343,7 +1353,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             factsheet_history_df_final = current_calculated_index_history_df.copy()
             factsheet_index_name_final = "Newly Calculated Index" 
             # Clear comparison constituents if a single index report is being generated
-            comparison_constituents_list_for_factsheet = []
+            comparison_constituents_list_for_factsheet = [] # Ensure it's not passed if not a comparison report
         
         # If no newly calculated index, but a specific saved index is selected for management (section 6), use that
         elif st.session_state.get('selected_index_to_manage') and st.session_state['selected_index_to_manage'] != "--- Select ---":
@@ -1366,14 +1376,16 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 
                 factsheet_index_name_final = selected_db_index_data_for_factsheet['index_name']
                 # Clear comparison constituents if a single index report is being generated
-                comparison_constituents_list_for_factsheet = []
+                comparison_constituents_list_for_factsheet = [] # Ensure it's not passed if not a comparison report
 
         # If neither a new index nor a specific saved index is chosen, but comparison data exists,
         # generate a generic comparison factsheet.
-        # This condition means factsheet_constituents_df_final and factsheet_history_df_final will remain empty DataFrames.
+        # In this case, factsheet_constituents_df_final will remain empty, but comparison_constituents_list_for_factsheet
+        # will contain the necessary data if a comparison was run.
         if (factsheet_constituents_df_final.empty and factsheet_history_df_final.empty) and not last_comparison_df.empty:
             factsheet_index_name_final = "Comparison Report"
             current_live_value_for_factsheet_final = 0.0 # No single live value for a comparison-only report
+            # comparison_constituents_list_for_factsheet is already set if a comparison was run
 
 
         # AI Agent Embed Snippet input
@@ -1388,6 +1400,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
         with col_factsheet_download_options_1:
             if st.button("Generate & Download Factsheet (CSV)", key="generate_download_factsheet_csv_btn"):
+                # Check if there's *any* data to put in the factsheet
                 if not factsheet_constituents_df_final.empty or not last_comparison_df.empty or comparison_constituents_list_for_factsheet:
                     factsheet_csv_content = generate_factsheet_csv_content(
                         current_calculated_index_data=factsheet_constituents_df_final,
@@ -1414,6 +1427,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
         with col_factsheet_download_options_2:
             if st.button("Generate & Download Factsheet (HTML/PDF)", key="generate_download_factsheet_html_btn"):
+                # Check if there's *any* data to put in the factsheet
                 if not factsheet_constituents_df_final.empty or not last_comparison_df.empty or comparison_constituents_list_for_factsheet:
                     factsheet_html_content = generate_factsheet_html_content(
                         current_calculated_index_data=factsheet_constituents_df_final,
