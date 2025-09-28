@@ -72,7 +72,7 @@ def load_secrets():
         errors.append("Supabase credentials (url, anon_key)")
 
     if errors:
-        st.error(f"Missing required credentials in `.streamlit/secrets.toml`: {', '.join(errors)}.")
+        st.error(f"Missing required credentials in `.streamlit/secrets.toml`: {', '.in_sidebar(errors)}.")
         st.info("Example `secrets.toml`:\n```toml\n[kite]\napi_key=\"YOUR_KITE_API_KEY\"\napi_secret=\"YOUR_KITE_SECRET\"\nredirect_uri=\"http://localhost:8501\"\n\n[supabase]\nurl=\"YOUR_SUPABASE_URL\"\nanon_key=\"YOUR_SUPABASE_ANON_KEY\"\n```")
         st.stop()
     return kite_conf, supabase_conf
@@ -702,81 +702,11 @@ k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state[
 
 
 # --- Main UI - Tabs for modules ---
-tabs = st.tabs(["Dashboard", "Market & Historical", "Custom Index"])
-tab_dashboard, tab_market, tab_custom_index = tabs
+tabs = st.tabs(["Market & Historical", "Custom Index"]) # Removed "Dashboard"
+tab_market, tab_custom_index = tabs # Updated assignment
 
 # --- Tab Logic Functions ---
-
-def render_dashboard_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
-    st.header("Personalized Dashboard")
-    st.write("Welcome to your advanced financial analysis dashboard.")
-
-    if not kite_client:
-        st.info("Please login to Kite Connect to view your personalized dashboard.")
-        return
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.subheader("Account Summary")
-        try:
-            profile = kite_client.profile() # Direct call, not cached
-            margins = kite_client.margins() # Direct call, not cached
-            st.metric("Account Holder", profile.get("user_name", "N/A"))
-            st.metric("Available Equity Margin", f"₹{margins.get('equity', {}).get('available', {}).get('live_balance', 0):,.2f}")
-            st.metric("Available Commodity Margin", f"₹{margins.get('commodity', {}).get('available', {}).get('live_balance', 0):,.2f}")
-        except Exception as e:
-            st.warning(f"Could not fetch full account summary: {e}")
-
-    with col2:
-        st.subheader("Market Insight (NIFTY 50)")
-        if api_key and access_token:
-            nifty_ltp_data = get_ltp_price_cached(api_key, access_token, "NIFTY 50", DEFAULT_EXCHANGE) # Use cached LTP
-            if nifty_ltp_data and "_error" not in nifty_ltp_data:
-                nifty_ltp = nifty_ltp_data.get("last_price", 0.0)
-                nifty_change = nifty_ltp_data.get("change", 0.0)
-                st.metric("NIFTY 50 (LTP)", f"₹{nifty_ltp:,.2f}", delta=f"{nifty_change:.2f}%")
-            else:
-                st.warning(f"Could not fetch NIFTY 50 LTP: {nifty_ltp_data.get('_error', 'Unknown error')}")
-        else:
-            st.info("Kite not authenticated to fetch NIFTY 50 LTP.")
-
-        if st.session_state.get("historical_data_NIFTY", pd.DataFrame()).empty:
-            if st.button("Load NIFTY 50 Historical for Chart", key="dashboard_load_nifty_hist_btn"):
-                if api_key and access_token:
-                    with st.spinner("Fetching NIFTY 50 historical data..."):
-                        nifty_df = get_historical_data_cached(api_key, access_token, "NIFTY 50", datetime.now().date() - timedelta(days=180), datetime.now().date(), "day", DEFAULT_EXCHANGE)
-                        if isinstance(nifty_df, pd.DataFrame) and "_error" not in nifty_df.columns:
-                            st.session_state["historical_data_NIFTY"] = nifty_df
-                            st.success("NIFTY 50 historical data loaded.")
-                        else:
-                            st.error(f"Error fetching NIFTY 50 historical: {nifty_df.get('_error', 'Unknown error')}")
-                else:
-                    st.warning("Kite not authenticated to fetch historical data.")
-
-        if not st.session_state.get("historical_data_NIFTY", pd.DataFrame()).empty:
-            nifty_df = st.session_state["historical_data_NIFTY"]
-            fig_nifty = go.Figure(data=[go.Candlestick(x=nifty_df.index, open=nifty_df['open'], high=nifty_df['high'], low=nifty_df['low'], close=nifty_df['close'], name='Candlestick'),
-                                         go.Scatter(x=nifty_df.index, y=ta.trend.sma_indicator(nifty_df['close'], window=20), mode='lines', name='SMA 20', line=dict(color='orange'))]) # Added a simple SMA for more visual data
-            fig_nifty.update_layout(title_text="NIFTY 50 Last 6 Months", xaxis_rangeslider_visible=False, height=300, template="plotly_white")
-            st.plotly_chart(fig_nifty, use_container_width=True)
-
-    with col3:
-        st.subheader("Quick Performance")
-        if st.session_state.get("last_fetched_symbol") and not st.session_state.get("historical_data", pd.DataFrame()).empty:
-            last_symbol = st.session_state["last_fetched_symbol"]
-            returns = st.session_state["historical_data"]["close"].pct_change().dropna() * 100
-            if not returns.empty:
-                perf = calculate_performance_metrics(returns)
-                st.write(f"**{last_symbol}** (Last Fetched)")
-                st.metric("Total Return", f"{perf.get('Total Return (%)', 0):.2f}%")
-                st.metric("Annualized Volatility", f"{perf.get('Annualized Volatility (%)', 0):.2f}%")
-                st.metric("Sharpe Ratio", f"{perf.get('Sharpe Ratio', 0):.2f}")
-            else:
-                st.info("No sufficient historical data for quick performance calculation.")
-        else:
-            st.info("Fetch some historical data in 'Market & Historical' tab to see quick performance here.")
-
+# render_dashboard_tab function removed as per request.
 
 def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("Market Data & Historical Candles")
@@ -1288,7 +1218,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         ltp_data_batch_for_factsheet_final = kc_client.ltp(instrument_identifiers)
                         for sym in symbols_for_ltp_for_factsheet_final:
                             key = f"{DEFAULT_EXCHANGE}:{sym}"
-                            live_quotes_for_factsheet_final[sym] = ltp_data_batch_for_factsheet_final.get(key, {}).get("last_price", np.nan)
+                            live_quotes[sym] = ltp_data_batch_for_factsheet_final.get(key, {}).get("last_price", np.nan)
                 except Exception as e:
                     st.warning(f"Error fetching batch LTP for factsheet live value (final): {e}. Live prices might be partial.")
             
@@ -1329,7 +1259,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                             ltp_data_batch_for_factsheet_final = kc_client.ltp(instrument_identifiers)
                             for sym in symbols_for_ltp_for_factsheet_final:
                                 key = f"{DEFAULT_EXCHANGE}:{sym}"
-                                live_quotes_for_factsheet_final[sym] = ltp_data_batch_for_factsheet_final.get(key, {}).get("last_price", np.nan)
+                                live_quotes[sym] = ltp_data_batch_for_factsheet_final.get(key, {}).get("last_price", np.nan)
                     except Exception as e:
                         st.warning(f"Error fetching batch LTP for factsheet live value (selected saved index): {e}. Live prices might be partial.")
                 
@@ -1471,6 +1401,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 api_key = KITE_CREDENTIALS["api_key"]
 access_token = st.session_state["kite_access_token"]
 
-with tab_dashboard: render_dashboard_tab(k, api_key, access_token)
+# Removed render_dashboard_tab(k, api_key, access_token)
 with tab_market: render_market_historical_tab(k, api_key, access_token)
 with tab_custom_index: render_custom_index_tab(k, supabase, api_key, access_token)
