@@ -688,13 +688,36 @@ def generate_factsheet_html_content(
         </details>
     """)
 
-    # Index Composition Pie Chart - This should only appear for a single primary index report
-    if not current_calculated_index_data.empty and current_calculated_index_data['Weights'].sum() > 0 and index_name != "Comparison Report":
+    # Index Composition Pie Chart - This should appear for a single primary index report OR for each index in a comparison report
+    if index_name != "Comparison Report" and not current_calculated_index_data.empty and current_calculated_index_data['Weights'].sum() > 0:
         html_content_parts.append("<h3>Index Composition</h3>")
         fig_pie = go.Figure(data=[go.Pie(labels=current_calculated_index_data['Name'], values=current_calculated_index_data['Weights'], hole=.3)])
         fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
         # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
         html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>") 
+    elif index_name == "Comparison Report" and comparison_constituents_list:
+        html_content_parts.append("<h3>Index Composition of Compared Indexes</h3>")
+        for idx_constituents_dict in comparison_constituents_list:
+            idx_name = idx_constituents_dict['index_name']
+            const_df = pd.DataFrame(idx_constituents_dict['constituents_data'])
+            
+            if not const_df.empty and const_df['Weights'].sum() > 0:
+                # Ensure 'Name' column exists for pie chart
+                if 'Name' not in const_df.columns:
+                    instruments_df = st.session_state["instruments_df"] # Use loaded instruments
+                    if not instruments_df.empty:
+                        instrument_names = instruments_df.set_index('tradingsymbol')['name'].to_dict()
+                        const_df['Name'] = const_df['symbol'].map(instrument_names).fillna(const_df['symbol'])
+                    else:
+                        const_df['Name'] = const_df['symbol'] # Fallback
+                
+                fig_pie = go.Figure(data=[go.Pie(labels=const_df['Name'], values=const_df['Weights'], hole=.3)])
+                fig_pie.update_layout(title_text=f'Constituent Weights: {idx_name}', height=400, template="plotly_dark")
+                html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
+                html_content_parts.append("<br>") # Add spacing between charts
+            else:
+                html_content_parts.append(f"<p class='warning-box'>No constituent data or weights available for composition chart of {idx_name}.</p>")
+        
     
     # --- Performance Metrics ---
     html_content_parts.append("<h3>Performance Metrics Summary</h3>")
