@@ -288,8 +288,13 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
     # Only consider returns below the risk-free rate for downside deviation
     downside_returns = daily_returns_decimal[daily_returns_decimal < risk_free_rate_decimal]
     
-    downside_std_dev_daily = downside_returns.std()
-    annualized_downside_std_dev = downside_std_dev_daily * np.sqrt(TRADING_DAYS_PER_YEAR) if not np.isnan(annualized_downside_std_dev) else np.nan
+    downside_std_dev_daily = downside_returns.std() # This can be NaN if downside_returns is empty/all NaN
+
+    # Initialize annualized_downside_std_dev to handle cases where downside_std_dev_daily is NaN
+    if not np.isnan(downside_std_dev_daily):
+        annualized_downside_std_dev = downside_std_dev_daily * np.sqrt(TRADING_DAYS_PER_YEAR)
+    else:
+        annualized_downside_std_dev = np.nan # Or 0, depending on desired behavior for no downside volatility
 
     sortino_ratio = (annualized_return / 100 - risk_free_rate_decimal) / (annualized_downside_std_dev) if annualized_downside_std_dev != 0 and not np.isnan(annualized_downside_std_dev) else np.nan
 
@@ -487,22 +492,27 @@ def generate_factsheet_csv_content(
         
         content.append(const_export_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False))
     elif index_name == "Comparison Report" and comparison_constituents_list: # For comparison report, list all constituents
+        # Ensure instruments are loaded for accurate name/token mapping when creating CSV
+        if st.session_state["instruments_df"].empty:
+            st.session_state["instruments_df"] = load_instruments_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], DEFAULT_EXCHANGE)
+            if "_error" in st.session_state["instruments_df"].columns:
+                st.warning(f"Could not load instruments for CSV constituent export: {st.session_state['instruments_df'].loc[0, '_error']}. Names/Live Prices might be missing.")
+
         for idx_constituents_dict in comparison_constituents_list:
             index_name_for_const = idx_constituents_dict['index_name']
             const_df = pd.DataFrame(idx_constituents_dict['constituents_data'])
             
+            # Enrich with live data for display within the report, if instruments are loaded
+            enriched_const_df, _ = _get_live_constituent_data(
+                const_df, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], st.session_state["instruments_df"]
+            )
+
+            # Format these columns for display in CSV table
+            enriched_const_df['Last Price'] = enriched_const_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+            enriched_const_df['Weighted Price'] = enriched_const_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+
             content.append(f"\nConstituents for {index_name_for_const}:\n")
-            if 'Name' not in const_df.columns: # Ensure 'Name' for display
-                const_df['Name'] = const_df['symbol']
-            
-            # These columns might not exist if fetched from DB directly without live data processing
-            if 'Last Price' not in const_df.columns: const_df['Last Price'] = np.nan
-            if 'Weighted Price' not in const_df.columns: const_df['Weighted Price'] = np.nan
-
-            const_df['Last Price'] = const_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
-            const_df['Weighted Price'] = const_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
-
-            content.append(const_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False))
+            content.append(enriched_const_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False))
     else:
         content.append("No constituent data available for this report.\n")
 
@@ -625,22 +635,20 @@ def generate_factsheet_html_content(
         html_content_parts.append(const_display_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_html(index=False, classes='table'))
     elif index_name == "Comparison Report" and comparison_constituents_list: # For a Comparison Report, list all selected custom indexes' constituents
         html_content_parts.append("<h4>Constituents of Compared Custom Indexes:</h4>")
+        # Ensure instruments are loaded for accurate name/token mapping
+        if st.session_state["instruments_df"].empty:
+            st.session_state["instruments_df"] = load_instruments_cached(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], DEFAULT_EXCHANGE)
+            if "_error" in st.session_state["instruments_df"].columns:
+                html_content_parts.append(f"<p class='warning-box'>Could not load instruments for constituent display: {st.session_state['instruments_df'].loc[0, '_error']}. Names/Live Prices might be missing.</p>")
+
         for idx_constituents_dict in comparison_constituents_list:
             idx_name = idx_constituents_dict['index_name']
             const_df = pd.DataFrame(idx_constituents_dict['constituents_data'])
             
             # Enrich with live data for display within the report, if instruments are loaded
-            if not st.session_state["instruments_df"].empty:
-                enriched_const_df, _ = _get_live_constituent_data(
-                    const_df, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], st.session_state["instruments_df"]
-                )
-            else:
-                enriched_const_df = const_df.copy()
-                enriched_const_df['Last Price'] = np.nan
-                enriched_const_df['Weighted Price'] = np.nan
-                if 'Name' not in enriched_const_df.columns:
-                    enriched_const_df['Name'] = enriched_const_df['symbol']
-
+            enriched_const_df, _ = _get_live_constituent_data(
+                const_df, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"], st.session_state["instruments_df"]
+            )
 
             # Format these columns for display in HTML table
             enriched_const_df['Last Price'] = enriched_const_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
@@ -1446,10 +1454,12 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         st.session_state['selected_index_to_manage'] = selected_index_to_manage # Store for factsheet logic
 
         selected_db_index_data = None
+        # Initialize loaded_constituents_df_base here to prevent NameError
+        loaded_constituents_df_base = pd.DataFrame() 
+
         if selected_index_to_manage != "--- Select ---":
             selected_db_index_data = next((idx for idx in saved_indexes if idx['index_name'] == selected_index_to_manage), None)
             if selected_db_index_data:
-                # Initialize loaded_constituents_df_base to an empty DataFrame to prevent NameError
                 loaded_constituents_df_base = pd.DataFrame(selected_db_index_data['constituents'])
                 
                 # Get live data for the selected index for display
@@ -1480,7 +1490,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 if loaded_historical_df.empty:
                     min_date = (datetime.now().date() - timedelta(days=365))
                     max_date = datetime.now().date()
-                    # Ensure loaded_constituents_df_base is properly initialized before this call
+                    # loaded_constituents_df_base is now guaranteed to be a DataFrame
                     recalculated_historical_df = _calculate_historical_index_value(api_key, access_token, loaded_constituents_df_base, min_date, max_date, DEFAULT_EXCHANGE)
                     
                     if not recalculated_historical_df.empty and "_error" not in recalculated_historical_df.columns:
