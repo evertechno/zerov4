@@ -285,7 +285,7 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
     downside_returns = daily_returns_decimal[daily_returns_decimal < risk_free_rate_decimal]
     
     downside_std_dev_daily = downside_returns.std()
-    annualized_downside_std_dev = downside_std_dev_daily * np.sqrt(TRADING_DAYS_PER_YEAR) if not np.isnan(downside_std_dev_daily) else np.nan
+    annualized_downside_std_dev = downside_std_dev_daily * np.sqrt(TRADING_DAYS_PER_YEAR) if not np.isnan(annualized_downside_std_dev) else np.nan
 
     sortino_ratio = (annualized_return / 100 - risk_free_rate_decimal) / (annualized_downside_std_dev) if annualized_downside_std_dev != 0 and not np.isnan(annualized_downside_std_dev) else np.nan
 
@@ -576,7 +576,7 @@ def generate_factsheet_html_content(
     # --- Constituents ---
     html_content_parts.append("<h3>Constituents</h3>")
     
-    # Always render the details/summary, then put conditional content inside
+    # ALWAYS render the <details> and <summary> tags
     html_content_parts.append("""
         <details>
             <summary>Click to view Constituent Data</summary>
@@ -601,16 +601,19 @@ def generate_factsheet_html_content(
         
         html_content_parts.append(const_display_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_html(index=False, classes='table'))
     else:
-        html_content_parts.append("<p class='warning-box'>No constituent data available for this index.</p>")
+        # If no data, display the message inside the details tag
+        html_content_parts.append("<p class='warning-box'>No constituent data available for this report (this is expected for comparison-only reports without a primary index, or if constituent data could not be loaded).</p>")
     
+    # Close the <div> and <details> tags
     html_content_parts.append("""
             </div>
         </details>
     """)
 
-    # Index Composition Pie Chart - only if constituents and weights are meaningful
+    # Index Composition Pie Chart - This should still be conditional on data actually existing
     if not current_calculated_index_data.empty and current_calculated_index_data['Weights'].sum() > 0:
         html_content_parts.append("<h3>Index Composition</h3>")
+        # Use current_calculated_index_data as it's the one passed to this function
         fig_pie = go.Figure(data=[go.Pie(labels=current_calculated_index_data['Name'], values=current_calculated_index_data['Weights'], hole=.3)])
         fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
         # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
