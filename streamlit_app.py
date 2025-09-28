@@ -15,8 +15,8 @@ import re # For email validation
 from supabase import create_client, Client
 from kiteconnect import KiteConnect
 
-# Resend import
-from resend import Resend # pip install resend-python
+# Resend import: Corrected import statement
+import resend # Use 'import resend' directly
 
 # --- Streamlit Page Configuration ---
 st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
@@ -88,6 +88,8 @@ def load_secrets():
         st.stop()
     
     st.session_state["resend_api_key"] = resend_conf["api_key"] # Store Resend API key in session state
+    # Set the Resend API key globally as per Resend library documentation
+    resend.api_key = st.session_state["resend_api_key"] 
     return kite_conf, supabase_conf
 
 KITE_CREDENTIALS, SUPABASE_CREDENTIALS = load_secrets()
@@ -107,29 +109,19 @@ def init_kite_unauth_client(api_key: str) -> KiteConnect:
 kite_unauth_client = init_kite_unauth_client(KITE_CREDENTIALS["api_key"])
 login_url = kite_unauth_client.login_url()
 
-# --- Resend Client Initialization ---
-# The Resend client needs the API key, which is loaded into session state.
-# Initialize it when needed, or globally if safe. For Streamlit, it's safer
-# to pass the key or initialize within a function when a button is pressed.
-# Let's define a helper for it.
-def get_resend_client():
-    if st.session_state.get("resend_api_key"):
-        return Resend(api_key=st.session_state["resend_api_key"])
-    return None
-
 # --- Email Validation Helper ---
 def is_valid_email(email):
-    return re.match(r"[^@]+@[^@]+\.[^@]+", email)
+    return re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", email) # More robust regex
 
 # --- Send Email Function ---
-def send_html_email_resend(recipient_emails: str, subject: str, html_content: str, factsheet_name: str):
-    resend_client = get_resend_client()
-    if not resend_client:
+def send_html_email_resend(recipient_emails_str: str, subject: str, html_content: str, factsheet_name: str):
+    
+    if not resend.api_key:
         st.error("Resend API key not configured. Cannot send email.")
         return False
 
     # Validate recipient emails
-    recipients = [e.strip() for e in recipient_emails.split(',') if e.strip()]
+    recipients = [e.strip() for e in recipient_emails_str.split(',') if e.strip()]
     valid_recipients = [e for e in recipients if is_valid_email(e)]
     invalid_recipients = [e for e in recipients if not is_valid_email(e)]
 
@@ -140,7 +132,8 @@ def send_html_email_resend(recipient_emails: str, subject: str, html_content: st
         st.warning(f"Skipping invalid email addresses: {', '.join(invalid_recipients)}")
 
     try:
-        email_sent = resend_client.emails.send(
+        # Use resend.Emails.send() directly
+        email_sent = resend.emails.send(
             {
                 "from": SENDER_EMAIL,
                 "to": valid_recipients,
@@ -1332,9 +1325,9 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             value="<iframe\n  src=\"https://etlas-v5.vercel.app/chat-agent?id=93dee35f-0ebe-42f6-beef-9a1abd1a6f12\"\n  width=\"400\"\n  height=\"600\"\n  frameborder=\"0\"\n  style=\"border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);\"\n></iframe>"
         )
 
-        col_factsheet_download_options_1, col_factsheet_download_options_2, col_factsheet_email = st.columns([1,1,2]) # Added a column for email
-
-        with col_factsheet_download_options_1:
+        col_factsheet_download_1, col_factsheet_download_2 = st.columns(2)
+        
+        with col_factsheet_download_1:
             if st.button("Generate & Download Factsheet (CSV)", key="generate_download_factsheet_csv_btn"):
                 if not factsheet_constituents_df_final.empty or not last_comparison_df.empty:
                     factsheet_csv_content = generate_factsheet_csv_content(
@@ -1359,7 +1352,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 else:
                     st.warning("No data available to generate a factsheet. Please calculate a new index, load a saved index, or run a comparison first.")
 
-        with col_factsheet_download_options_2:
+        with col_factsheet_download_2:
             if st.button("Generate & Download Factsheet (HTML)", key="generate_download_factsheet_html_btn"):
                 if not factsheet_constituents_df_final.empty or not last_comparison_df.empty:
                     factsheet_html_content = generate_factsheet_html_content(
@@ -1385,23 +1378,24 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     st.success("HTML Factsheet generated and ready for download! (Open in browser, then 'Print to PDF')")
                 else:
                     st.warning("No data available to generate a factsheet. Please calculate a new index, load a saved index, or run a comparison first.")
+        
+        st.markdown("---")
+        st.subheader("Email HTML Factsheet")
+        recipient_emails_input = st.text_input(
+            "Recipient Email(s) (comma-separated)",
+            key="recipient_emails_input",
+            help="Enter one or more email addresses to send the HTML factsheet. Requires HTML factsheet to be generated first."
+        )
+        if st.button("Send HTML Factsheet via Email", key="email_html_factsheet_btn"):
+            if not st.session_state.get("last_factsheet_html_data"):
+                st.warning("Please generate the HTML Factsheet first (using the 'Generate & Download Factsheet (HTML)' button) before attempting to email.")
+            elif not recipient_emails_input.strip():
+                st.warning("Please enter at least one recipient email address.")
+            else:
+                factsheet_html_content_to_email = st.session_state["last_factsheet_html_data"].decode('utf-8')
+                email_subject = f"Invsion Connect Factsheet: {factsheet_index_name_final} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                send_html_email_resend(recipient_emails_input, email_subject, factsheet_html_content_to_email, factsheet_index_name_final)
 
-        with col_factsheet_email:
-            st.markdown("---") # Visual separator for email section
-            recipient_emails_input = st.text_input(
-                "Recipient Email(s) (comma-separated)",
-                key="recipient_emails_input",
-                help="Enter one or more email addresses to send the HTML factsheet."
-            )
-            if st.button("Email HTML Factsheet", key="email_html_factsheet_btn"):
-                if not st.session_state.get("last_factsheet_html_data"):
-                    st.warning("Please generate the HTML Factsheet first before attempting to email.")
-                elif not recipient_emails_input.strip():
-                    st.warning("Please enter at least one recipient email address.")
-                else:
-                    factsheet_html_content_to_email = st.session_state["last_factsheet_html_data"].decode('utf-8')
-                    email_subject = f"Invsion Connect Factsheet: {factsheet_index_name_final} - {datetime.now().strftime('%Y-%m-%d')}"
-                    send_html_email_resend(recipient_emails_input, email_subject, factsheet_html_content_to_email, factsheet_index_name_final)
 
         st.markdown("---")
         st.subheader("6. View/Delete Individual Saved Indexes")
