@@ -17,7 +17,7 @@ from kiteconnect import KiteConnect # Moved import to top for consistency
 # --- Streamlit Page Configuration ---
 st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
 st.title("Invsion Connect")
-st.markdown("Aprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
+st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
 # --- Global Constants & Session State Initialization ---
 TRADING_DAYS_PER_YEAR = 252 # Commonly accepted general figure for equity markets. Can be adjusted for specific regions.
@@ -60,6 +60,8 @@ if "historical_data_NIFTY" not in st.session_state:
     st.session_state["historical_data_NIFTY"] = pd.DataFrame()
 if "selected_index_to_manage" not in st.session_state: # Added for consistent factsheet generation
     st.session_state["selected_index_to_manage"] = "--- Select ---"
+if "displayed_constituents_df" not in st.session_state: # New state for displaying constituents in tab
+    st.session_state["displayed_constituents_df"] = pd.DataFrame()
 
 
 # --- Load Credentials from Streamlit Secrets ---
@@ -920,7 +922,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         hist_df = pd.DataFrame()
         if data_type == "custom_index":
             if constituents_df is None or constituents_df.empty:
-                return pd.DataFrame({"_error": ["No constituents for custom index {name}."]})
+                return pd.DataFrame({"_error": [f"No constituents for custom index {name}."]})
             # Always recalculate for the exact comparison range to ensure consistency
             hist_df = _calculate_historical_index_value(api_key, access_token, constituents_df, comparison_start_date, comparison_end_date, exchange)
             if "_error" in hist_df.columns:
@@ -1388,15 +1390,31 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         if selected_index_to_manage != "--- Select ---":
             selected_db_index_data = next((idx for idx in saved_indexes if idx['index_name'] == selected_index_to_manage), None)
             if selected_db_index_data:
-                loaded_constituents_df_base = pd.DataFrame(selected_db_index_data['constituents'])
-                
-                # Get live data for the selected index for display
-                loaded_constituents_df, current_live_value_for_selected = _get_live_constituent_data(
-                    loaded_constituents_df_base, api_key, access_token, st.session_state["instruments_df"]
-                )
+                # Placeholder for displaying constituents of the selected index
+                # We need to load instruments first for accurate name/token mapping
+                if st.session_state["instruments_df"].empty:
+                    st.session_state["instruments_df"] = load_instruments_cached(api_key, access_token, DEFAULT_EXCHANGE)
+                    if "_error" in st.session_state["instruments_df"].columns:
+                         st.error(f"Failed to load instruments for constituent lookup: {st.session_state['instruments_df'].loc[0, '_error']}")
+                         # Cannot proceed with fetching live data if instruments fail
+                         loaded_constituents_df = pd.DataFrame()
+                         current_live_value_for_selected = 0.0
+                    else:
+                        base_constituents_df = pd.DataFrame(selected_db_index_data['constituents'])
+                        loaded_constituents_df, current_live_value_for_selected = _get_live_constituent_data(
+                            base_constituents_df, api_key, access_token, st.session_state["instruments_df"]
+                        )
+                else: # Instruments already loaded
+                    base_constituents_df = pd.DataFrame(selected_db_index_data['constituents'])
+                    loaded_constituents_df, current_live_value_for_selected = _get_live_constituent_data(
+                        base_constituents_df, api_key, access_token, st.session_state["instruments_df"]
+                    )
 
+                # Store the loaded and enriched constituents for display in the app UI
+                st.session_state["displayed_constituents_df"] = loaded_constituents_df
+
+                # Load historical data for individual management view (may need recalculation)
                 loaded_historical_performance_raw = selected_db_index_data.get('historical_performance')
-
                 loaded_historical_df = pd.DataFrame()
                 is_recalculated_live = False
 
@@ -1424,6 +1442,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     else:
                         st.error(f"Failed to recalculate historical data: {recalculated_historical_df.get('_error', 'Unknown error')}")
 
+                # Display the selected index details, including the newly loaded constituents
                 display_single_index_details(selected_index_to_manage, loaded_constituents_df, loaded_historical_df, selected_db_index_data['id'], is_recalculated_live)
                 
                 st.markdown("---")
@@ -1433,10 +1452,54 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         st.success(f"Index '{selected_index_to_manage}' deleted successfully.")
                         st.session_state["saved_indexes"] = [] # Force reload
                         st.session_state['selected_index_to_manage'] = "--- Select ---" # Reset selector
+                        st.session_state["displayed_constituents_df"] = pd.DataFrame() # Clear displayed constituents
                         st.rerun()
                     except Exception as e: st.error(f"Error deleting index: {e}")
-    else:
-        st.info("No saved indexes to manage yet. Load them using the button above.")
+            else:
+                st.warning(f"Could not find data for index '{selected_index_to_manage}'. It might have been deleted.")
+                st.session_state["displayed_constituents_df"] = pd.DataFrame()
+        else: # If "--- Select ---" is chosen
+            st.info("Select a saved index from the dropdown above to view its details or delete it.")
+            st.session_state["displayed_constituents_df"] = pd.DataFrame() # Clear previous display
+
+        # New: Always display the "Load Constituent Data" button and its output area
+        # This section comes after the selection logic, but before the factsheet generation.
+        st.markdown("#### Load Constituent Data for Selected Index")
+        if st.session_state['selected_index_to_manage'] != "--- Select ---":
+            if st.button(f"Load Constituent Data for '{st.session_state['selected_index_to_manage']}'", key="load_const_data_button_in_tab"):
+                selected_db_index_data_for_display = next((idx for idx in saved_indexes if idx['index_name'] == st.session_state['selected_index_to_manage']), None)
+                if selected_db_index_data_for_display:
+                    base_constituents_df_to_load = pd.DataFrame(selected_db_index_data_for_display['constituents']).copy()
+                    
+                    if st.session_state["instruments_df"].empty:
+                        with st.spinner("Loading instruments for constituent display..."):
+                            st.session_state["instruments_df"] = load_instruments_cached(api_key, access_token, DEFAULT_EXCHANGE)
+                            if "_error" in st.session_state["instruments_df"].columns:
+                                st.error(f"Failed to load instruments for constituent display: {st.session_state['instruments_df'].loc[0, '_error']}")
+                                st.session_state["displayed_constituents_df"] = pd.DataFrame()
+                                return
+                    
+                    with st.spinner(f"Fetching live prices for {st.session_state['selected_index_to_manage']} constituents..."):
+                        enriched_df, live_val = _get_live_constituent_data(
+                            base_constituents_df_to_load, api_key, access_token, st.session_state["instruments_df"]
+                        )
+                        st.session_state["displayed_constituents_df"] = enriched_df
+                        st.info(f"Loaded constituents for '{st.session_state['selected_index_to_manage']}'. Current Live Value: ₹{live_val:,.2f}" if live_val > 0 else f"Loaded constituents for '{st.session_state['selected_index_to_manage']}'. Live value N/A.")
+                else:
+                    st.error("Selected index not found. Please refresh saved indexes.")
+            
+            # Display the loaded constituents if available in session state
+            if not st.session_state["displayed_constituents_df"].empty:
+                st.markdown("##### Currently Displayed Constituent Data:")
+                st.dataframe(st.session_state["displayed_constituents_df"][['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].style.format({
+                    "Weights": "{:.4f}",
+                    "Last Price": "₹{:,.2f}",
+                    "Weighted Price": "₹{:,.2f}"
+                }), use_container_width=True)
+            elif st.session_state['selected_index_to_manage'] != "--- Select ---":
+                st.info("Click the button above to load constituent data for the selected index.")
+        else:
+            st.info("Select an index from the 'View/Delete Individual Saved Indexes' dropdown above to load its constituents.")
 
 
 # --- Main Application Logic (Tab Rendering) ---
