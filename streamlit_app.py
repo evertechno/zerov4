@@ -15,7 +15,8 @@ from supabase import create_client, Client
 from kiteconnect import KiteConnect # Moved import to top for consistency
 
 # --- Streamlit Page Configuration ---
-st.set_set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
+# CORRECTED LINE HERE
+st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded") 
 st.title("Invsion Connect")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
@@ -1089,7 +1090,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         hist_df = pd.DataFrame()
         if data_type == "custom_index":
             if constituents_df is None or constituents_df.empty:
-                return pd.DataFrame({"_error": [f"No constituents for custom index {name}."]})
+                return pd.DataFrame({"_error": ["No constituents for custom index {name}."]})
             # Always recalculate for the exact comparison range to ensure consistency
             hist_df = _calculate_historical_index_value(api_key, access_token, constituents_df, comparison_start_date, comparison_end_date, exchange)
             if "_error" in hist_df.columns:
@@ -1156,34 +1157,41 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         plot_df = plot_df[plot_df['Weights'] > 0] # Filter out zero or negative weights
         
         if not plot_df.empty and plot_df['Weights'].sum() > 0: # Final check for empty df or zero sum
-            fig_pie = go.Figure(data=[go.Pie(
-                labels=plot_df['Name'], 
-                values=plot_df['Weights'], 
-                hole=.3,
-                textinfo='percent+label', # Show both percent and label
-                insidetextorientation='radial', # Orient labels radially
-                uniformtext_minsize=10, # Minimum font size
-                uniformtext_mode='hide', # Hide if text doesn't fit
-                hovertemplate="<b>%{label}</b><br>Weight: %{percent}<extra></extra>"
-            )])
-            fig_pie.update_layout(
-                title_text='Constituent Weights', 
-                height=400, 
-                template="plotly_dark",
-                margin=dict(l=20, r=20, t=50, b=20),
-                legend=dict(
-                    orientation="v",
-                    yanchor="auto",
-                    y=1,
-                    xanchor="left",
-                    x=1.02, # Position slightly outside the chart
-                    traceorder="normal",
-                    font=dict(size=10),
-                    itemwidth=30,
-                    groupclick="toggleitem"
+            # Before plotting, ensure labels and values are not empty lists
+            pie_labels = plot_df['Name'].tolist()
+            pie_values = plot_df['Weights'].tolist()
+
+            if pie_labels and pie_values: # Only proceed if there are actual labels and values
+                fig_pie = go.Figure(data=[go.Pie(
+                    labels=pie_labels, 
+                    values=pie_values, 
+                    hole=.3,
+                    textinfo='percent+label', # Show both percent and label
+                    insidetextorientation='radial', # Orient labels radially
+                    uniformtext_minsize=10, # Minimum font size
+                    uniformtext_mode='hide', # Hide if text doesn't fit
+                    hovertemplate="<b>%{label}</b><br>Weight: %{percent}<extra></extra>"
+                )])
+                fig_pie.update_layout(
+                    title_text='Constituent Weights', 
+                    height=400, 
+                    template="plotly_dark",
+                    margin=dict(l=20, r=20, t=50, b=20),
+                    legend=dict(
+                        orientation="v",
+                        yanchor="auto",
+                        y=1,
+                        xanchor="left",
+                        x=1.02, # Position slightly outside the chart
+                        traceorder="normal",
+                        font=dict(size=10),
+                        itemwidth=30,
+                        groupclick="toggleitem"
+                    )
                 )
-            )
-            st.plotly_chart(fig_pie, use_container_width=True)
+                st.plotly_chart(fig_pie, use_container_width=True)
+            else:
+                st.info("No valid constituent data (labels or values) available for composition chart after filtering.")
         else:
             st.info("No valid constituents or weights available for composition chart.")
 
