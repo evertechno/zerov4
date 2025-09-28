@@ -48,7 +48,7 @@ if "last_comparison_df" not in st.session_state:
     st.session_state["last_comparison_df"] = pd.DataFrame()
 if "last_comparison_metrics" not in st.session_state: # To store metrics for factsheet
     st.session_state["last_comparison_metrics"] = {}
-if "last_facts_data" not in st.session_state: # To store data for factsheet download
+if "last_facts_data" not in st.session_state:
     st.session_state["last_facts_data"] = None
 if "last_factsheet_html_data" not in st.session_state: # To store HTML for factsheet download
     st.session_state["last_factsheet_html_data"] = None
@@ -443,7 +443,10 @@ def generate_factsheet_csv_content(
     content.append(f"Factsheet for {index_name}\n")
     content.append(f"Generated On: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     content.append("\n--- Index Overview ---\n")
-    content.append(f"Current Live Calculated Index Value,₹{current_live_value:,.2f}\n")
+    if current_live_value > 0 and not current_calculated_index_data.empty:
+        content.append(f"Current Live Calculated Index Value,₹{current_live_value:,.2f}\n")
+    else:
+        content.append("Current Live Calculated Index Value,N/A (Constituent data not available or comparison report only)\n")
     
     # --- Constituents ---
     content.append("\n--- Constituents ---\n")
@@ -938,7 +941,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
     # Helper function to render an index's details, charts, and export options
     def display_single_index_details(index_name: str, constituents_df: pd.DataFrame, index_history_df: pd.DataFrame, index_id: str | None = None, is_recalculated_live=False):
-        st.markdown(f"#### Details for Index: **{index_name}** {'(Recalculated Live)' if is_recalculated_live else ''}")
+        st.markdown(f"#### Details for Index: **{index_name}** {'<span style="color:yellow; font-size:0.8em;">(Historical data recalculated live)</span>' if is_recalculated_live else ''}", unsafe_allow_html=True)
         
         st.subheader("Constituents and Current Live Value")
         
@@ -954,7 +957,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         }), use_container_width=True)
         
         # Display live value based on whether it was successfully calculated
-        if current_live_value > 0:
+        if current_live_value > 0 and not enriched_constituents_df.empty:
             st.success(f"Current Live Calculated Index Value: **₹{current_live_value:,.2f}**")
         else:
             st.warning("Current Live Calculated Index Value: N/A (Could not fetch live prices for constituents).")
@@ -967,7 +970,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
         if not enriched_constituents_df.empty and enriched_constituents_df['Weights'].sum() > 0:
             fig_pie = go.Figure(data=[go.Pie(labels=enriched_constituents_df['Name'], values=enriched_constituents_df['Weights'], hole=.3)])
-            fig_pie.update_layout(title_text='Constituent Weights', height=400)
+            fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
             st.plotly_chart(fig_pie, use_container_width=True)
         else:
             st.info("No constituents or weights available for composition chart.")
@@ -1133,10 +1136,11 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             comparison_start_date = st.date_input("Comparison Start Date", value=datetime.now().date() - timedelta(days=365), key="comparison_start_date")
             comparison_end_date = st.date_input("Comparison End Date", value=datetime.now().date(), key="comparison_end_date")
             if comparison_start_date >= comparison_end_date:
-                st.error("Comparison start date must be before end date.")
-                # To ensure comparison_start_date and comparison_end_date are always defined
-                comparison_start_date = datetime.now().date() - timedelta(days=365)
-                comparison_end_date = datetime.now().date()
+                st.error("Comparison start date must be before end date. Adjusting dates for valid comparison.")
+                comparison_start_date = comparison_end_date - timedelta(days=365) # Auto-adjust for a year if invalid
+                if comparison_start_date >= comparison_end_date: # Ensure it's still before
+                     comparison_start_date = comparison_end_date - timedelta(days=1)
+                st.info(f"Adjusted start date to {comparison_start_date} for a valid range.")
 
 
         with col_comp_bench:
@@ -1234,7 +1238,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 xaxis_title="Date",
                 yaxis_title="Normalized Value (Base 100)",
                 height=600,
-                template="plotly_white",
+                template="plotly_dark",
                 hovermode="x unified"
             )
             st.plotly_chart(fig_comparison, use_container_width=True)
@@ -1256,7 +1260,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         
         # Prioritize newly calculated index for the factsheet if available
         if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
-            factsheet_index_name_final = "Invsion Connect Factsheet: Newly Calculated Index" 
+            factsheet_index_name_final = "Newly Calculated Index" 
             
             # Fetch live prices and enrich the constituents DataFrame
             factsheet_constituents_df_final, current_live_value_for_factsheet_final = _get_live_constituent_data(
@@ -1283,12 +1287,12 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                     factsheet_history_df_final.set_index('date', inplace=True)
                     factsheet_history_df_final.sort_index(inplace=True)
                 
-                factsheet_index_name_final = f"Invsion Connect Factsheet: {selected_db_index_data_for_factsheet['index_name']}"
+                factsheet_index_name_final = selected_db_index_data_for_factsheet['index_name']
 
         # If neither a new index nor a specific saved index is chosen, but comparison data exists,
         # generate a generic comparison factsheet.
         if (factsheet_constituents_df_final.empty and factsheet_history_df_final.empty) and not last_comparison_df.empty:
-            factsheet_index_name_final = "Invsion Connect Factsheet: Comparison Report"
+            factsheet_index_name_final = "Comparison Report"
             current_live_value_for_factsheet_final = 0.0 # No single live value for a comparison-only report
 
 
@@ -1430,3 +1434,5 @@ access_token = st.session_state["kite_access_token"]
 # Removed render_dashboard_tab(k, api_key, access_token)
 with tab_market: render_market_historical_tab(k, api_key, access_token)
 with tab_custom_index: render_custom_index_tab(k, supabase, api_key, access_token)
+
+```
