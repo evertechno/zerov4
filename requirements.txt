@@ -6,5 +6,4 @@ scikit-learn
 lightgbm
 ta
 matplotlib
-resend-python
 resend
