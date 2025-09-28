@@ -1301,6 +1301,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
         # If neither a new index nor a specific saved index is chosen, but comparison data exists,
         # generate a generic comparison factsheet.
+        # This condition means factsheet_constituents_df_final and factsheet_history_df_final will remain empty DataFrames.
         if (factsheet_constituents_df_final.empty and factsheet_history_df_final.empty) and not last_comparison_df.empty:
             factsheet_index_name_final = "Comparison Report"
             current_live_value_for_factsheet_final = 0.0 # No single live value for a comparison-only report
