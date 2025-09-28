@@ -15,7 +15,7 @@ from supabase import create_client, Client
 from kiteconnect import KiteConnect # Moved import to top for consistency
 
 # --- Streamlit Page Configuration ---
-st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
+st.set_set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
 st.title("Invsion Connect")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
@@ -689,7 +689,7 @@ def generate_factsheet_html_content(
     """)
 
     # Index Composition Pie Chart - This should appear for a single primary index report OR for each index in a comparison report
-    if index_name != "Comparison Report" and not current_calculated_index_data.empty and 'Weights' in current_calculated_index_data.columns and current_calculated_index_data['Weights'].sum() > 0:
+    if index_name != "Comparison Report" and not current_calculated_index_data.empty and 'Weights' in current_calculated_index_data.columns:
         html_content_parts.append("<h3>Index Composition</h3>")
         
         plot_df = current_calculated_index_data.copy()
@@ -697,11 +697,12 @@ def generate_factsheet_html_content(
         if 'Name' not in plot_df.columns:
             plot_df['Name'] = plot_df['symbol']
 
-        # Ensure weights are numeric and drop NaNs if any slipped through
-        plot_df['Weights'] = pd.to_numeric(plot_df['Weights'], errors='coerce').fillna(0)
-        plot_df = plot_df[plot_df['Weights'] > 0] # Only plot positive weights
+        # Ensure weights are numeric and drop NaNs if any slipped through, then filter for positive weights
+        plot_df['Weights'] = pd.to_numeric(plot_df['Weights'], errors='coerce')
+        plot_df = plot_df.dropna(subset=['Weights'])
+        plot_df = plot_df[plot_df['Weights'] > 0] 
         
-        if not plot_df.empty: # Re-check after cleanup
+        if not plot_df.empty and plot_df['Weights'].sum() > 0: # Re-check after cleanup for empty df or zero sum
             fig_pie = go.Figure(data=[go.Pie(
                 labels=plot_df['Name'], 
                 values=plot_df['Weights'], 
@@ -748,13 +749,14 @@ def generate_factsheet_html_content(
                 else:
                     const_df['Name'] = const_df['symbol'] # Fallback
             
-            # Ensure weights are numeric and drop NaNs if any slipped through
+            # Ensure weights are numeric and drop NaNs if any slipped through, then filter for positive weights
             plot_df_comp = const_df.copy()
-            plot_df_comp['Weights'] = pd.to_numeric(plot_df_comp['Weights'], errors='coerce').fillna(0)
-            plot_df_comp = plot_df_comp[plot_df_comp['Weights'] > 0] # Only plot positive weights
+            plot_df_comp['Weights'] = pd.to_numeric(plot_df_comp['Weights'], errors='coerce')
+            plot_df_comp = plot_df_comp.dropna(subset=['Weights'])
+            plot_df_comp = plot_df_comp[plot_df_comp['Weights'] > 0]
 
 
-            if not plot_df_comp.empty: # Re-check after cleanup
+            if not plot_df_comp.empty and plot_df_comp['Weights'].sum() > 0: # Re-check after cleanup for empty df or zero sum
                 fig_pie = go.Figure(data=[go.Pie(
                     labels=plot_df_comp['Name'], 
                     values=plot_df_comp['Weights'], 
@@ -1147,12 +1149,13 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         if 'Name' not in enriched_constituents_df.columns:
             enriched_constituents_df['Name'] = enriched_constituents_df['symbol']
 
-        # Ensure weights are numeric and drop NaNs if any slipped through
+        # Prepare data for the pie chart with robust checks
         plot_df = enriched_constituents_df.copy()
-        plot_df['Weights'] = pd.to_numeric(plot_df['Weights'], errors='coerce').fillna(0)
-        plot_df = plot_df[plot_df['Weights'] > 0] # Only plot positive weights
+        plot_df['Weights'] = pd.to_numeric(plot_df['Weights'], errors='coerce')
+        plot_df = plot_df.dropna(subset=['Weights'])
+        plot_df = plot_df[plot_df['Weights'] > 0] # Filter out zero or negative weights
         
-        if not plot_df.empty: # Re-check after cleanup
+        if not plot_df.empty and plot_df['Weights'].sum() > 0: # Final check for empty df or zero sum
             fig_pie = go.Figure(data=[go.Pie(
                 labels=plot_df['Name'], 
                 values=plot_df['Weights'], 
