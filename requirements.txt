@@ -7,3 +7,4 @@ lightgbm
 ta
 matplotlib
 resend-python
+resend
