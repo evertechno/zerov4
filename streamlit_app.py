@@ -58,6 +58,9 @@ if "holdings_data" not in st.session_state:
     st.session_state["holdings_data"] = None
 if "historical_data_NIFTY" not in st.session_state:
     st.session_state["historical_data_NIFTY"] = pd.DataFrame()
+if "selected_index_to_manage" not in st.session_state: # Added for consistent factsheet generation
+    st.session_state["selected_index_to_manage"] = "--- Select ---"
+
 
 # --- Load Credentials from Streamlit Secrets ---
 def load_secrets():
@@ -72,7 +75,7 @@ def load_secrets():
         errors.append("Supabase credentials (url, anon_key)")
 
     if errors:
-        st.error(f"Missing required credentials in `.streamlit/secrets.toml`: {', '.in_sidebar(errors)}.")
+        st.error(f"Missing required credentials in `.streamlit/secrets.toml`: {', '.join(errors)}.") # Changed .in_sidebar to .join
         st.info("Example `secrets.toml`:\n```toml\n[kite]\napi_key=\"YOUR_KITE_API_KEY\"\napi_secret=\"YOUR_KITE_SECRET\"\nredirect_uri=\"http://localhost:8501\"\n\n[supabase]\nurl=\"YOUR_SUPABASE_URL\"\nanon_key=\"YOUR_SUPABASE_ANON_KEY\"\n```")
         st.stop()
     return kite_conf, supabase_conf
@@ -318,7 +321,7 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
         progress_bar_placeholder.progress((i + 1) / len(constituents_df))
 
     progress_text_placeholder.empty()
-    progress_bar_placeholder.empty()
+            progress_bar_placeholder.empty()
 
     if not all_historical_closes:
         return pd.DataFrame({"_error": ["No historical data available for any constituent to build index."]})
@@ -364,6 +367,64 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
                 return pd.DataFrame({"_error": ["First day's index value is zero, cannot normalize."]})
     return pd.DataFrame({"_error": ["Error in calculating or normalizing historical index values."]})
 
+# NEW HELPER FUNCTION: Fetch live prices for constituents and enrich DataFrame
+def _get_live_constituent_data(
+    constituents_df: pd.DataFrame, 
+    api_key: str, 
+    access_token: str, 
+    instruments_df: pd.DataFrame
+) -> tuple[pd.DataFrame, float]:
+    """
+    Fetches live LTP for constituents, adds 'Last Price' and 'Weighted Price' columns,
+    and calculates the current live index value.
+    """
+    if constituents_df.empty:
+        return pd.DataFrame(), 0.0
+
+    constituents_df_enriched = constituents_df.copy()
+    live_quotes = {}
+    symbols_for_ltp = constituents_df_enriched["symbol"].tolist()
+
+    if instruments_df.empty:
+        st.warning("Instruments not loaded. Live prices may be incomplete.")
+        instruments_df = load_instruments_cached(api_key, access_token, DEFAULT_EXCHANGE)
+        if "_error" in instruments_df.columns:
+             st.error(f"Failed to load instruments for live price lookup: {instruments_df.loc[0, '_error']}")
+
+    if not instruments_df.empty and symbols_for_ltp:
+        try:
+            kc_client = get_authenticated_kite_client(api_key, access_token)
+            if kc_client:
+                instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp]
+                # Use uncached LTP batch call for the live price check
+                ltp_data_batch = kc_client.ltp(instrument_identifiers)
+                
+                for sym in symbols_for_ltp:
+                    key = f"{DEFAULT_EXCHANGE}:{sym}"
+                    if key in ltp_data_batch:
+                        live_quotes[sym] = ltp_data_batch[key].get("last_price", np.nan)
+                    else:
+                        live_quotes[sym] = np.nan
+            else:
+                st.warning("Kite client not available for batch LTP fetch (internal error).")
+        except Exception as e:
+            st.error(f"Error fetching batch LTP: {e}. Live prices might be partial.")
+
+    # Ensure 'Name' column exists for display
+    if 'Name' not in constituents_df_enriched.columns:
+        if not instruments_df.empty:
+            instrument_names = instruments_df.set_index('tradingsymbol')['name'].to_dict()
+            constituents_df_enriched['Name'] = constituents_df_enriched['symbol'].map(instrument_names).fillna(constituents_df_enriched['symbol'])
+        else:
+            constituents_df_enriched['Name'] = constituents_df_enriched['symbol'] # Fallback if no names found
+
+    constituents_df_enriched["Last Price"] = constituents_df_enriched["symbol"].map(live_quotes)
+    constituents_df_enriched["Weighted Price"] = constituents_df_enriched["Last Price"] * constituents_df_enriched["Weights"]
+    current_live_value = constituents_df_enriched["Weighted Price"].sum() if not constituents_df_enriched["Weighted Price"].empty else 0.0
+
+    return constituents_df_enriched, current_live_value
+
+
 # Function to generate factsheet as multi-section CSV (includes historical data)
 def generate_factsheet_csv_content(
     current_calculated_index_data: pd.DataFrame,
@@ -387,11 +448,17 @@ def generate_factsheet_csv_content(
     content.append("\n--- Constituents ---\n")
     if not current_calculated_index_data.empty:
         const_export_df = current_calculated_index_data.copy()
+        # Ensure 'Name' column exists
+        if 'Name' not in const_export_df.columns:
+            const_export_df['Name'] = const_export_df['symbol']
+
+        # Ensure 'Last Price' and 'Weighted Price' exist for consistent output, fill if missing
         if 'Last Price' not in const_export_df.columns:
             const_export_df['Last Price'] = np.nan
         if 'Weighted Price' not in const_export_df.columns:
             const_export_df['Weighted Price'] = np.nan
         
+        # Apply formatting for display in CSV (pure string, not numbers)
         const_export_df['Last Price'] = const_export_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
         const_export_df['Weighted Price'] = const_export_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
         
@@ -431,7 +498,7 @@ def generate_factsheet_html_content(
     last_comparison_df: pd.DataFrame,
     last_comparison_metrics: dict,
     current_live_value: float,
-    index_name: str = "Custom Index",
+    index_name: str = "Consolidated Report", # Default changed to be more descriptive
     ai_agent_embed_snippet: str = None # New argument for AI agent snippet
 ) -> str:
     """Generates a comprehensive factsheet as an HTML string, including visualizations but NOT raw historical data."""
@@ -476,7 +543,9 @@ def generate_factsheet_html_content(
     html_content_parts.append(f"<h1>Invsion Connect Factsheet: {index_name}</h1>")
     html_content_parts.append(f"<p><strong>Generated On:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
     html_content_parts.append("<h2>Index Overview</h2>")
-    if current_live_value > 0:
+    
+    # Check if current_live_value is truly meaningful before displaying
+    if current_live_value > 0 and not current_calculated_index_data.empty: # Check for non-zero and actual constituent data
         html_content_parts.append(f"<p class='metric'><strong>Current Live Calculated Index Value:</strong> ₹{current_live_value:,.2f}</p>")
     else:
         html_content_parts.append("<p class='warning-box'>Current Live Calculated Index Value: N/A (Constituent data not available or comparison report only)</p>")
@@ -489,25 +558,33 @@ def generate_factsheet_html_content(
         if 'Name' not in const_display_df.columns:
             const_display_df['Name'] = const_display_df['symbol'] 
 
-        if 'Last Price' in const_display_df.columns:
-            const_display_df['Last Price'] = const_display_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
-        if 'Weighted Price' in const_display_df.columns:
-            const_display_df['Weighted Price'] = const_display_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+        # Ensure 'Last Price' and 'Weighted Price' columns are present for the formatter
+        if 'Last Price' not in const_display_df.columns:
+            const_display_df['Last Price'] = np.nan
+        if 'Weighted Price' not in const_display_df.columns:
+            const_display_df['Weighted Price'] = np.nan
+
+        # Format these columns for display in HTML table
+        const_display_df['Last Price'] = const_display_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+        const_display_df['Weighted Price'] = const_display_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
         
+        # Use pandas to_html for the table
         html_content_parts.append(const_display_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_html(index=False, classes='table'))
 
-        # Index Composition Pie Chart
-        fig_pie = go.Figure(data=[go.Pie(labels=const_display_df['Name'], values=const_display_df['Weights'], hole=.3)])
-        fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
-        html_content_parts.append("<h3>Index Composition</h3>")
-        # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
-        html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>") 
+        # Index Composition Pie Chart - only if weights are meaningful
+        if const_display_df['Weights'].sum() > 0:
+            fig_pie = go.Figure(data=[go.Pie(labels=const_display_df['Name'], values=const_display_df['Weights'], hole=.3)])
+            fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
+            html_content_parts.append("<h3>Index Composition</h3>")
+            # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
+            html_content_parts.append(f"<div class='plotly-graph'>{fig_pie.to_html(full_html=False, include_plotlyjs='cdn')}</div>") 
     else:
         html_content_parts.append("<p class='warning-box'>No constituent data available for this index.</p>")
     
     # --- Performance Metrics ---
     html_content_parts.append("<h3>Performance Metrics Summary</h3>")
     if last_comparison_metrics:
+        # Create a DataFrame for metrics, transpose it for better display if few metrics
         metrics_df = pd.DataFrame(last_comparison_metrics).T
         metrics_html = metrics_df.style.format("{:.4f}").to_html(classes='table') # Format to 4 decimal places for precision
         html_content_parts.append(metrics_html)
@@ -523,7 +600,7 @@ def generate_factsheet_html_content(
         
         # Adjust title based on whether it's a specific index report or a generic comparison
         chart_title = "Multi-Index & Benchmark Performance"
-        if index_name != "Consolidated Report" and index_name != "Comparison Report":
+        if index_name != "Consolidated Report":
             chart_title = f"{index_name} vs Benchmarks Performance"
 
         fig_comparison.update_layout(
@@ -540,14 +617,16 @@ def generate_factsheet_html_content(
         html_content_parts.append("<p class='warning-box'>No comparison data available.</p>")
 
     # --- Optional: Historical Performance Chart for the main index (if applicable and not too large) ---
-    if not current_calculated_index_history.empty and current_calculated_index_history.shape[0] < 730: # Limit for HTML, e.g., 2 years daily data
+    # Only show this chart if it's an index-specific report AND there's history AND it's not too big.
+    if index_name != "Consolidated Report" and not current_calculated_index_history.empty and current_calculated_index_history.shape[0] < 730: # Limit for HTML, e.g., 2 years daily data
         html_content_parts.append("<h3>Index Historical Performance (Normalized to 100)</h3>")
         fig_hist_index = go.Figure(data=[go.Scatter(x=current_calculated_index_history.index, y=current_calculated_index_history['index_value'], mode='lines', name=index_name)])
         fig_hist_index.update_layout(title_text=f"{index_name} Historical Performance", template="plotly_dark", height=400)
         # include_plotlyjs='cdn' ensures Plotly.js is loaded for this chart
         html_content_parts.append(f"<div class='plotly-graph'>{fig_hist_index.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
-    elif not current_calculated_index_history.empty:
+    elif not current_calculated_index_history.empty and current_calculated_index_history.shape[0] >= 730:
         html_content_parts.append(f"<p class='info-box'>Historical performance chart for {index_name} is too large for the HTML factsheet. Please refer to the CSV download.</p>")
+
 
     # --- AI Agent Embed Snippet ---
     if ai_agent_embed_snippet:
@@ -847,67 +926,42 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         
         st.subheader("Constituents and Current Live Value")
         
-        live_quotes = {}
-        symbols_for_ltp = [sym for sym in constituents_df["symbol"]]
-        
-        # Load instruments for symbol to token lookup if not already loaded
-        if st.session_state["instruments_df"].empty:
-            with st.spinner("Loading instruments for live price lookup..."):
-                st.session_state["instruments_df"] = load_instruments_cached(api_key, access_token, DEFAULT_EXCHANGE)
-        
-        if "_error" in st.session_state["instruments_df"].columns:
-            st.warning(f"Could not load instruments for live price lookup: {st.session_state['instruments_df'].loc[0, '_error']}")
-        else:
-            if symbols_for_ltp:
-                try:
-                    kc_client = get_authenticated_kite_client(api_key, access_token)
-                    if kc_client:
-                        instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp]
-                        # Use uncached LTP batch call for the live price check
-                        ltp_data_batch = kc_client.ltp(instrument_identifiers)
-                        
-                        for sym in symbols_for_ltp:
-                            key = f"{DEFAULT_EXCHANGE}:{sym}"
-                            if key in ltp_data_batch:
-                                live_quotes[sym] = ltp_data_batch[key].get("last_price", np.nan)
-                            else:
-                                live_quotes[sym] = np.nan
-                    else:
-                        st.warning("Kite client not available for batch LTP fetch (internal error).")
-                except Exception as e:
-                    st.error(f"Error fetching batch LTP: {e}. Live prices might be partial.")
+        # Call the new helper function to get live data
+        enriched_constituents_df, current_live_value = _get_live_constituent_data(
+            constituents_df, api_key, access_token, st.session_state["instruments_df"]
+        )
 
-        # Ensure 'Name' column exists for display
-        if 'Name' not in constituents_df.columns:
-            if not st.session_state["instruments_df"].empty:
-                instrument_names = st.session_state["instruments_df"].set_index('tradingsymbol')['name'].to_dict()
-                constituents_df['Name'] = constituents_df['symbol'].map(instrument_names).fillna(constituents_df['symbol'])
-            else:
-                constituents_df['Name'] = constituents_df['symbol'] # Fallback if no names found
-
-        constituents_df_display = constituents_df.copy()
-        constituents_df_display["Last Price"] = constituents_df_display["symbol"].map(live_quotes)
-        constituents_df_display["Weighted Price"] = constituents_df_display["Last Price"] * constituents_df_display["Weights"]
-        current_live_value = constituents_df_display["Weighted Price"].sum()
-
-        st.dataframe(constituents_df_display[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].style.format({
+        st.dataframe(enriched_constituents_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].style.format({
             "Weights": "{:.4f}",
             "Last Price": "₹{:,.2f}",
             "Weighted Price": "₹{:,.2f}"
         }), use_container_width=True)
-        st.success(f"Current Live Calculated Index Value: **₹{current_live_value:,.2f}**")
+        
+        # Display live value based on whether it was successfully calculated
+        if current_live_value > 0:
+            st.success(f"Current Live Calculated Index Value: **₹{current_live_value:,.2f}**")
+        else:
+            st.warning("Current Live Calculated Index Value: N/A (Could not fetch live prices for constituents).")
 
         st.markdown("---")
         st.subheader("Index Composition")
-        fig_pie = go.Figure(data=[go.Pie(labels=constituents_df_display['Name'], values=constituents_df_display['Weights'], hole=.3)])
-        fig_pie.update_layout(title_text='Constituent Weights', height=400)
-        st.plotly_chart(fig_pie, use_container_width=True)
+        # Ensure 'Name' column exists for pie chart
+        if 'Name' not in enriched_constituents_df.columns:
+            enriched_constituents_df['Name'] = enriched_constituents_df['symbol']
+
+        if not enriched_constituents_df.empty and enriched_constituents_df['Weights'].sum() > 0:
+            fig_pie = go.Figure(data=[go.Pie(labels=enriched_constituents_df['Name'], values=enriched_constituents_df['Weights'], hole=.3)])
+            fig_pie.update_layout(title_text='Constituent Weights', height=400)
+            st.plotly_chart(fig_pie, use_container_width=True)
+        else:
+            st.info("No constituents or weights available for composition chart.")
+
 
         st.markdown("---")
         st.subheader("Export Options")
         col_export1, col_export2 = st.columns(2)
         with col_export1:
-            csv_constituents = constituents_df_display[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False).encode('utf-8')
+            csv_constituents = enriched_constituents_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="Export Constituents to CSV",
                 data=csv_constituents,
@@ -990,29 +1044,12 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
     if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
         
-        # Calculate current_live_value to display and for the factsheet
-        constituents_df_for_live = current_calculated_index_data_df.copy()
-        live_quotes = {}
-        symbols_for_ltp = [sym for sym in constituents_df_for_live["symbol"]] if not constituents_df_for_live.empty else []
+        # Call the new helper function for display purposes in the main tab
+        enriched_constituents_df_for_display, current_live_value_for_display = _get_live_constituent_data(
+            current_calculated_index_data_df, api_key, access_token, st.session_state["instruments_df"]
+        )
 
-        if not st.session_state["instruments_df"].empty and symbols_for_ltp:
-            try:
-                kc_client = get_authenticated_kite_client(api_key, access_token)
-                if kc_client:
-                    instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp]
-                    ltp_data_batch = kc_client.ltp(instrument_identifiers)
-                    for sym in symbols_for_ltp:
-                        key = f"{DEFAULT_EXCHANGE}:{sym}"
-                        live_quotes[sym] = ltp_data_batch.get(key, {}).get("last_price", np.nan)
-            except Exception as e:
-                st.warning(f"Error fetching batch LTP for live value calculation: {e}. Live prices might be partial.")
-        
-        # Add Last Price and Weighted Price columns to constituents_df_for_live for consistent factsheet generation
-        constituents_df_for_live["Last Price"] = constituents_df_for_live["symbol"].map(live_quotes)
-        constituents_df_for_live["Weighted Price"] = constituents_df_for_live["Last Price"] * constituents_df_for_live["Weights"]
-        current_live_value_for_factsheet_display = constituents_df_for_live["Weighted Price"].sum() if not constituents_df_for_live["Weighted Price"].empty else 0.0
-
-        display_single_index_details("Newly Calculated Index", constituents_df_for_live, current_calculated_index_history_df, index_id="new_index")
+        display_single_index_details("Newly Calculated Index", enriched_constituents_df_for_display, current_calculated_index_history_df, index_id="new_index")
         
         st.markdown("---")
         st.subheader("Save Newly Created Index")
@@ -1203,75 +1240,41 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         
         # Prioritize newly calculated index for the factsheet if available
         if not current_calculated_index_data_df.empty and not current_calculated_index_history_df.empty:
-            factsheet_constituents_df_final = current_calculated_index_data_df.copy()
+            factsheet_index_name_final = "Invsion Connect Factsheet: Newly Calculated Index" 
+            
+            # Fetch live prices and enrich the constituents DataFrame
+            factsheet_constituents_df_final, current_live_value_for_factsheet_final = _get_live_constituent_data(
+                current_calculated_index_data_df, api_key, access_token, st.session_state["instruments_df"]
+            )
             factsheet_history_df_final = current_calculated_index_history_df.copy()
-            factsheet_index_name_final = "Newly Calculated Index" 
-            
-            # Fetch live prices for this index's constituents for the factsheet
-            live_quotes_for_factsheet_final = {}
-            symbols_for_ltp_for_factsheet_final = [sym for sym in factsheet_constituents_df_final["symbol"]] if not factsheet_constituents_df_final.empty else []
-            if not st.session_state["instruments_df"].empty and symbols_for_ltp_for_factsheet_final:
-                try:
-                    kc_client = get_authenticated_kite_client(api_key, access_token)
-                    if kc_client:
-                        instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp_for_factsheet_final]
-                        ltp_data_batch_for_factsheet_final = kc_client.ltp(instrument_identifiers)
-                        for sym in symbols_for_ltp_for_factsheet_final:
-                            key = f"{DEFAULT_EXCHANGE}:{sym}"
-                            live_quotes[sym] = ltp_data_batch_for_factsheet_final.get(key, {}).get("last_price", np.nan)
-                except Exception as e:
-                    st.warning(f"Error fetching batch LTP for factsheet live value (final): {e}. Live prices might be partial.")
-            
-            # Ensure 'Name' column exists
-            if 'Name' not in factsheet_constituents_df_final.columns and not st.session_state["instruments_df"].empty:
-                instrument_names_for_factsheet_final = st.session_state["instruments_df"].set_index('tradingsymbol')['name'].to_dict()
-                factsheet_constituents_df_final['Name'] = factsheet_constituents_df_final['symbol'].map(instrument_names_for_factsheet_final).fillna(factsheet_constituents_df_final['symbol'])
-            elif 'Name' not in factsheet_constituents_df_final.columns:
-                factsheet_constituents_df_final['Name'] = factsheet_constituents_df_final['symbol']
-
-            factsheet_constituents_df_final["Last Price"] = factsheet_constituents_df_final["symbol"].map(live_quotes_for_factsheet_final)
-            factsheet_constituents_df_final["Weighted Price"] = factsheet_constituents_df_final["Last Price"] * factsheet_constituents_df_final["Weights"]
-            current_live_value_for_factsheet_final = factsheet_constituents_df_final["Weighted Price"].sum() if not factsheet_constituents_df_final["Weighted Price"].empty else 0.0
         
         # If no newly calculated index, but a specific saved index is selected for management (section 6), use that
         elif st.session_state.get('selected_index_to_manage') and st.session_state['selected_index_to_manage'] != "--- Select ---":
             # Find the data for the selected saved index
             selected_db_index_data_for_factsheet = next((idx for idx in saved_indexes if idx['index_name'] == st.session_state['selected_index_to_manage']), None)
             if selected_db_index_data_for_factsheet:
-                factsheet_constituents_df_final = pd.DataFrame(selected_db_index_data_for_factsheet['constituents']).copy()
-                # Need to load/re-calculate history for factsheet if not in session state
+                base_constituents_df = pd.DataFrame(selected_db_index_data_for_factsheet['constituents']).copy()
+                
+                # Fetch live prices and enrich the constituents DataFrame
+                factsheet_constituents_df_final, current_live_value_for_factsheet_final = _get_live_constituent_data(
+                    base_constituents_df, api_key, access_token, st.session_state["instruments_df"]
+                )
+                
+                # Load historical performance for the selected saved index
                 factsheet_history_df_final = pd.DataFrame(selected_db_index_data_for_factsheet.get('historical_performance', []))
                 if not factsheet_history_df_final.empty:
                     factsheet_history_df_final['date'] = pd.to_datetime(factsheet_history_df_final['date'])
                     factsheet_history_df_final.set_index('date', inplace=True)
                     factsheet_history_df_final.sort_index(inplace=True)
                 
-                factsheet_index_name_final = selected_db_index_data_for_factsheet['index_name']
+                factsheet_index_name_final = f"Invsion Connect Factsheet: {selected_db_index_data_for_factsheet['index_name']}"
 
-                # Fetch live prices for this index's constituents for the factsheet
-                live_quotes_for_factsheet_final = {}
-                symbols_for_ltp_for_factsheet_final = [sym for sym in factsheet_constituents_df_final["symbol"]] if not factsheet_constituents_df_final.empty else []
-                if not st.session_state["instruments_df"].empty and symbols_for_ltp_for_factsheet_final:
-                    try:
-                        kc_client = get_authenticated_kite_client(api_key, access_token)
-                        if kc_client:
-                            instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols_for_ltp_for_factsheet_final]
-                            ltp_data_batch_for_factsheet_final = kc_client.ltp(instrument_identifiers)
-                            for sym in symbols_for_ltp_for_factsheet_final:
-                                key = f"{DEFAULT_EXCHANGE}:{sym}"
-                                live_quotes[sym] = ltp_data_batch_for_factsheet_final.get(key, {}).get("last_price", np.nan)
-                    except Exception as e:
-                        st.warning(f"Error fetching batch LTP for factsheet live value (selected saved index): {e}. Live prices might be partial.")
-                
-                if 'Name' not in factsheet_constituents_df_final.columns and not st.session_state["instruments_df"].empty:
-                    instrument_names_for_factsheet_final = st.session_state["instruments_df"].set_index('tradingsymbol')['name'].to_dict()
-                    factsheet_constituents_df_final['Name'] = factsheet_constituents_df_final['symbol'].map(instrument_names_for_factsheet_final).fillna(factsheet_constituents_df_final['symbol'])
-                elif 'Name' not in factsheet_constituents_df_final.columns:
-                    factsheet_constituents_df_final['Name'] = factsheet_constituents_df_final['symbol']
+        # If neither a new index nor a specific saved index is chosen, but comparison data exists,
+        # generate a generic comparison factsheet.
+        if (factsheet_constituents_df_final.empty and factsheet_history_df_final.empty) and not last_comparison_df.empty:
+            factsheet_index_name_final = "Invsion Connect Factsheet: Comparison Report"
+            current_live_value_for_factsheet_final = 0.0 # No single live value for a comparison-only report
 
-                factsheet_constituents_df_final["Last Price"] = factsheet_constituents_df_final["symbol"].map(live_quotes_for_factsheet_final)
-                factsheet_constituents_df_final["Weighted Price"] = factsheet_constituents_df_final["Last Price"] * factsheet_constituents_df_final["Weights"]
-                current_live_value_for_factsheet_final = factsheet_constituents_df_final["Weighted Price"].sum() if not factsheet_constituents_df_final["Weighted Price"].empty else 0.0
 
         # AI Agent Embed Snippet input
         ai_agent_snippet_input = st.text_area(
@@ -1352,7 +1355,13 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         if selected_index_to_manage != "--- Select ---":
             selected_db_index_data = next((idx for idx in saved_indexes if idx['index_name'] == selected_index_to_manage), None)
             if selected_db_index_data:
-                loaded_constituents_df = pd.DataFrame(selected_db_index_data['constituents'])
+                loaded_constituents_df_base = pd.DataFrame(selected_db_index_data['constituents'])
+                
+                # Get live data for the selected index for display
+                loaded_constituents_df, current_live_value_for_selected = _get_live_constituent_data(
+                    loaded_constituents_df_base, api_key, access_token, st.session_state["instruments_df"]
+                )
+
                 loaded_historical_performance_raw = selected_db_index_data.get('historical_performance')
 
                 loaded_historical_df = pd.DataFrame()
@@ -1373,7 +1382,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 if loaded_historical_df.empty:
                     min_date = (datetime.now().date() - timedelta(days=365))
                     max_date = datetime.now().date()
-                    recalculated_historical_df = _calculate_historical_index_value(api_key, access_token, loaded_constituents_df, min_date, max_date, DEFAULT_EXCHANGE)
+                    recalculated_historical_df = _calculate_historical_index_value(api_key, access_token, loaded_constituents_df_base, min_date, max_date, DEFAULT_EXCHANGE)
                     
                     if not recalculated_historical_df.empty and "_error" not in recalculated_historical_df.columns:
                         loaded_historical_df = recalculated_historical_df
@@ -1390,6 +1399,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         supabase_client.table("custom_indexes").delete().eq("id", selected_db_index_data['id']).execute()
                         st.success(f"Index '{selected_index_to_manage}' deleted successfully.")
                         st.session_state["saved_indexes"] = [] # Force reload
+                        st.session_state['selected_index_to_manage'] = "--- Select ---" # Reset selector
                         st.rerun()
                     except Exception as e: st.error(f"Error deleting index: {e}")
     else:
