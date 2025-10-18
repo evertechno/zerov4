@@ -261,7 +261,7 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
     sortino_ratio = (annualized_return / 100 - risk_free_rate_decimal) / annualized_downside_std_dev if annualized_downside_std_dev > 0 else np.nan
 
     # Calmar Ratio
-    calmar_ratio = (annualized_return / 100) / abs(max_drawdown / 100) if max_drawdown != 0 else np.nan
+    calmar_ratio = (annualized_return / 100) / abs(max_drawdown / 100) if max_drawdown != 0 and not np.isnan(max_drawdown) else np.nan
 
     # Beta, Alpha, Treynor Ratio (if benchmark is provided)
     beta, alpha, treynor_ratio = np.nan, np.nan, np.nan
@@ -278,7 +278,6 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
             if benchmark_variance > 0:
                 beta = covariance / benchmark_variance
                 
-                # Annualized average returns
                 expected_asset_return = annualized_return / 100
                 benchmark_annualized_return = ((1 + aligned_benchmark_returns.mean()) ** TRADING_DAYS_PER_YEAR - 1)
                 
@@ -313,7 +312,6 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
     all_historical_closes = {}
     progress_bar = st.progress(0, text="Fetching constituent data...")
     
-    # Ensure instruments are loaded
     if st.session_state["instruments_df"].empty:
         st.session_state["instruments_df"] = load_instruments_cached(api_key, access_token, exchange)
         if "_error" in st.session_state["instruments_df"].columns:
@@ -371,20 +369,11 @@ def _calculate_historical_index_value(api_key: str, access_token: str, constitue
 # --- Charting Functions for Factsheet ---
 def plot_drawdown_chart(df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
-    # We need raw price history (normalized to 100) which is stored in last_comparison_df
     for col in df.columns:
-        # Calculate daily returns from the normalized series
         daily_returns = df[col].pct_change().dropna()
-        
-        # Calculate cumulative performance from the start (normalized to 1)
         cumulative_performance = (1 + daily_returns).cumprod()
-        
-        # Calculate Peak (High Water Mark)
         peak = cumulative_performance.expanding(min_periods=1).max()
-        
-        # Calculate Drawdown: (Current Value / Peak) - 1, in percentage
         drawdown = ((cumulative_performance / peak) - 1) * 100
-        
         fig.add_trace(go.Scatter(x=drawdown.index, y=drawdown, mode='lines', name=f'{col} Drawdown'))
         
     fig.update_layout(
@@ -393,16 +382,15 @@ def plot_drawdown_chart(df: pd.DataFrame) -> go.Figure:
         template="plotly_dark", 
         height=400, 
         hovermode="x unified",
-        yaxis_tickformat=".2f" # Display percentage
+        yaxis_tickformat=".2f"
     )
-    fig.update_yaxes(rangemode="tozero") # Ensure y-axis starts at zero (or below)
+    fig.update_yaxes(rangemode="tozero")
     return fig
 
 def plot_rolling_volatility_chart(df: pd.DataFrame, window=30) -> go.Figure:
     fig = go.Figure()
     for col in df.columns:
         daily_returns = df[col].pct_change()
-        # Annualized rolling volatility
         rolling_vol = daily_returns.rolling(window=window).std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100
         fig.add_trace(go.Scatter(x=rolling_vol.index, y=rolling_vol, mode='lines', name=f'{col} {window}-Day Rolling Volatility'))
     fig.update_layout(
@@ -415,8 +403,6 @@ def plot_rolling_volatility_chart(df: pd.DataFrame, window=30) -> go.Figure:
     return fig
 
 # --- Factsheet Generation Functions ---
-# (Using the existing structure for CSV and HTML but adding the new charts to HTML)
-# The CSV function remains largely as provided in the request boilerplate, but updated to use the full ratio list.
 
 def generate_factsheet_csv_content(
     factsheet_constituents_df_final: pd.DataFrame,
@@ -427,6 +413,7 @@ def generate_factsheet_csv_content(
     index_name: str = "Custom Index",
     ai_agent_embed_snippet: str = None
 ) -> str:
+    """Generates a comprehensive factsheet as a multi-section CSV string, including historical data."""
     content = []
     content.append(f"Factsheet for {index_name}\n")
     content.append(f"Generated On: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -478,11 +465,17 @@ def generate_factsheet_html_content(
     index_name: str = "Custom Index",
     ai_agent_embed_snippet: str = None
 ) -> str:
+    """Generates a comprehensive factsheet as an HTML string, including visualizations."""
     html_content_parts = []
-    # --- HTML Structure and Styles (Simplified for brevity, assuming standard dark theme CSS from thought block) ---
+
+    # Basic HTML structure and styling
     html_content_parts.append("""
-    <!DOCTYPE html><html><head>
+    <!DOCTYPE html>
+    <html>
+    <head>
         <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Invsion Connect Factsheet</title>
         <style>
             body { font-family: Arial, sans-serif; margin: 20px; background-color: #1a1a1a; color: #e0e0e0; }
             .container { max-width: 900px; margin: auto; padding: 20px; background-color: #2b2b2b; border-radius: 8px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2); }
@@ -492,27 +485,44 @@ def generate_factsheet_html_content(
             th { background-color: #3a3a3a; }
             .metric { font-size: 1.1em; margin-bottom: 5px; }
             .plotly-graph { margin-top: 20px; border: 1px solid #444; border-radius: 5px; overflow: hidden; }
+            .info-box { background-color: #334455; border-left: 5px solid #6699cc; padding: 10px; margin-top: 10px; border-radius: 4px; }
             .warning-box { background-color: #554433; border-left: 5px solid #cc9966; padding: 10px; margin-top: 10px; border-radius: 4px; }
             .ai-agent-section { margin-top: 30px; padding: 15px; background-color: #333344; border-radius: 8px; }
+            .ai-agent-section h3 { color: #add8e6; border-bottom: 1px solid #555; padding-bottom: 5px; }
+            @media print {
+                body { background-color: #fff; color: #000; }
+                .container { box-shadow: none; border: 1px solid #eee; background-color: #fff; }
+                h1, h2, h3, h4 { color: #000; border-bottom-color: #ccc; }
+                th, td { border-color: #ccc; }
+                .plotly-graph { border: none; }
+                .ai-agent-section { display: none; }
+            }
         </style>
-    </head><body><div class="container">
+    </head>
+    <body>
+        <div class="container">
     """)
-    
-    # --- Content Generation ---
+
+    # --- Factsheet Header and Overview ---
     html_content_parts.append(f"<h1>Invsion Connect Factsheet: {index_name}</h1>")
-    # ... (rest of header and constituent table logic) ...
+    html_content_parts.append(f"<p><strong>Generated On:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
+    html_content_parts.append("<h2>Index Overview</h2>")
+    
     if current_live_value > 0 and not factsheet_constituents_df_final.empty:
         html_content_parts.append(f"<p class='metric'><strong>Current Live Calculated Index Value:</strong> ₹{current_live_value:,.2f}</p>")
     else:
         html_content_parts.append("<p class='warning-box'>Current Live Calculated Index Value: N/A (Constituent data not available or comparison report only)</p>")
 
+    # --- Constituents & Composition ---
     html_content_parts.append("<h3>Constituents</h3>")
     if not factsheet_constituents_df_final.empty:
         const_display_df = factsheet_constituents_df_final.copy()
+        if 'Name' not in const_display_df.columns: const_display_df['Name'] = const_display_df['symbol'] 
         const_display_df['Last Price'] = const_display_df['Last Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
         const_display_df['Weighted Price'] = const_display_df['Weighted Price'].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "N/A")
+
         html_content_parts.append(const_display_df[['symbol', 'Name', 'Weights', 'Last Price', 'Weighted Price']].to_html(index=False, classes='table'))
-        
+
         fig_pie = go.Figure(data=[go.Pie(labels=const_display_df['Name'], values=const_display_df['Weights'], hole=.3)])
         fig_pie.update_layout(title_text='Constituent Weights', height=400, template="plotly_dark")
         html_content_parts.append("<h3>Index Composition</h3>")
@@ -520,7 +530,7 @@ def generate_factsheet_html_content(
     else:
         html_content_parts.append("<p class='warning-box'>No constituent data available for this index.</p>")
     
-    # Performance Metrics
+    # --- Performance Metrics ---
     html_content_parts.append("<h3>Performance Metrics Summary</h3>")
     if last_comparison_metrics:
         metrics_df = pd.DataFrame(last_comparison_metrics).T
@@ -529,16 +539,22 @@ def generate_factsheet_html_content(
     else:
         html_content_parts.append("<p class='warning-box'>No performance metrics available (run a comparison first).</p>")
 
-    # Comparison Chart
+    # --- Comparison Data & Risk Analysis Charts ---
     html_content_parts.append("<h3>Cumulative Performance Comparison (Normalized to 100)</h3>")
     if not last_comparison_df.empty:
         fig_comparison = go.Figure()
         for col in last_comparison_df.columns:
             fig_comparison.add_trace(go.Scatter(x=last_comparison_df.index, y=last_comparison_df[col], mode='lines', name=col))
-        fig_comparison.update_layout(title_text="Multi-Index & Benchmark Performance", xaxis_title="Date", yaxis_title="Normalized Value (Base 100)", height=600, template="plotly_dark", hovermode="x unified")
+        
+        chart_title = f"{index_name} vs Benchmarks Performance" if index_name not in ["Consolidated Report", "Comparison Report", "Combined Index Constituents Report"] else "Multi-Index & Benchmark Performance"
+
+        fig_comparison.update_layout(
+            title_text=chart_title, xaxis_title="Date", yaxis_title="Normalized Value (Base 100)",
+            height=600, template="plotly_dark", hovermode="x unified"
+        )
         html_content_parts.append(f"<div class='plotly-graph'>{fig_comparison.to_html(full_html=False, include_plotlyjs='cdn')}</div>") 
 
-        # --- NEW RISK VISUALIZATIONS EMBEDDED ---
+        # NEW RISK VISUALIZATIONS EMBEDDED
         html_content_parts.append("<h3>Risk Analysis</h3>")
         
         fig_drawdown = plot_drawdown_chart(last_comparison_df)
@@ -550,22 +566,31 @@ def generate_factsheet_html_content(
     else:
         html_content_parts.append("<p class='warning-box'>No comparison data available.</p>")
 
-    # Optional Historical Chart (for single index only)
-    if len(st.session_state["factsheet_selected_constituents_index_names"]) == 1 and not factsheet_history_df_final.empty and factsheet_history_df_final.shape[0] < 730: 
+    # Optional Historical Chart
+    if (len(st.session_state["factsheet_selected_constituents_index_names"]) == 1 and not factsheet_history_df_final.empty and factsheet_history_df_final.shape[0] < 730): 
         html_content_parts.append("<h3>Index Historical Performance (Normalized to 100)</h3>")
         fig_hist_index = go.Figure(data=[go.Scatter(x=factsheet_history_df_final.index, y=factsheet_history_df_final['index_value'], mode='lines', name=index_name)])
         fig_hist_index.update_layout(title_text=f"{index_name} Historical Performance", template="plotly_dark", height=400)
         html_content_parts.append(f"<div class='plotly-graph'>{fig_hist_index.to_html(full_html=False, include_plotlyjs='cdn')}</div>")
-    
+    elif len(st.session_state["factsheet_selected_constituents_index_names"]) == 1:
+        html_content_parts.append(f"<p class='info-box'>Historical performance chart for {index_name} is too large or data is missing.</p>")
+
     # AI Agent Embed Snippet
     if ai_agent_embed_snippet:
         html_content_parts.append(f"""<div class="ai-agent-section"><h3>Embedded AI Agent</h3>{ai_agent_embed_snippet}</div>""")
 
-    html_content_parts.append("</div></body></html>")
+    html_content_parts.append("""
+        <div class="info-box">
+            <p><strong>Note:</strong> Raw historical time series data (tables) is excluded. For the full historical data, please download the CSV factsheet. To convert this HTML file to PDF, use your browser's "Print" function and select "Save as PDF".</p>
+        </div>
+        </div>
+    </body>
+    </html>
+    """)
     return "".join(html_content_parts)
 
 
-# --- Sidebar: Kite Login (Unchanged) ---
+# --- Sidebar: Kite Login ---
 with st.sidebar:
     st.markdown("### 1. Login to Kite Connect")
     st.write("Click to open Kite login. You'll be redirected back with a `request_token`.")
@@ -596,7 +621,7 @@ with st.sidebar:
         st.info("Not authenticated with Kite yet.")
 
 
-# --- Sidebar: Supabase Authentication (Unchanged) ---
+# --- Sidebar: Supabase Authentication ---
 with st.sidebar:
     st.markdown("### 2. Supabase User Account")
     _refresh_supabase_session()
@@ -670,7 +695,7 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
         st.info("Please login to Kite Connect via the sidebar to access market data.")
         return
 
-    # --- Market Data Snapshot (Simplified section) ---
+    # --- Market Data Snapshot ---
     st.subheader("Current Market Data Snapshot")
     col_market_quote1, col_market_quote2 = st.columns([1, 2])
     with col_market_quote1:
@@ -778,6 +803,13 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
         fig.update_yaxes(title_text="MACD", row=4, col=1)
         st.plotly_chart(fig, use_container_width=True)
 
+        st.subheader("Performance Snapshot")
+        metrics = calculate_performance_metrics(df['close'].pct_change().dropna() * 100)
+        if metrics:
+            st.dataframe(pd.DataFrame([metrics]).T.rename(columns={0: "Value"}).style.format("{:.4f}"))
+        else:
+            st.info("Not enough data to calculate performance metrics.")
+
 
 def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Client, api_key: str | None, access_token: str | None):
     st.header("📊 Custom Index Creation, Benchmarking & Export")
@@ -792,10 +824,10 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
     # Helper function is defined outside, but we need the display function here:
     def display_single_index_details(index_name: str, constituents_df: pd.DataFrame, index_history_df: pd.DataFrame, index_id: str | None = None, is_recalculated_live=False):
-        # (Definition from boilerplate - condensed for context here)
         st.markdown(f"#### Details for Index: **{index_name}** {'(Recalculated Live)' if is_recalculated_live else ''}")
-        # ... (Live price fetching and display logic) ...
-
+        
+        st.subheader("Constituents and Current Live Value")
+        
         live_quotes = {}
         symbols_for_ltp = [sym for sym in constituents_df["symbol"]]
         
@@ -825,7 +857,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         }), use_container_width=True)
         st.success(f"Current Live Calculated Index Value: **₹{current_live_value:,.2f}**")
 
-        # ... (Index Composition and Export logic) ...
         st.markdown("---")
         st.subheader("Index Composition")
         fig_pie = go.Figure(data=[go.Pie(labels=constituents_df_display['Name'], values=constituents_df_display['Weights'], hole=.3)])
@@ -860,7 +891,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 required_cols = {"symbol", "Name", "Weights"}
                 if not required_cols.issubset(set(df_constituents_new.columns)):
                     st.error(f"CSV must contain columns: `symbol`, `Name`, `Weights`. Missing: {required_cols - set(df_constituents_new.columns)}")
-                    # Reset data on invalid upload
                     st.session_state["current_calculated_index_data"] = pd.DataFrame()
                     st.session_state["current_calculated_index_history"] = pd.DataFrame()
                 else:
@@ -881,19 +911,21 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             if holdings_df is None or holdings_df.empty:
                 st.warning("Please fetch holdings from the sidebar first.")
             else:
-                # Filter for equity and relevant columns
                 df_constituents_new = holdings_df[holdings_df['product'] != 'CDS'].copy()
                 df_constituents_new.rename(columns={'tradingsymbol': 'symbol'}, inplace=True)
                 df_constituents_new['Name'] = df_constituents_new['symbol']
                 
                 if weighting_scheme == "Equal Weight":
+                    if len(df_constituents_new) == 0:
+                        st.error("No valid holdings found to create an index.")
+                        return # Correctly use return to exit handler
                     df_constituents_new['Weights'] = 1 / len(df_constituents_new)
-                else: # Value Weighted (using average price * quantity as proxy for initial investment value)
+                else: # Value Weighted
                     df_constituents_new['investment_value'] = df_constituents_new['average_price'] * df_constituents_new['quantity']
                     total_value = df_constituents_new['investment_value'].sum()
                     if total_value == 0:
                          st.error("Total investment value is zero, cannot calculate value weights.")
-                         continue
+                         return # FIX APPLIED: Replaced 'continue' with 'return'
                     df_constituents_new['Weights'] = df_constituents_new['investment_value'] / total_value
                 
                 st.session_state["current_calculated_index_data"] = df_constituents_new[['symbol', 'Name', 'Weights']]
@@ -933,12 +965,11 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         
         st.markdown("---")
         st.subheader("Save Newly Created Index")
-        # ... (Save logic from boilerplate) ...
+        
         index_name_to_save = st.text_input("Enter a unique name for this index to save it:", value="MyCustomIndex", key="new_index_save_name")
         if st.button("Save New Index to DB", key="save_new_index_to_db_btn"):
             if index_name_to_save and st.session_state["user_id"]:
                 try:
-                    # Saving logic...
                     history_df_to_save = current_calculated_index_history_df.reset_index()
                     history_df_to_save['date'] = history_df_to_save['date'].dt.strftime('%Y-%m-%dT%H:%M:%S') 
                     index_data = {
@@ -1019,10 +1050,13 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 benchmark_returns = None
             else:
                 benchmark_returns = benchmark_df['close'].pct_change().dropna()
-                st.session_state["benchmark_historical_data"] = benchmark_df # Cache the whole DF if successful
+                st.session_state["benchmark_historical_data"] = benchmark_df
 
         # 2. Process all selected items
-        comparison_items = selected_custom_indexes_names + external_benchmark_symbols
+        comparison_items = selected_custom_indexes_names + [sym for sym in external_benchmark_symbols if sym not in [BENCHMARK_SYMBOL]] # Avoid double counting if NIFTY 50 is manually added
+        if BENCHMARK_SYMBOL not in external_benchmark_symbols:
+             comparison_items.append(BENCHMARK_SYMBOL) # Ensure NIFTY 50 is included if data was fetched
+
         progress_bar = st.progress(0, text="Processing comparisons...")
 
         for i, name in enumerate(comparison_items):
@@ -1038,7 +1072,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                 if db_index_data: constituents_df = pd.DataFrame(db_index_data['constituents'])
             else:
                 symbol = name
-                if symbol == BENCHMARK_SYMBOL: exchange = DEFAULT_EXCHANGE # Ensure NIFTY 50 uses NSE
+                if symbol == BENCHMARK_SYMBOL: exchange = DEFAULT_EXCHANGE
 
             normalized_df_result = _fetch_and_normalize_data_for_comparison(
                 name=name, data_type=data_type, comparison_start_date=comparison_start_date,
@@ -1049,7 +1083,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             if "_error" not in normalized_df_result.columns:
                 all_normalized_data[name] = normalized_df_result['normalized_value']
                 
-                # Calculate metrics with the fetched benchmark returns
                 asset_daily_returns = normalized_df_result['raw_values'].pct_change().dropna() * 100
                 all_performance_metrics[name] = calculate_performance_metrics(
                     asset_daily_returns, 
@@ -1074,7 +1107,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         else:
             st.info("No data selected or fetched for comparison.")
 
-    # --- Display Comparison Results ---
+    # --- Display Comparison Results (Charts and Metrics) ---
     last_comparison_df = st.session_state.get("last_comparison_df", pd.DataFrame())
 
     if not last_comparison_df.empty:
@@ -1104,7 +1137,8 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
     st.markdown("---")
     st.subheader("5. Generate and Download Consolidated Factsheet")
     
-    # --- Factsheet preparation logic (from boilerplate) ---
+    # Factsheet preparation logic remains identical to the corrected version above
+
     factsheet_constituents_df_final = pd.DataFrame()
     factsheet_history_df_final = pd.DataFrame() 
     factsheet_index_name_final = "Consolidated Report"
@@ -1126,7 +1160,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
     all_constituents_dfs = []
     
-    # Logic to consolidate constituents and calculate live value for the factsheet
     if selected_constituents_for_factsheet and "None" not in selected_constituents_for_factsheet:
         if "Newly Calculated Index" in selected_constituents_for_factsheet and not current_calculated_index_data_df.empty:
             all_constituents_dfs.append(current_calculated_index_data_df.copy())
@@ -1145,7 +1178,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             if len(selected_constituents_for_factsheet) == 1:
                 factsheet_index_name_final = selected_constituents_for_factsheet[0]
                 if factsheet_index_name_final == "Newly Calculated Index": factsheet_history_df_final = current_calculated_index_history_df.copy()
-                else: # Load saved history
+                else: 
                     db_data = next((idx for idx in saved_indexes if idx['index_name'] == factsheet_index_name_final), None)
                     if db_data and db_data.get('historical_performance'):
                         factsheet_history_df_final = pd.DataFrame(db_data['historical_performance'])
@@ -1154,7 +1187,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             else:
                 factsheet_index_name_final = "Combined Index Constituents Report"
 
-            # Fetch live prices for factsheet
             live_quotes_for_factsheet_final = {}
             symbols_for_ltp_for_factsheet_final = [sym for sym in factsheet_constituents_df_final["symbol"]]
             if symbols_for_ltp_for_factsheet_final:
@@ -1167,10 +1199,14 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
                         live_quotes_for_factsheet_final[sym] = ltp_data_batch_for_factsheet_final.get(key, {}).get("last_price", np.nan)
                 except Exception: pass
             
-            # Finalize DF
             factsheet_constituents_df_final["Last Price"] = factsheet_constituents_df_final["symbol"].map(live_quotes_for_factsheet_final)
             factsheet_constituents_df_final["Weighted Price"] = factsheet_constituents_df_final["Last Price"] * factsheet_constituents_df_final["Weights"]
             current_live_value_for_factsheet_final = factsheet_constituents_df_final["Weighted Price"].sum()
+        else:
+            factsheet_constituents_df_final = pd.DataFrame()
+            factsheet_history_df_final = pd.DataFrame()
+            factsheet_index_name_final = "Comparison Report" if not last_comparison_df.empty else "Consolidated Report"
+            current_live_value_for_factsheet_final = 0.0
 
     
     ai_agent_snippet_input = st.text_area(
@@ -1225,7 +1261,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
 
     st.markdown("---")
     st.subheader("6. View/Delete Individual Saved Indexes")
-    # ... (View/Delete logic from boilerplate) ...
+    
     index_names_from_db_for_selector = [idx['index_name'] for idx in saved_indexes] if saved_indexes else []
 
     selected_index_to_manage = st.selectbox(
@@ -1243,7 +1279,6 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             loaded_historical_df = pd.DataFrame()
             is_recalculated_live = False
 
-            # Recalculate if saved history is missing or invalid
             if loaded_historical_performance_raw:
                 try:
                     loaded_historical_df = pd.DataFrame(loaded_historical_performance_raw)
