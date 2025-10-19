@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import json
-import threading 
+import threading
 import time
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
@@ -496,8 +496,8 @@ def plot_rolling_risk_charts(comparison_df: pd.DataFrame, benchmark_returns: pd.
 
 # Function to generate factsheet as multi-section CSV (includes historical data)
 def generate_factsheet_csv_content(
-    factsheet_constituents_df_final: pd.DataFrame, 
-    factsheet_history_df_final: pd.DataFrame,     
+    factsheet_constituents_df_final: pd.DataFrame,
+    factsheet_history_df_final: pd.DataFrame,
     last_comparison_df: pd.DataFrame,
     last_comparison_metrics: dict,
     current_live_value: float,
@@ -540,7 +540,7 @@ def generate_factsheet_csv_content(
         metrics_df = metrics_df.applymap(lambda x: f"{x:.4f}" if pd.notna(x) and isinstance(x, (int, float)) else "N/A")
         
         # Transpose so metric names are rows in the CSV
-        content.append(metrics_df.T.to_csv()) 
+        content.append(metrics_df.T.to_csv())
     else:
         content.append("No performance metrics available (run a comparison first).\n")
 
@@ -751,7 +751,7 @@ with st.sidebar:
         st.info("Not authenticated with Kite yet.")
 
 
-# --- Sidebar: Supabase Authentication ---
+# --- Sidebar: Supabase User Account ---
 with st.sidebar:
     st.markdown("### 2. Supabase User Account")
     
@@ -1002,8 +1002,7 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         elif data_type == "benchmark":
             if symbol is None: return pd.DataFrame({"_error": [f"No symbol for benchmark {name}."]})
             
-            # Robust logic relies on get_historical_data_cached handling index lookup robustly
-            # Pass the specified exchange for external benchmarks
+            # Use get_historical_data_cached which handles index lookup robustly
             hist_df = get_historical_data_cached(api_key, access_token, symbol, comparison_start_date, comparison_end_date, "day", exchange)
             
             if "_error" in hist_df.columns: return hist_df
