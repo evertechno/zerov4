@@ -16,7 +16,7 @@ from supabase import create_client, Client
 from kiteconnect import KiteConnect
 
 # --- Streamlit Page Configuration ---
-st.set_page_config(page_title="Kite Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Invsion Connect - Advanced Analysis", layout="wide", initial_sidebar_state="expanded")
 st.title("Invsion Connect")
 st.markdown("A comprehensive platform for fetching market data, performing ML-driven analysis, risk assessment, and live data streaming.")
 
@@ -45,7 +45,6 @@ if "holdings_data" not in st.session_state: st.session_state["holdings_data"] = 
 if "benchmark_historical_data" not in st.session_state: st.session_state["benchmark_historical_data"] = pd.DataFrame() # Store benchmark data for ratios
 if "factsheet_selected_constituents_index_names" not in st.session_state: st.session_state["factsheet_selected_constituents_index_names"] = []
 if "index_price_calc_df" not in st.session_state: st.session_state["index_price_calc_df"] = pd.DataFrame()
-# ADDED for the new tab
 if "compliance_results_df" not in st.session_state: st.session_state["compliance_results_df"] = pd.DataFrame()
 
 
@@ -1731,19 +1730,24 @@ def parse_and_validate_rules(rules_text: str, portfolio_df: pd.DataFrame):
     stock_weights = portfolio_df.set_index('Symbol')['Weight %']
     if 'Rating' in portfolio_df.columns:
         rating_weights = portfolio_df.groupby('Rating')['Weight %'].sum()
-    else:
-        rating_weights = pd.Series()
-
+    else: rating_weights = pd.Series()
+    if 'Asset Class' in portfolio_df.columns:
+        asset_class_weights = portfolio_df.groupby('Asset Class')['Weight %'].sum()
+    else: asset_class_weights = pd.Series()
+    
     # --- Helper function to check pass/fail ---
     def check_pass(actual, op, threshold):
         if op == '>': return actual > threshold
         if op == '<': return actual < threshold
+        if op == '>=': return actual >= threshold
+        if op == '<=': return actual <= threshold
+        if op == '=': return actual == threshold
         return False
 
     # --- Process each rule line by line ---
     for rule in rules_text.strip().split('\n'):
         rule = rule.strip()
-        if not rule:
+        if not rule or rule.startswith('#'):
             continue
 
         parts = re.split(r'\s+', rule)
@@ -1753,72 +1757,84 @@ def parse_and_validate_rules(rules_text: str, portfolio_df: pd.DataFrame):
             actual_value = None
             details = ""
 
-            # --- Rule Type: STOCK ---
-            if rule_type == 'STOCK' and len(parts) >= 4:
-                # Handles multi-word names, e.g., "STOCK RELIANCE IND < 10%" -> not really, symbol is one word
+            # Rule format: KEY [NAME] OPERATOR VALUE
+            # For multi-word names: KEY NAME PART 1 NAME PART 2 ... OPERATOR VALUE
+            if len(parts) < 3:
+                results.append({'rule': rule, 'status': 'Error', 'details': 'Invalid format. Must have at least a KEY, OPERATOR, and VALUE.'})
+                continue
+            
+            op = parts[-2]
+            if op not in ['>', '<', '>=', '<=', '=']:
+                results.append({'rule': rule, 'status': 'Error', 'details': f"Invalid operator '{op}'. Use >, <, >=, <=, or =."})
+                continue
+
+            threshold_str = parts[-1].replace('%', '')
+            
+            # --- STOCK weight limit ---
+            if rule_type == 'STOCK' and len(parts) == 4:
                 symbol = parts[1].upper()
-                op = parts[2]
-                threshold = float(parts[3].replace('%', ''))
-                
+                threshold = float(threshold_str)
                 if symbol in stock_weights.index:
                     actual_value = stock_weights.get(symbol, 0.0)
-                    details = f"Actual: {actual_value:.2f}%"
+                    details = f"Actual weight for {symbol}: {actual_value:.2f}%"
                 else:
                     results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': f"Stock Symbol '{symbol}' not found in portfolio."})
                     continue
-
-            # --- Rule Type: SECTOR ---
-            elif rule_type == 'SECTOR' and len(parts) >= 4:
-                op = parts[-2]
-                threshold = float(parts[-1].replace('%', ''))
+            
+            # --- SECTOR weight limit ---
+            elif rule_type == 'SECTOR':
                 sector_name = ' '.join(parts[1:-2]).upper()
-                
+                threshold = float(threshold_str)
                 matching_sector = next((s for s in sector_weights.index if s.upper() == sector_name), None)
                 if matching_sector:
                     actual_value = sector_weights.get(matching_sector, 0.0)
-                    details = f"Actual: {actual_value:.2f}%"
+                    details = f"Actual weight for {matching_sector}: {actual_value:.2f}%"
                 else:
                     results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': f"Sector '{sector_name}' not found in portfolio."})
                     continue
-
-            # --- Rule Type: RATING ---
-            elif rule_type == 'RATING' and len(parts) >= 4:
+            
+            # --- RATING weight limit ---
+            elif rule_type == 'RATING':
                 if rating_weights.empty:
                     results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': "Portfolio missing 'Rating' column."})
                     continue
-                rating_name = parts[1].upper()
-                op = parts[2]
-                threshold = float(parts[3].replace('%', ''))
-
+                rating_name = ' '.join(parts[1:-2]).upper()
+                threshold = float(threshold_str)
                 actual_value = rating_weights.get(rating_name, 0.0)
-                details = f"Actual: {actual_value:.2f}%"
+                details = f"Actual weight for {rating_name}: {actual_value:.2f}%"
 
-            # --- Rule Type: TOP_N_STOCKS ---
+            # --- ASSET_CLASS weight limit ---
+            elif rule_type == 'ASSET_CLASS':
+                if asset_class_weights.empty:
+                    results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': "Portfolio missing 'Asset Class' column."})
+                    continue
+                asset_name = ' '.join(parts[1:-2]).upper()
+                threshold = float(threshold_str)
+                actual_value = asset_class_weights.get(asset_name, 0.0)
+                details = f"Actual weight for {asset_name}: {actual_value:.2f}%"
+            
+            # --- TOP N STOCKS combined weight ---
             elif rule_type == 'TOP_N_STOCKS' and len(parts) == 4:
                 n = int(parts[1])
-                op = parts[2]
-                threshold = float(parts[3].replace('%', ''))
+                threshold = float(threshold_str)
                 actual_value = portfolio_df.nlargest(n, 'Weight %')['Weight %'].sum()
-                details = f"Actual combined weight of top {n}: {actual_value:.2f}%"
+                details = f"Actual combined weight of top {n} stocks: {actual_value:.2f}%"
 
-            # --- Rule Type: TOP_N_SECTORS ---
+            # --- TOP N SECTORS combined weight ---
             elif rule_type == 'TOP_N_SECTORS' and len(parts) == 4:
                 n = int(parts[1])
-                op = parts[2]
-                threshold = float(parts[3].replace('%', ''))
+                threshold = float(threshold_str)
                 actual_value = sector_weights.nlargest(n).sum()
-                details = f"Actual combined weight of top {n}: {actual_value:.2f}%"
-
-            # --- Rule Type: COUNT_STOCKS ---
+                details = f"Actual combined weight of top {n} sectors: {actual_value:.2f}%"
+            
+            # --- COUNT of stocks ---
             elif rule_type == 'COUNT_STOCKS' and len(parts) == 3:
-                op = parts[1]
-                threshold = int(parts[2])
+                threshold = int(threshold_str)
                 actual_value = len(portfolio_df)
                 details = f"Actual count: {actual_value}"
             
-            # --- Unrecognized Rule ---
             else:
-                results.append({'rule': rule, 'status': 'Error', 'details': 'Invalid rule format or insufficient parameters.'})
+                results.append({'rule': rule, 'status': 'Error', 'details': 'Unrecognized rule format.'})
                 continue
             
             # --- Final Validation ---
@@ -1833,175 +1849,173 @@ def parse_and_validate_rules(rules_text: str, portfolio_df: pd.DataFrame):
     return results
 
 def render_investment_compliance_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
-    st.header("💼 Investment Compliance Validation")
-    st.markdown("Upload your portfolio, define compliance rules, and get a real-time analysis of your holdings and exposures.")
+    st.header("💼 Investment Compliance & Portfolio Analysis")
+    st.markdown("Upload a portfolio, define compliance rules, and get a real-time, multi-dimensional analysis of your holdings and exposures.")
 
     if not kite_client:
         st.info("Please login to Kite Connect first to fetch live prices for validation.")
         return
     
-    # --- Configuration Columns ---
+    # --- Configuration Section ---
     col1, col2 = st.columns([2, 3])
     with col1:
-        # --- 1. File Upload Section ---
         st.subheader("1. Upload Portfolio")
         uploaded_file = st.file_uploader(
-            "Choose a CSV file",
-            type="csv",
-            help="Required columns: 'Symbol', 'Industry', 'Quantity', 'Market/Fair Value(Rs. in Lacs)'. Optional: 'Rating'."
+            "Choose a CSV file", type="csv",
+            help="Required columns: 'Symbol', 'Industry', 'Quantity', 'Market/Fair Value(Rs. in Lacs)'. Optional: 'Rating', 'Asset Class'."
         )
 
     with col2:
-        # --- 2. Compliance Rules Section ---
         st.subheader("2. Define Compliance Rules")
         rules_text = st.text_area(
-            "Enter one rule per line. See examples for syntax.",
-            height=150,
-            placeholder="Examples:\nSECTOR BANKS > 25%\nSTOCK RELIANCE < 10%\nTOP_N_STOCKS 5 < 40%\nTOP_N_SECTORS 3 < 65%\nCOUNT_STOCKS > 20\nRATING AAA > 50%",
+            "Enter one rule per line.", height=150,
             key="compliance_rules_input"
         )
-    
+        with st.expander("📖 View Rule Syntax Guide"):
+            st.markdown("""
+            - **STOCK**: `STOCK [Symbol] <operator> [Value]%` (e.g., `STOCK RELIANCE < 10%`)
+            - **SECTOR**: `SECTOR [Sector Name] <operator> [Value]%` (e.g., `SECTOR BANKS > 25%`)
+            - **RATING**: `RATING [Rating] <operator> [Value]%` (e.g., `RATING AAA > 50%`)
+            - **ASSET_CLASS**: `ASSET_CLASS [Asset Name] <operator> [Value]%` (e.g., `ASSET_CLASS EQUITY < 80%`)
+            - **TOP_N_STOCKS**: `TOP_N_STOCKS [N] <operator> [Value]%` (e.g., `TOP_N_STOCKS 5 < 40%`)
+            - **TOP_N_SECTORS**: `TOP_N_SECTORS [N] <operator> [Value]%` (e.g., `TOP_N_SECTORS 3 < 65%`)
+            - **COUNT_STOCKS**: `COUNT_STOCKS <operator> [Value]` (e.g., `COUNT_STOCKS > 20`)
+            - **Operators**: Use `<`, `>`, `<=`, `>=`, `=`.
+            """)
+
     # --- Processing Logic ---
     if uploaded_file is not None:
         try:
             df = pd.read_csv(uploaded_file)
-            
-            # --- Header Validation and Data Cleaning ---
-            df.columns = [str(col).strip().lower().replace(' ', '_').replace('.', '') for col in df.columns]
+            df.columns = [str(col).strip().lower().replace(' ', '_').replace('.', '').replace('/','_') for col in df.columns]
 
             header_map = {
                 'isin': 'ISIN', 'name_of_the_instrument': 'Name', 'symbol': 'Symbol',
                 'industry': 'Industry', 'quantity': 'Quantity', 'rating': 'Rating',
-                'market/fair_value(rs_in_lacs)': 'Uploaded Value (Lacs)'
+                'asset_class': 'Asset Class', 'market_fair_value(rs_in_lacs)': 'Uploaded Value (Lacs)'
             }
-            
             df = df.rename(columns=header_map)
-            # Make 'Rating' column case-insensitive if it exists
-            if 'Rating' in df.columns:
-                df['Rating'] = df['Rating'].str.upper()
+            for col in ['Rating', 'Asset Class', 'Industry']:
+                if col in df.columns:
+                    df[col] = df[col].str.strip().str.upper()
 
             missing_cols = [col for col in ['Symbol', 'Quantity', 'Uploaded Value (Lacs)', 'Industry'] if col not in df.columns]
-
             if missing_cols:
-                st.error(f"The uploaded CSV is missing the following required columns: {', '.join(missing_cols)}")
+                st.error(f"The uploaded CSV is missing required columns: {', '.join(missing_cols)}")
                 st.session_state.compliance_results_df = pd.DataFrame()
             else:
-                # --- Data Type Conversion ---
                 df['Symbol'] = df['Symbol'].str.strip().str.upper()
                 df['Quantity'] = pd.to_numeric(df['Quantity'].astype(str).str.replace(',', ''), errors='coerce')
                 df['Uploaded Value (Lacs)'] = pd.to_numeric(df['Uploaded Value (Lacs)'], errors='coerce')
                 df.dropna(subset=['Symbol', 'Quantity', 'Uploaded Value (Lacs)'], inplace=True)
 
-                if st.button("Validate Portfolio", type="primary", use_container_width=True):
+                if st.button("Analyze & Validate Portfolio", type="primary", use_container_width=True):
                     with st.spinner("Fetching live prices and analyzing portfolio..."):
                         symbols = df['Symbol'].unique().tolist()
                         instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols]
-
                         try:
-                            # --- Fetch Live Prices ---
                             ltp_data = kite_client.ltp(instrument_identifiers)
                             prices = {sym: ltp_data.get(f"{DEFAULT_EXCHANGE}:{sym}", {}).get('last_price') for sym in symbols}
-
+                            
                             df_results = df.copy()
                             df_results['LTP'] = df_results['Symbol'].map(prices)
                             failed_symbols = df_results[df_results['LTP'].isna()]['Symbol'].tolist()
                             if failed_symbols:
-                                st.warning(f"Could not fetch LTP for: {', '.join(failed_symbols)}. They will be excluded from real-time calculations.")
+                                st.warning(f"Could not fetch LTP for: {', '.join(failed_symbols)}. Real-time values for these will be 0.")
                             
-                            # --- Calculate Values & Weights ---
                             df_results['Real-time Value (Rs)'] = (df_results['LTP'] * df_results['Quantity']).fillna(0)
-                            total_realtime_value = df_results['Real-time Value (Rs)'].sum()
+                            total_value = df_results['Real-time Value (Rs)'].sum()
+                            df_results['Weight %'] = (df_results['Real-time Value (Rs)'] / total_value * 100) if total_value > 0 else 0
                             
-                            if total_realtime_value > 0:
-                                df_results['Weight %'] = (df_results['Real-time Value (Rs)'] / total_realtime_value) * 100
-                            else:
-                                df_results['Weight %'] = 0
-                            
-                            st.session_state.compliance_results_df = df_results.copy()
-
+                            st.session_state.compliance_results_df = df_results
                         except Exception as e:
                             st.error(f"An error occurred during calculation: {e}")
                             st.session_state.compliance_results_df = pd.DataFrame()
-        
         except Exception as e:
-            st.error(f"Failed to process the CSV file. Error: {e}")
+            st.error(f"Failed to process CSV file. Error: {e}")
             st.session_state.compliance_results_df = pd.DataFrame()
 
-    # --- Display Results and Visualizations ---
+    # --- Display Results ---
     results_df = st.session_state.get("compliance_results_df", pd.DataFrame())
-
     if not results_df.empty and 'Weight %' in results_df.columns:
         st.markdown("---")
         
-        analysis_tabs = st.tabs(["📊 Dashboard", "⚖️ Compliance Check", "📄 Detailed Holdings"])
+        analysis_tabs = st.tabs(["📊 Dashboard", "🔍 Breakdowns", "⚖️ Compliance Check", "📄 Detailed Holdings"])
 
-        with analysis_tabs[0]: # Dashboard Tab
+        # --- Dashboard Tab ---
+        with analysis_tabs[0]:
             st.subheader("Portfolio Dashboard")
-            # --- KPI Metrics ---
-            total_realtime_value = results_df['Real-time Value (Rs)'].sum()
-            
+            total_value = results_df['Real-time Value (Rs)'].sum()
             kpi_cols = st.columns(4)
-            kpi_cols[0].metric("Real-time Value", f"₹ {total_realtime_value:,.2f}")
+            kpi_cols[0].metric("Portfolio Value", f"₹ {total_value:,.2f}")
             kpi_cols[1].metric("Holdings Count", f"{len(results_df)}")
             kpi_cols[2].metric("Unique Sectors", f"{results_df['Industry'].nunique()}")
             if 'Rating' in results_df.columns:
                 kpi_cols[3].metric("Unique Ratings", f"{results_df['Rating'].nunique()}")
 
-            st.markdown("---")
-            # --- Concentration Metrics ---
             st.markdown("#### Concentration Analysis")
-            
-            # HHI Calculation
             stock_hhi = (results_df['Weight %'] ** 2).sum()
             sector_hhi = (results_df.groupby('Industry')['Weight %'].sum() ** 2).sum()
-            
-            def get_hhi_category(hhi_score):
-                if hhi_score < 1500: return "Not Concentrated"
-                elif hhi_score <= 2500: return "Moderately Concentrated"
+            def get_hhi_category(score):
+                if score < 1500: return "Not Concentrated"
+                elif score <= 2500: return "Moderately Concentrated"
                 else: return "Highly Concentrated"
 
-            concentration_cols = st.columns(4)
-            top_5_stocks = results_df.nlargest(5, 'Weight %')['Weight %'].sum()
-            top_10_stocks = results_df.nlargest(10, 'Weight %')['Weight %'].sum()
-            sector_weights_grouped = results_df.groupby('Industry')['Weight %'].sum()
-            top_3_sectors = sector_weights_grouped.nlargest(3).sum()
+            conc_cols = st.columns(2)
+            with conc_cols[0]:
+                st.metric("Top 5 Stocks Weight", f"{results_df.nlargest(5, 'Weight %')['Weight %'].sum():.2f}%")
+                st.metric("Top 10 Stocks Weight", f"{results_df.nlargest(10, 'Weight %')['Weight %'].sum():.2f}%")
+                st.metric("Top 3 Sectors Weight", f"{results_df.groupby('Industry')['Weight %'].sum().nlargest(3).sum():.2f}%")
+            with conc_cols[1]:
+                st.metric("Stock HHI", f"{stock_hhi:,.0f}", help=get_hhi_category(stock_hhi))
+                st.metric("Sector HHI", f"{sector_hhi:,.0f}", help=get_hhi_category(sector_hhi))
+            st.info("Herfindahl-Hirschman Index (HHI) measures concentration. Scale: <1500 (Low), 1500-2500 (Moderate), >2500 (High).")
+
+        # --- Breakdowns Tab ---
+        with analysis_tabs[1]:
+            st.subheader("Portfolio Breakdowns")
             
-            concentration_cols[0].metric("Top 5 Stocks Weight", f"{top_5_stocks:.2f}%")
-            concentration_cols[1].metric("Top 10 Stocks Weight", f"{top_10_stocks:.2f}%")
-            concentration_cols[2].metric("Top 3 Sectors Weight", f"{top_3_sectors:.2f}%")
-            concentration_cols[3].metric("Holdings Count", f"{len(results_df)}")
+            # Sunburst Chart
+            st.markdown("#### Interactive Portfolio Composition")
+            path = ['Industry', 'Name']
+            if 'Asset Class' in results_df.columns:
+                path.insert(0, 'Asset Class')
+                results_df['Asset Class'] = results_df['Asset Class'].fillna('UNCLASSIFIED')
             
-            hhi_cols = st.columns(2)
-            hhi_cols[0].metric("Stock HHI", f"{stock_hhi:,.0f}", help=f"Category: {get_hhi_category(stock_hhi)}")
-            hhi_cols[1].metric("Sector HHI", f"{sector_hhi:,.0f}", help=f"Category: {get_hhi_category(sector_hhi)}")
-            st.info("Herfindahl-Hirschman Index (HHI) is a measure of market concentration. Scale: <1500 (Low), 1500-2500 (Moderate), >2500 (High).")
-            st.markdown("---")
-            
-            # --- Visualizations ---
-            vis_cols = st.columns(2)
-            with vis_cols[0]:
-                st.markdown("#### Sector Allocation")
-                sector_weights_df = sector_weights_grouped.sort_values(ascending=False).reset_index()
-                fig_sector = px.bar(sector_weights_df.head(15), 
-                                    x='Weight %', 
-                                    y='Industry', 
-                                    orientation='h', 
-                                    text_auto='.2f')
-                fig_sector.update_traces(textposition='outside')
-                fig_sector.update_layout(yaxis={'categoryorder':'total ascending'}, xaxis_title="Weight (%)", yaxis_title=None)
+            fig_sunburst = px.sunburst(results_df, path=path, values='Real-time Value (Rs)',
+                                       hover_data={'Weight %': ':.2f%'})
+            fig_sunburst.update_layout(margin=dict(t=20, l=20, r=20, b=20), height=600)
+            st.plotly_chart(fig_sunburst, use_container_width=True)
+
+            # Allocation Charts
+            breakdown_cols = st.columns(3)
+            with breakdown_cols[0]:
+                st.markdown("##### By Sector")
+                sector_weights = results_df.groupby('Industry')['Weight %'].sum().reset_index()
+                fig_sector = px.pie(sector_weights, names='Industry', values='Weight %', hole=0.4)
+                fig_sector.update_traces(textinfo='percent+label', showlegend=False)
                 st.plotly_chart(fig_sector, use_container_width=True)
-
-            with vis_cols[1]:
-                st.markdown("#### Top 10 Holdings")
-                top_10_df = results_df.nlargest(10, 'Weight %')[['Name', 'Symbol', 'Industry', 'Weight %']]
-                st.dataframe(top_10_df.style.format({'Weight %': '{:.2f}%'}), use_container_width=True)
-
-
-        with analysis_tabs[1]: # Compliance Check Tab
+            with breakdown_cols[1]:
+                if 'Asset Class' in results_df.columns:
+                    st.markdown("##### By Asset Class")
+                    asset_weights = results_df.groupby('Asset Class')['Weight %'].sum().reset_index()
+                    fig_asset = px.pie(asset_weights, names='Asset Class', values='Weight %', hole=0.4)
+                    fig_asset.update_traces(textinfo='percent+label', showlegend=False)
+                    st.plotly_chart(fig_asset, use_container_width=True)
+            with breakdown_cols[2]:
+                if 'Rating' in results_df.columns:
+                    st.markdown("##### By Rating")
+                    rating_weights = results_df.groupby('Rating')['Weight %'].sum().reset_index()
+                    fig_rating = px.pie(rating_weights, names='Rating', values='Weight %', hole=0.4)
+                    fig_rating.update_traces(textinfo='percent+label', showlegend=False)
+                    st.plotly_chart(fig_rating, use_container_width=True)
+                    
+        # --- Compliance Check Tab ---
+        with analysis_tabs[2]:
             st.subheader("Compliance Rule Validation")
             validation_results = parse_and_validate_rules(rules_text, results_df)
             if not validation_results:
-                st.info("No rules were entered or all rules were valid. Please define rules in the text area above.")
+                st.info("No rules were entered or all entered rules are valid. Define rules in the text area to see validation results.")
             else:
                 for res in validation_results:
                     if res['status'] == "✅ PASS":
@@ -2011,31 +2025,24 @@ def render_investment_compliance_tab(kite_client: KiteConnect | None, api_key: s
                     else:
                         st.warning(f"**{res['status']}:** `{res['rule']}` ({res['details']})")
 
-        with analysis_tabs[2]: # Detailed Holdings Tab
+        # --- Detailed Holdings Tab ---
+        with analysis_tabs[3]:
             st.subheader("Detailed Holdings View")
             display_df = results_df.copy()
+            format_dict = {'Real-time Value (Rs)': '₹{:,.2f}', 'LTP': '₹{:,.2f}', 'Weight %': '{:.2f}%'}
             
-            format_dict = {
-                 'Real-time Value (Rs)': '₹ {:,.2f}', 'LTP': '₹ {:,.2f}', 'Weight %': '{:.2f}%'
-            }
+            column_order = ['Name', 'Symbol', 'Industry', 'Real-time Value (Rs)', 'Weight %', 'Quantity', 'LTP']
+            if 'Asset Class' in display_df.columns: column_order.insert(3, 'Asset Class')
+            if 'Rating' in display_df.columns: column_order.insert(3, 'Rating')
             
-            column_order = [
-                'Name', 'Symbol', 'Industry', 'Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %'
-            ]
-            if 'Rating' in display_df.columns:
-                column_order.insert(3, 'Rating')
-
             display_columns = [col for col in column_order if col in display_df.columns]
-            
             st.dataframe(display_df[display_columns].style.format(format_dict), use_container_width=True)
 
-            # Download Button for the detailed report
             csv_export = display_df[display_columns].to_csv(index=False).encode('utf-8')
             st.download_button(
-                label="📥 Download Full Report (CSV)",
-                data=csv_export,
-                file_name=f"realtime_portfolio_report_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
+                label="📥 Download Full Report (CSV)", data=csv_export,
+                file_name=f"realtime_portfolio_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
             )
 
 # --- Main Application Logic (Tab Rendering) ---
