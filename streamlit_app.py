@@ -607,8 +607,14 @@ def generate_factsheet_html_content(
         for col in last_comparison_df.columns:
             fig_comparison.add_trace(go.Scatter(x=last_comparison_df.index, y=last_comparison_df[col], mode='lines', name=col))
         
+        # Correctly determine the chart_title here
         chart_title = "Multi-Index & Benchmark Performance"
-        if index_name != "Consolidated Report" and index_name != "Comparison Report" and index_name != "Combined Index Constituents Report":
+        # Ensure index_name is properly defined before using it in f-string
+        if index_name in ["Newly Calculated Index", "Combined Index Constituents Report"]:
+            # If it's a report about combined or newly calculated index, use that as title part
+            chart_title = f"{index_name} Performance"
+        elif index_name != "Consolidated Report" and index_name != "Comparison Report":
+            # Otherwise, if it's a specific saved index name, use it
             chart_title = f"{index_name} vs Benchmarks Performance"
 
         fig_comparison.update_layout(
@@ -1340,8 +1346,14 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
             for col in last_comparison_df.columns:
                 fig_comparison.add_trace(go.Scatter(x=last_comparison_df.index, y=last_comparison_df[col], mode='lines', name=col))
             
+            # Correctly determine the chart_title here
             chart_title = "Multi-Index & Benchmark Performance"
-            if index_name != "Consolidated Report" and index_name != "Comparison Report" and index_name != "Combined Index Constituents Report":
+            # Ensure index_name is properly defined before using it in f-string
+            if index_name in ["Newly Calculated Index", "Combined Index Constituents Report"]:
+                # If it's a report about combined or newly calculated index, use that as title part
+                chart_title = f"{index_name} Performance"
+            elif index_name != "Consolidated Report" and index_name != "Comparison Report":
+                # Otherwise, if it's a specific saved index name, use it
                 chart_title = f"{index_name} vs Benchmarks Performance"
 
             fig_comparison.update_layout(
