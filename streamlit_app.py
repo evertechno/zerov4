@@ -474,7 +474,7 @@ def render_ai_analysis_tab(kite_client):
                     Be clear, concise, and professional. Use bullet points and bold text to structure your analysis. If the documents lack specific quantifiable rules, state that and perform a qualitative analysis based on the fund's stated philosophy.
                     """
                     with st.spinner("AI is analyzing... This may take a moment."):
-                        model = genai.GenerativeModel('gemini-1.5-pro-latest')
+                        model = genai.GenerativeModel('gemini-2.5-flash')
                         safety_settings = [
                             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
                             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
