@@ -777,6 +777,14 @@ with st.sidebar:
         if st.session_state.get("holdings_data") is not None and not st.session_state["holdings_data"].empty:
             with st.expander("Show Holdings"):
                 st.dataframe(st.session_state["holdings_data"])
+                # ADDED DOWNLOAD BUTTON FOR HOLDINGS
+                st.download_button(
+                    label="Download Holdings Data (CSV)",
+                    data=st.session_state["holdings_data"].to_csv(index=False).encode('utf-8'),
+                    file_name="kite_holdings.csv",
+                    mime="text/csv",
+                    key="download_holdings_sidebar_csv"
+                )
     else:
         st.info("Login to Kite to access quick data.")
 
