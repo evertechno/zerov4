@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import json
-import threading
+import re # Added for parsing compliance rules
 import time
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
@@ -1719,115 +1719,163 @@ def render_index_price_calc_tab(kite_client: KiteConnect | None, api_key: str | 
                 except Exception as e:
                     st.error(f"An error occurred while fetching prices: {e}")
 
-# START: NEW TAB FUNCTION
+# START: NEW/ENHANCED TAB FUNCTION
+def parse_and_validate_rules(rules_text: str, portfolio_df: pd.DataFrame):
+    """Parses user-defined rules and validates them against the portfolio dataframe."""
+    results = []
+    if not rules_text.strip():
+        return results
+
+    # Pre-calculate aggregations
+    sector_weights = portfolio_df.groupby('Industry')['Weight %'].sum()
+    stock_weights = portfolio_df.set_index('Symbol')['Weight %']
+
+    rules = rules_text.strip().split('\n')
+    for rule in rules:
+        rule = rule.strip()
+        if not rule:
+            continue
+
+        # Regex to capture TYPE, NAME, OPERATOR, and VALUE
+        match = re.match(r'(?P<type>SECTOR|STOCK)\s+(?P<name>[\w\s&-]+)\s*(?P<op>[><])\s*(?P<val>[\d.]+)\%?', rule, re.IGNORECASE)
+
+        if not match:
+            results.append({'rule': rule, 'status': 'Error', 'details': 'Invalid rule format.'})
+            continue
+
+        data = match.groupdict()
+        try:
+            rule_type = data['type'].upper()
+            rule_name = data['name'].strip().upper()
+            operator = data['op']
+            threshold = float(data['val'])
+
+            actual_value = 0.0
+            is_valid = False
+
+            if rule_type == 'SECTOR':
+                # Find matching sector case-insensitively
+                matching_sector = next((s for s in sector_weights.index if s.upper() == rule_name), None)
+                if matching_sector:
+                    actual_value = sector_weights.get(matching_sector, 0.0)
+                    is_valid = True
+                else:
+                    results.append({'rule': rule, 'status': 'Error', 'details': f"Sector '{rule_name}' not found in portfolio."})
+                    continue
+
+            elif rule_type == 'STOCK':
+                if rule_name in stock_weights.index:
+                    actual_value = stock_weights.get(rule_name, 0.0)
+                    is_valid = True
+                else:
+                    results.append({'rule': rule, 'status': 'Error', 'details': f"Stock Symbol '{rule_name}' not found in portfolio."})
+                    continue
+            
+            if is_valid:
+                passed = (operator == '>' and actual_value > threshold) or \
+                         (operator == '<' and actual_value < threshold)
+                
+                status = "✅ PASS" if passed else "❌ FAIL"
+                details = f"Actual: {actual_value:.2f}% | Rule: {operator} {threshold:.2f}%"
+                results.append({'rule': rule, 'status': status, 'details': details})
+
+        except (ValueError, KeyError) as e:
+            results.append({'rule': rule, 'status': 'Error', 'details': f"Could not parse rule. Error: {e}"})
+            
+    return results
+
 def render_investment_compliance_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("💼 Investment Compliance Validation")
-    st.markdown("""
-    Upload your portfolio holdings as a CSV file to validate and calculate its real-time value.
-    The tool fetches the latest prices, calculates current valuations, and visualizes your portfolio exposures.
-    """)
+    st.markdown("Upload your portfolio, define compliance rules, and get a real-time analysis of your holdings, exposures, and performance.")
 
     if not kite_client:
         st.info("Please login to Kite Connect first to fetch live prices for validation.")
         return
+    
+    # --- Configuration Columns ---
+    col1, col2 = st.columns(2)
+    with col1:
+        # --- 1. File Upload Section ---
+        st.subheader("1. Upload Portfolio CSV")
+        uploaded_file = st.file_uploader(
+            "Choose a CSV file",
+            type="csv",
+            help="CSV must contain headers: ISIN, Name of the Instrument, Symbol, Industry, Quantity, Market/Fair Value(Rs. in Lacs)"
+        )
 
-    # --- 1. File Upload Section ---
-    st.subheader("1. Upload Portfolio CSV")
-    uploaded_file = st.file_uploader(
-        "Choose a CSV file",
-        type="csv",
-        help="CSV must contain the headers: ISIN, Name of the Instrument, Symbol, Industry, Quantity, Market/Fair Value(Rs. in Lacs)"
-    )
-
+    with col2:
+        # --- 2. Compliance Rules Section ---
+        st.subheader("2. Set Compliance Rules (Optional)")
+        rules_text = st.text_area(
+            "Enter one rule per line.",
+            height=150,
+            placeholder="Examples:\nSECTOR FINANCIAL SERVICES > 25%\nSECTOR IT < 20%\nSTOCK RELIANCE < 10%\nSTOCK HDFCBANK > 5%",
+            key="compliance_rules_input"
+        )
+    
+    # --- Processing Logic ---
     if uploaded_file is not None:
         try:
             df = pd.read_csv(uploaded_file)
             
-            # --- 2. Header Validation and Data Cleaning ---
-            original_cols = df.columns
-            df.columns = [str(col).strip().lower().replace(' ', '_') for col in df.columns]
+            # Header Validation and Data Cleaning
+            df.columns = [str(col).strip().lower().replace(' ', '_').replace('.', '') for col in df.columns]
 
-            # Define expected headers and their standardized internal names
             header_map = {
-                'isin': 'ISIN',
-                'name_of_the_instrument': 'Name',
-                'symbol': 'Symbol',
-                'industry': 'Industry',
-                'quantity': 'Quantity',
-                'market/fair_value(rs._in_lacs)': 'Uploaded Value (Lacs)',
+                'isin': 'ISIN', 'name_of_the_instrument': 'Name', 'symbol': 'Symbol',
+                'industry': 'Industry', 'quantity': 'Quantity',
+                'market/fair_value(rs_in_lacs)': 'Uploaded Value (Lacs)',
                 'rounded_%_to_net_assets': 'Uploaded Weight (%)'
             }
             
-            required_keys = ['symbol', 'quantity', 'market/fair_value(rs._in_lacs)', 'industry']
-            missing_keys = [key for key in required_keys if key not in df.columns]
+            required_keys = ['symbol', 'quantity', 'market/fair_value(rs_in_lacs)', 'industry']
+            df = df.rename(columns=header_map)
+            missing_cols = [col for col in ['Symbol', 'Quantity', 'Uploaded Value (Lacs)', 'Industry'] if col not in df.columns]
 
-            if missing_keys:
-                st.error(f"The uploaded CSV is missing the following required columns: {', '.join(missing_keys)}")
-                st.session_state.compliance_results_df = pd.DataFrame() # Clear any previous results
+            if missing_cols:
+                st.error(f"The uploaded CSV is missing the following required columns: {', '.join(missing_cols)}")
+                st.session_state.compliance_results_df = pd.DataFrame()
             else:
-                # Rename columns for internal use
-                df = df.rename(columns=header_map)
-                
-                # Select and reorder columns we will definitely use
-                final_cols = [col for col in header_map.values() if col in df.columns]
-                df = df[final_cols]
-
-                # Data type conversion and cleaning
                 df['Symbol'] = df['Symbol'].str.strip().str.upper()
-                df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce')
+                df['Quantity'] = pd.to_numeric(df['Quantity'].astype(str).str.replace(',', ''), errors='coerce')
                 df['Uploaded Value (Lacs)'] = pd.to_numeric(df['Uploaded Value (Lacs)'], errors='coerce')
-                
-                # Drop rows where essential data is missing after conversion
                 df.dropna(subset=['Symbol', 'Quantity', 'Uploaded Value (Lacs)'], inplace=True)
 
-                st.success(f"Successfully loaded and validated {len(df)} holdings from {uploaded_file.name}.")
-                with st.expander("View Uploaded Data"):
-                    st.dataframe(df)
-
-                # --- 3. Validation and Calculation Trigger ---
-                if st.button("Calculate Real-time Value & Exposures", type="primary"):
+                if st.button("Calculate Real-time Value & Exposures", type="primary", use_container_width=True):
                     with st.spinner("Fetching live prices and analyzing portfolio..."):
                         symbols = df['Symbol'].unique().tolist()
                         instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols]
 
                         try:
                             ltp_data = kite_client.ltp(instrument_identifiers)
-                            
-                            prices = {
-                                sym: ltp_data.get(f"{DEFAULT_EXCHANGE}:{sym}", {}).get('last_price')
-                                for sym in symbols
-                            }
+                            prices = {sym: ltp_data.get(f"{DEFAULT_EXCHANGE}:{sym}", {}).get('last_price') for sym in symbols}
 
                             df_results = df.copy()
                             df_results['LTP'] = df_results['Symbol'].map(prices)
-                            
-                            # Handle symbols for which LTP was not found
                             failed_symbols = df_results[df_results['LTP'].isna()]['Symbol'].tolist()
                             if failed_symbols:
-                                st.warning(f"Could not fetch LTP for: {', '.join(failed_symbols)}. These holdings will be excluded from real-time calculations.")
+                                st.warning(f"Could not fetch LTP for: {', '.join(failed_symbols)}. They will be excluded from real-time calculations.")
                             
-                            # Perform calculations
                             df_results['Uploaded Value (Rs)'] = df_results['Uploaded Value (Lacs)'] * 100000
-                            df_results['Real-time Value (Rs)'] = df_results['LTP'] * df_results['Quantity']
+                            df_results['Real-time Value (Rs)'] = (df_results['LTP'] * df_results['Quantity']).fillna(0)
                             
-                            # Fill NaN for P/L calculations where real-time value is not available
-                            df_results['P/L (Rs)'] = (df_results['Real-time Value (Rs)'] - df_results['Uploaded Value (Rs)']).fillna(0)
+                            total_realtime_value = df_results['Real-time Value (Rs)'].sum()
+                            if total_realtime_value > 0:
+                                df_results['Weight %'] = (df_results['Real-time Value (Rs)'] / total_realtime_value) * 100
+                            else:
+                                df_results['Weight %'] = 0
                             
-                            # Avoid division by zero for P/L %
-                            df_results['P/L %'] = np.where(
-                                df_results['Uploaded Value (Rs)'] != 0,
-                                (df_results['P/L (Rs)'] / df_results['Uploaded Value (Rs)']) * 100,
-                                0
-                            )
+                            df_results['P/L (Rs)'] = df_results['Real-time Value (Rs)'] - df_results['Uploaded Value (Rs)']
+                            df_results['P/L %'] = np.where(df_results['Uploaded Value (Rs)'] != 0, (df_results['P/L (Rs)'] / df_results['Uploaded Value (Rs)']) * 100, 0)
 
-                            st.session_state.compliance_results_df = df_results
+                            st.session_state.compliance_results_df = df_results.copy()
 
                         except Exception as e:
-                            st.error(f"An error occurred while fetching prices: {e}")
+                            st.error(f"An error occurred during calculation: {e}")
                             st.session_state.compliance_results_df = pd.DataFrame()
         
         except Exception as e:
-            st.error(f"Failed to process the CSV file. Please ensure it is a valid CSV. Error: {e}")
+            st.error(f"Failed to process the CSV file. Error: {e}")
             st.session_state.compliance_results_df = pd.DataFrame()
 
     # --- 4. Display Results and Visualizations ---
@@ -1835,80 +1883,102 @@ def render_investment_compliance_tab(kite_client: KiteConnect | None, api_key: s
 
     if not results_df.empty:
         st.markdown("---")
-        st.subheader("📈 Real-time Portfolio Analysis")
+        st.subheader("📊 Real-time Portfolio Analysis")
 
-        # --- KPI Metrics ---
-        total_uploaded_value = results_df['Uploaded Value (Rs)'].sum()
-        total_realtime_value = results_df['Real-time Value (Rs)'].sum()
-        total_pl = results_df['P/L (Rs)'].sum()
-        overall_pl_percent = (total_pl / total_uploaded_value) * 100 if total_uploaded_value else 0
+        analysis_tabs = st.tabs(["Dashboard", "Compliance Check", "Detailed Holdings"])
 
-        kpi_cols = st.columns(4)
-        kpi_cols[0].metric("Uploaded Value", f"₹ {total_uploaded_value:,.2f}")
-        kpi_cols[1].metric("Real-time Value", f"₹ {total_realtime_value:,.2f}")
-        kpi_cols[2].metric("Total P/L", f"₹ {total_pl:,.2f}")
-        kpi_cols[3].metric("Overall P/L %", f"{overall_pl_percent:.2f}%")
+        with analysis_tabs[0]: # Dashboard Tab
+            # --- KPI Metrics ---
+            total_uploaded_value = results_df['Uploaded Value (Rs)'].sum()
+            total_realtime_value = results_df['Real-time Value (Rs)'].sum()
+            total_pl = results_df['P/L (Rs)'].sum()
+            overall_pl_percent = (total_pl / total_uploaded_value) * 100 if total_uploaded_value else 0
 
-        st.markdown("---")
-        
-        # --- Visualizations ---
-        st.subheader("🖼️ Portfolio Exposures")
-        vis_cols = st.columns(2)
+            kpi_cols = st.columns(4)
+            kpi_cols[0].metric("Uploaded Value", f"₹ {total_uploaded_value:,.2f}")
+            kpi_cols[1].metric("Real-time Value", f"₹ {total_realtime_value:,.2f}")
+            kpi_cols[2].metric("Total P/L", f"₹ {total_pl:,.2f}", delta=f"{overall_pl_percent:.2f}%")
+            kpi_cols[3].metric("Holdings Count", f"{len(results_df)}")
 
-        with vis_cols[0]:
-            # Industry Exposure Pie Chart
-            industry_exposure = results_df.groupby('Industry')['Real-time Value (Rs)'].sum().reset_index()
-            fig_pie = px.pie(
-                industry_exposure,
-                values='Real-time Value (Rs)',
-                names='Industry',
-                title='Industry Exposure by Real-time Value',
-                hole=0.3
+            # --- Concentration Metrics ---
+            st.markdown("#### Portfolio Concentration")
+            concentration_cols = st.columns(3)
+            top_5_stocks = results_df.nlargest(5, 'Weight %')['Weight %'].sum()
+            top_10_stocks = results_df.nlargest(10, 'Weight %')['Weight %'].sum()
+            sector_weights = results_df.groupby('Industry')['Weight %'].sum()
+            top_3_sectors = sector_weights.nlargest(3).sum()
+            
+            concentration_cols[0].metric("Top 5 Stocks Weight", f"{top_5_stocks:.2f}%")
+            concentration_cols[1].metric("Top 10 Stocks Weight", f"{top_10_stocks:.2f}%")
+            concentration_cols[2].metric("Top 3 Sectors Weight", f"{top_3_sectors:.2f}%")
+            st.markdown("---")
+
+            # --- Visualizations ---
+            vis_cols = st.columns(2)
+            with vis_cols[0]:
+                st.markdown("#### Sector & Stock Exposure")
+                fig_treemap = px.treemap(results_df, path=[px.Constant("Portfolio"), 'Industry', 'Name'], 
+                                         values='Real-time Value (Rs)',
+                                         color='Industry',
+                                         hover_data={'Weight %':':.2f%'})
+                fig_treemap.update_layout(margin = dict(t=30, l=10, r=10, b=10))
+                st.plotly_chart(fig_treemap, use_container_width=True)
+
+            with vis_cols[1]:
+                st.markdown("#### Top P/L Contributors")
+                pl_non_zero = results_df[results_df['P/L (Rs)'] != 0]
+                top_5_gainers = pl_non_zero.nlargest(5, 'P/L (Rs)')
+                top_5_losers = pl_non_zero.nsmallest(5, 'P/L (Rs)')
+                pl_contributors = pd.concat([top_5_gainers, top_5_losers]).sort_values('P/L (Rs)')
+                
+                fig_pl = px.bar(pl_contributors, x='Name', y='P/L (Rs)', 
+                                color=pl_contributors['P/L (Rs)'] > 0,
+                                color_discrete_map={True: 'green', False: 'red'},
+                                text_auto='.2s')
+                fig_pl.update_layout(showlegend=False, xaxis_title="", yaxis_title="Profit / Loss (Rs)")
+                st.plotly_chart(fig_pl, use_container_width=True)
+
+        with analysis_tabs[1]: # Compliance Check Tab
+            st.subheader("⚖️ Compliance Rule Validation")
+            validation_results = parse_and_validate_rules(rules_text, results_df)
+            if not validation_results:
+                st.info("No rules were entered or all rules were invalid. Please define rules in the text area above.")
+            else:
+                for res in validation_results:
+                    if res['status'] == "✅ PASS":
+                        st.success(f"**{res['status']}:** `{res['rule']}` ({res['details']})")
+                    elif res['status'] == "❌ FAIL":
+                        st.error(f"**{res['status']}:** `{res['rule']}` ({res['details']})")
+                    else:
+                        st.warning(f"**{res['status']}:** `{res['rule']}` ({res['details']})")
+
+        with analysis_tabs[2]: # Detailed Holdings Tab
+            st.subheader("📄 Detailed Holdings View")
+            display_df = results_df.copy()
+            
+            format_dict = {
+                'Uploaded Value (Rs)': '₹ {:,.2f}', 'Real-time Value (Rs)': '₹ {:,.2f}',
+                'P/L (Rs)': '₹ {:,.2f}', 'LTP': '₹ {:,.2f}',
+                'P/L %': '{:.2f}%', 'Weight %': '{:.2f}%'
+            }
+            
+            column_order = [
+                'Name', 'Symbol', 'Industry', 'Quantity', 'LTP',
+                'Uploaded Value (Rs)', 'Real-time Value (Rs)', 'Weight %', 
+                'P/L (Rs)', 'P/L %'
+            ]
+            display_columns = [col for col in column_order if col in display_df.columns]
+            
+            st.dataframe(display_df[display_columns].style.format(format_dict), use_container_width=True)
+
+            # Download Button for the detailed report
+            csv_export = display_df[display_columns].to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Full Report (CSV)",
+                data=csv_export,
+                file_name=f"realtime_portfolio_report_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
             )
-            fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-        with vis_cols[1]:
-            # Top 10 Holdings Bar Chart
-            top_10_holdings = results_df.nlargest(10, 'Real-time Value (Rs)').sort_values('Real-time Value (Rs)', ascending=True)
-            fig_bar = px.bar(
-                top_10_holdings,
-                x='Real-time Value (Rs)',
-                y='Name',
-                orientation='h',
-                title='Top 10 Holdings by Real-time Value',
-                text='Real-time Value (Rs)'
-            )
-            fig_bar.update_traces(texttemplate='₹ %{text:,.0f}', textposition='outside')
-            fig_bar.update_layout(yaxis_title="")
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-        st.markdown("---")
-
-        # --- Detailed Table View ---
-        st.subheader("📄 Detailed Portfolio View")
-        
-        # Format the dataframe for display
-        display_df = results_df.copy()
-        
-        # Columns to format
-        currency_cols = ['Uploaded Value (Rs)', 'Real-time Value (Rs)', 'P/L (Rs)', 'LTP']
-        percent_cols = ['P/L %']
-        
-        format_dict = {col: '₹ {:,.2f}' for col in currency_cols}
-        format_dict.update({col: '{:.2f}%' for col in percent_cols})
-        
-        # Define the column order for better readability
-        column_order = [
-            'Name', 'Symbol', 'Industry', 'Quantity', 'LTP',
-            'Uploaded Value (Rs)', 'Real-time Value (Rs)', 'P/L (Rs)', 'P/L %'
-        ]
-        # Filter out any columns that might not exist, just in case
-        display_columns = [col for col in column_order if col in display_df.columns]
-
-        st.dataframe(display_df[display_columns].style.format(format_dict), use_container_width=True)
-
-# END: NEW TAB FUNCTION
 
 # --- Main Application Logic (Tab Rendering) ---
 api_key = KITE_CREDENTIALS["api_key"]
