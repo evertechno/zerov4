@@ -43,6 +43,8 @@ if "current_market_data" not in st.session_state: st.session_state["current_mark
 if "holdings_data" not in st.session_state: st.session_state["holdings_data"] = None
 if "benchmark_historical_data" not in st.session_state: st.session_state["benchmark_historical_data"] = pd.DataFrame() # Store benchmark data for ratios
 if "factsheet_selected_constituents_index_names" not in st.session_state: st.session_state["factsheet_selected_constituents_index_names"] = []
+# ADDED for the new tab
+if "index_price_calc_df" not in st.session_state: st.session_state["index_price_calc_df"] = pd.DataFrame()
 
 # --- Load Credentials from Streamlit Secrets ---
 def load_secrets():
@@ -794,8 +796,8 @@ k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state[
 
 
 # --- Main UI - Tabs for modules ---
-tabs = st.tabs(["Market & Historical", "Custom Index"])
-tab_market, tab_custom_index = tabs
+tabs = st.tabs(["Market & Historical", "Custom Index", "Index Price Calculation"])
+tab_market, tab_custom_index, tab_index_price_calc = tabs
 
 # --- Tab Logic Functions ---
 
@@ -1621,9 +1623,106 @@ def render_custom_index_tab(kite_client: KiteConnect | None, supabase_client: Cl
         st.info("No saved indexes to manage yet. Load them using the button above.")
 
 
+def render_index_price_calc_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
+    st.header("⚡ Live Index Price Calculator")
+    st.markdown("Upload a CSV file with symbols and their weights to calculate a real-time index value based on the Last Traded Price (LTP).")
+
+    if not kite_client:
+        st.info("Please login to Kite Connect first to fetch live prices.")
+        return
+
+    # --- 1. CSV Upload Section ---
+    st.subheader("1. Upload Constituents CSV")
+    uploaded_file = st.file_uploader(
+        "Upload a CSV file",
+        type="csv",
+        help="The CSV must have two columns: 'Symbol' and 'Weights'."
+    )
+
+    if uploaded_file is not None:
+        try:
+            df = pd.read_csv(uploaded_file)
+            # Normalize column names for robustness
+            df.columns = [col.strip().lower() for col in df.columns]
+
+            if 'symbol' in df.columns and 'weights' in df.columns:
+                # Data cleaning and type conversion
+                df['symbol'] = df['symbol'].str.strip().str.upper()
+                df['weights'] = pd.to_numeric(df['weights'], errors='coerce')
+                df.dropna(subset=['symbol', 'weights'], inplace=True)
+                
+                # Rename columns back to a user-friendly format
+                df.rename(columns={'symbol': 'Symbol', 'weights': 'Weights'}, inplace=True)
+                
+                st.session_state.index_price_calc_df = df
+                st.success(f"Successfully loaded {len(df)} valid symbols from {uploaded_file.name}.")
+            else:
+                st.error("CSV file must contain 'Symbol' and 'Weights' columns (case-insensitive).")
+                st.session_state.index_price_calc_df = pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error processing CSV file: {e}")
+            st.session_state.index_price_calc_df = pd.DataFrame()
+
+    # --- 2. Calculation Section ---
+    df_constituents = st.session_state.get("index_price_calc_df", pd.DataFrame())
+    
+    if not df_constituents.empty:
+        st.subheader("2. Review Constituents")
+        st.dataframe(df_constituents, use_container_width=True)
+
+        st.subheader("3. Calculate Index Price")
+        if st.button("Calculate/Refresh Index Price", type="primary"):
+            with st.spinner("Fetching live prices and calculating index value..."):
+                symbols = df_constituents['Symbol'].tolist()
+                instrument_identifiers = [f"{DEFAULT_EXCHANGE}:{s}" for s in symbols]
+
+                try:
+                    # Fetch LTP in a single batch call
+                    ltp_data = kite_client.ltp(instrument_identifiers)
+
+                    # Map prices back to the dataframe
+                    prices = {}
+                    for sym in symbols:
+                        key = f"{DEFAULT_EXCHANGE}:{sym}"
+                        if key in ltp_data and ltp_data[key].get('last_price') is not None:
+                            prices[sym] = ltp_data[key]['last_price']
+                        else:
+                            prices[sym] = np.nan # Mark as NaN if not found
+
+                    df_results = df_constituents.copy()
+                    df_results['LTP'] = df_results['Symbol'].map(prices)
+                    
+                    # Calculate Weighted Price
+                    df_results['Weighted Price'] = df_results['LTP'] * df_results['Weights']
+
+                    # Warn about any symbols that failed to get a price
+                    failed_symbols = df_results[df_results['LTP'].isna()]['Symbol'].tolist()
+                    if failed_symbols:
+                        st.warning(f"Could not fetch LTP for the following symbols: {', '.join(failed_symbols)}. They will be excluded from the calculation.")
+                    
+                    # Calculate final index price (sum of weighted prices)
+                    final_index_price = df_results['Weighted Price'].sum()
+
+                    # Display Results
+                    st.subheader("Calculation Results")
+                    st.dataframe(df_results.style.format({
+                        "Weights": "{:.4f}",
+                        "LTP": "₹{:,.2f}",
+                        "Weighted Price": "₹{:,.2f}"
+                    }), use_container_width=True)
+                    
+                    st.metric(label="Final Calculated Index Price", value=f"₹ {final_index_price:,.2f}")
+
+                except Exception as e:
+                    st.error(f"An error occurred while fetching prices: {e}")
+
 # --- Main Application Logic (Tab Rendering) ---
 api_key = KITE_CREDENTIALS["api_key"]
 access_token = st.session_state["kite_access_token"]
 
-with tab_market: render_market_historical_tab(k, api_key, access_token)
-with tab_custom_index: render_custom_index_tab(k, supabase, api_key, access_token)
+with tab_market: 
+    render_market_historical_tab(k, api_key, access_token)
+with tab_custom_index: 
+    render_custom_index_tab(k, supabase, api_key, access_token)
+with tab_index_price_calc:
+    render_index_price_calc_tab(k, api_key, access_token)
