@@ -1881,7 +1881,9 @@ def render_investment_compliance_tab(kite_client: KiteConnect | None, api_key: s
     # --- 4. Display Results and Visualizations ---
     results_df = st.session_state.get("compliance_results_df", pd.DataFrame())
 
-    if not results_df.empty:
+    # FIX: Check if the dataframe is not only non-empty but also contains the calculated 'Weight %' column
+    # This prevents the KeyError when the display logic runs before the calculation is complete.
+    if not results_df.empty and 'Weight %' in results_df.columns:
         st.markdown("---")
         st.subheader("📊 Real-time Portfolio Analysis")
 
