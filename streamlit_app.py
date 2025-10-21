@@ -1842,7 +1842,7 @@ Begin your analysis now:
 
                     # Call Gemini API
                     with st.spinner("🤖 AI is analyzing your portfolio... This may take 30-60 seconds."):
-                        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+                        model = genai.GenerativeModel('gemini-1.5-flash')
                         
                         safety_settings = [
                             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
