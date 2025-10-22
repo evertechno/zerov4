@@ -1,219 +1,4 @@
-with detail_subtabs[2]:
-                if 'Rating' in results_df.columns:
-                    st.markdown("#### Credit Rating Distribution Analysis")
-                    
-                    rating_analysis = results_df.groupby('Rating').agg({
-                        'Weight %': 'sum',
-                        'Symbol': 'count',
-                        'Real-time Value (Rs)': 'sum'
-                    }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        fig = px.pie(
-                            rating_analysis.reset_index(),
-                            values='Weight %',
-                            names='Rating',
-                            title='Rating Distribution by Weight',
-                            hole=0.3
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    
-                    with col2:
-                        fig = px.bar(
-                            rating_analysis.reset_index(),
-                            y='Rating',
-                            x='Weight %',
-                            orientation='h',
-                            title='Rating Exposure Detail',
-                            color='Weight %',
-                            color_continuous_scale='RdYlGn_r'
-                        )
-                        fig.update_layout(yaxis={'categoryorder': 'total ascending'})
-                        st.plotly_chart(fig, use_container_width=True)
-                    
-                    st.dataframe(
-                        rating_analysis.style.format({
-                            'Weight %': '{:.2f}%',
-                            'Real-time Value (Rs)': '₹{:,.2f}'
-                        }),
-                        use_container_width=True
-                    )
-                else:
-                    st.info("Rating information not available in portfolio data")
-        
-        # Additional tabs implementation...
-        # (Due to length constraints, the full implementation continues with all remaining tabs)
-
-
-# Render tabs
-with tab_market:
-    render_market_historical_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
-
-with tab_compliance:
-    render_investment_compliance_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
-
-with tab_ai:
-    # AI Analysis tab implementation
-    st.header("🤖 AI-Powered Compliance Analysis")
-    st.markdown("Advanced AI analysis using Google Gemini for comprehensive compliance insights")
-    
-    portfolio_df = st.session_state.get("compliance_results_df")
-    
-    if portfolio_df is None or portfolio_df.empty:
-        st.warning("⚠️ Please upload and analyze a portfolio in the 'Investment Compliance Pro' tab first")
-    else:
-        st.info("💡 Upload scheme documents (SID/KIM) for AI-powered compliance analysis")
-        
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            uploaded_files = st.file_uploader(
-                "📄 Upload Scheme Documents",
-                type=["pdf", "txt"],
-                accept_multiple_files=True,
-                help="Upload SID, KIM, or investment policy documents"
-            )
-        
-        with col2:
-            st.markdown("**Analysis Configuration**")
-            analysis_depth = st.select_slider(
-                "Depth",
-                options=["Quick", "Standard", "Comprehensive"],
-                value="Standard"
-            )
-            include_recommendations = st.checkbox("Recommendations", value=True)
-            include_risk = st.checkbox("Risk Assessment", value=True)
-        
-        if uploaded_files:
-            st.success(f"✅ {len(uploaded_files)} document(s) uploaded")
-            
-            if st.button("🚀 Run AI Analysis", type="primary", use_container_width=True):
-                with st.spinner("🤖 AI analyzing portfolio..."):
-                    try:
-                        # Extract document text
-                        docs_text = ""
-                        for file in uploaded_files:
-                            if file.type == "application/pdf":
-                                with fitz.open(stream=file.getvalue(), filetype="pdf") as doc:
-                                    for page in doc:
-                                        docs_text += page.get_text()
-                            else:
-                                docs_text += file.getvalue().decode("utf-8")
-                        
-                        # Prepare portfolio summary
-                        total_value = portfolio_df['Real-time Value (Rs)'].sum()
-                        top_10 = portfolio_df.nlargest(10, 'Weight %')[['Name', 'Weight %']]
-                        sector_weights = portfolio_df.groupby('Industry')['Weight %'].sum().nlargest(10)
-                        
-                        portfolio_summary = f"""
-Portfolio Overview:
-- Total Value: ₹{total_value:,.2f}
-- Holdings: {len(portfolio_df)}
-- Top Stock: {portfolio_df.nlargest(1, 'Weight %')['Name'].values[0]} ({portfolio_df['Weight %'].max():.2f}%)
-- Top 10 Weight: {portfolio_df.nlargest(10, 'Weight %')['Weight %'].sum():.2f}%
-
-Top 10 Holdings:
-{top_10.to_string()}
-
-Sector Allocation:
-{sector_weights.to_string()}
-"""
-                        
-                        # Build prompt
-                        prompt = f"""You are an expert investment compliance analyst for Indian Asset Management Companies with deep knowledge of SEBI regulations.
-
-**PORTFOLIO DATA:**
-{portfolio_summary}
-
-**SCHEME DOCUMENTS:**
-{docs_text[:100000]}
-
-**TASK:**
-Perform comprehensive compliance analysis covering:
-
-1. **Executive Summary** - Overall compliance status and critical findings
-2. **Investment Objective Alignment** - Strategy vs implementation analysis
-3. **SEBI Regulatory Compliance** - Single issuer, sector, group limits
-4. **Scheme-Specific Restrictions** - Document-based validation
-5. **Risk Assessment** - Concentration, liquidity, credit risks
-6. **Violations & Concerns** - Severity-classified issues
-7. **Recommendations** - Actionable remediation steps
-
-Provide specific, quantitative analysis with document citations. Use markdown formatting with clear sections."""
-
-                        # Call Gemini
-                        model = genai.GenerativeModel('gemini-2.0-flash-exp')
-                        response = model.generate_content(
-                            prompt,
-                            generation_config={
-                                'temperature': 0.3,
-                                'top_p': 0.8,
-                                'max_output_tokens': 8192,
-                            }
-                        )
-                        
-                        st.session_state.ai_analysis_response = response.text
-                        st.success("✅ AI Analysis Complete!")
-                        
-                    except Exception as e:
-                        st.error(f"❌ Analysis failed: {e}")
-        
-        # Display results
-        if st.session_state.get("ai_analysis_response"):
-            st.markdown("---")
-            st.markdown("## 📊 AI Compliance Analysis Report")
-            st.markdown(st.session_state.ai_analysis_response)
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                txt_data = st.session_state.ai_analysis_response.encode('utf-8')
-                st.download_button(
-                    "📄 Download Text",
-                    txt_data,
-                    f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                    "text/plain",
-                    use_container_width=True
-                )
-            
-            with col2:
-                md_data = st.session_state.ai_analysis_response.encode('utf-8')
-                st.download_button(
-                    "📝 Download Markdown",
-                    md_data,
-                    f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
-                    "text/markdown",
-                    use_container_width=True
-                )
-            
-            with col3:
-                if st.button("🗑️ Clear Analysis", use_container_width=True):
-                    st.session_state.ai_analysis_response = None
-                    st.rerun()
-
-
-# --- Footer ---
-st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-
-st.markdown("""
-<div style='text-align: center; color: #666; padding: 30px; background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); border-radius: 10px; margin-top: 30px;'>
-    <h3 style='color: #1e3c72; margin-bottom: 10px;'>Invsion Connect Pro</h3>
-    <p style='font-size: 1.1em; margin-bottom: 15px;'><strong>Enterprise Portfolio Compliance & Risk Analytics Platform</strong></p>
-    <p style='font-size: 0.9em; color: #555;'>⚠️ This tool provides informational analysis only. Always consult qualified professionals for investment decisions.</p>
-    <p style='font-size: 0.85em; color: #777; margin-top: 15px;'>
-        Powered by <strong>KiteConnect API</strong> & <strong>Google Gemini AI</strong><br>
-        © 2025 Invsion Connect | All Rights Reserved
-    </p>
-    <div style='margin-top: 20px; padding-top: 15px; border-top: 1px solid #ddd;'>
-        <p style='font-size: 0.8em; color: #888;'>
-            📊 Real-time Market Data | 🤖 AI-Powered Analysis | 🔒 Secure & Compliant<br>
-            Built for Asset Management Companies, Fund Managers & Compliance Teams
-        </p>
-    </div>
-</div>
-""", unsafe_allow_html=True)import streamlit as st
+import streamlit as st
 import pandas as pd
 import json
 import re
@@ -2020,8 +1805,807 @@ UNRATED_EXPOSURE <= 10""",
                         'Avg Weight per Stock': '{:.2f}%'
                     }),
                     use_container_width=True
-)
+                )
             
-with detail_subtabs[2]:
-    if 'Rating' in results_df.columns:
-        st.markdown("#### Rating")
+            with detail_subtabs[2]:
+                if 'Rating' in results_df.columns:
+                    st.markdown("#### Credit Rating Distribution Analysis")
+                    
+                    rating_analysis = results_df.groupby('Rating').agg({
+                        'Weight %': 'sum',
+                        'Symbol': 'count',
+                        'Real-time Value (Rs)': 'sum'
+                    }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        fig = px.pie(
+                            rating_analysis.reset_index(),
+                            values='Weight %',
+                            names='Rating',
+                            title='Rating Distribution by Weight',
+                            hole=0.3
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with col2:
+                        fig = px.bar(
+                            rating_analysis.reset_index(),
+                            y='Rating',
+                            x='Weight %',
+                            orientation='h',
+                            title='Rating Exposure Detail',
+                            color='Weight %',
+                            color_continuous_scale='RdYlGn_r'
+                        )
+                        fig.update_layout(yaxis={'categoryorder': 'total ascending'})
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.dataframe(
+                        rating_analysis.style.format({
+                            'Weight %': '{:.2f}%',
+                            'Real-time Value (Rs)': '₹{:,.2f}'
+                        }),
+                        use_container_width=True
+                    )
+                else:
+                    st.info("Rating information not available in portfolio data")
+            
+            with detail_subtabs[3]:
+                if 'Market Cap' in results_df.columns:
+                    st.markdown("#### Market Capitalization Distribution Analysis")
+                    market_cap_analysis = results_df.groupby('Market Cap').agg({
+                        'Weight %': 'sum',
+                        'Symbol': 'count',
+                        'Real-time Value (Rs)': 'sum'
+                    }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        fig = px.pie(
+                            market_cap_analysis.reset_index(),
+                            values='Weight %',
+                            names='Market Cap',
+                            title='Market Cap Distribution by Weight',
+                            hole=0.3
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with col2:
+                        fig = px.bar(
+                            market_cap_analysis.reset_index(),
+                            y='Market Cap',
+                            x='Weight %',
+                            orientation='h',
+                            title='Market Cap Exposure Detail',
+                            color='Weight %',
+                            color_continuous_scale='Plasma'
+                        )
+                        fig.update_layout(yaxis={'categoryorder': 'total ascending'})
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.dataframe(
+                        market_cap_analysis.style.format({
+                            'Weight %': '{:.2f}%',
+                            'Real-time Value (Rs)': '₹{:,.2f}'
+                        }),
+                        use_container_width=True
+                    )
+                else:
+                    st.info("Market Cap information not available in portfolio data")
+            
+            with detail_subtabs[4]:
+                if 'Country' in results_df.columns and results_df['Country'].nunique() > 1:
+                    st.markdown("#### Geographic Exposure Analysis")
+                    geo_analysis = results_df.groupby('Country').agg({
+                        'Weight %': 'sum',
+                        'Symbol': 'count',
+                        'Real-time Value (Rs)': 'sum'
+                    }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        fig = px.pie(
+                            geo_analysis.reset_index(),
+                            values='Weight %',
+                            names='Country',
+                            title='Geographic Distribution by Weight',
+                            hole=0.3
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with col2:
+                        fig = px.bar(
+                            geo_analysis.reset_index(),
+                            y='Country',
+                            x='Weight %',
+                            orientation='h',
+                            title='Geographic Exposure Detail',
+                            color='Weight %',
+                            color_continuous_scale='cividis'
+                        )
+                        fig.update_layout(yaxis={'categoryorder': 'total ascending'})
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.dataframe(
+                        geo_analysis.style.format({
+                            'Weight %': '{:.2f}%',
+                            'Real-time Value (Rs)': '₹{:,.2f}'
+                        }),
+                        use_container_width=True
+                    )
+                else:
+                    st.info("Geographic information not available or only single country in portfolio data")
+        
+        # TAB 3: Risk Metrics
+        with analysis_tabs[2]:
+            st.markdown("### 📈 Portfolio Risk Metrics")
+            
+            # Placeholder for advanced risk metrics calculation
+            advanced_metrics_calculated = False
+            if st.button("Calculate Advanced Risk Metrics", key="calc_adv_risk", type="secondary", use_container_width=True):
+                if k and st.session_state["kite_access_token"]:
+                    advanced_metrics_data = calculate_advanced_metrics(results_df, api_key, access_token)
+                    if advanced_metrics_data:
+                        st.session_state.advanced_metrics = advanced_metrics_data
+                        advanced_metrics_calculated = True
+                        st.success("✅ Advanced risk metrics calculated!")
+                    else:
+                        st.warning("⚠️ Could not calculate advanced risk metrics due to insufficient data.")
+                else:
+                    st.warning("🔐 Please connect Kite for live data to calculate advanced risk metrics.")
+            
+            advanced_metrics = st.session_state.get("advanced_metrics")
+            
+            if advanced_metrics:
+                st.markdown("#### VaR & Expected Shortfall (CVaR)")
+                col1, col2, col3, col4, col5, col6 = st.columns(6)
+                col1.metric("VaR (95%)", f"{(advanced_metrics.get('var_95', 0) * 100):.2f}%")
+                col2.metric("VaR (99%)", f"{(advanced_metrics.get('var_99', 0) * 100):.2f}%")
+                col3.metric("VaR (90%)", f"{(advanced_metrics.get('var_90', 0) * 100):.2f}%")
+                col4.metric("CVaR (95%)", f"{(advanced_metrics.get('cvar_95', 0) * 100):.2f}%")
+                col5.metric("CVaR (99%)", f"{(advanced_metrics.get('cvar_99', 0) * 100):.2f}%")
+                
+                st.markdown("#### Modern Portfolio Theory Metrics")
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("Sharpe Ratio", f"{advanced_metrics.get('sharpe_ratio', 0):.2f}")
+                col2.metric("Sortino Ratio", f"{advanced_metrics.get('sortino_ratio', 0):.2f}")
+                col3.metric("Beta", f"{advanced_metrics.get('beta', 0):.2f}")
+                col4.metric("Alpha (Annualized)", f"{(advanced_metrics.get('alpha', 0) * 100):.2f}%")
+                col5.metric("Tracking Error", f"{(advanced_metrics.get('tracking_error', 0) * 100):.2f}%")
+                
+                col6, col7, col8, col9, col10 = st.columns(5)
+                col6.metric("Information Ratio", f"{advanced_metrics.get('information_ratio', 0):.2f}")
+                col7.metric("Treynor Ratio", f"{(advanced_metrics.get('treynor_ratio', 0) * 100):.2f}%")
+                col8.metric("Calmar Ratio", f"{advanced_metrics.get('calmar_ratio', 0):.2f}")
+                col9.metric("Max Drawdown", f"{(advanced_metrics.get('max_drawdown', 0) * 100):.2f}%")
+                col10.metric("Ulcer Index", f"{(advanced_metrics.get('ulcer_index', 0) * 100):.2f}%")
+
+                st.markdown("#### Statistical & Distribution Metrics")
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("Portfolio Volatility (Annualized)", f"{(advanced_metrics.get('portfolio_volatility', 0) * 100):.2f}%")
+                col2.metric("Skewness", f"{advanced_metrics.get('skewness', 0):.2f}")
+                col3.metric("Kurtosis", f"{advanced_metrics.get('kurtosis', 0):.2f}")
+                col4.metric("Max Daily Gain", f"{(advanced_metrics.get('max_daily_gain', 0) * 100):.2f}%")
+                col5.metric("Max Daily Loss", f"{(advanced_metrics.get('max_daily_loss', 0) * 100):.2f}%")
+
+                st.markdown("#### Correlation Analysis")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Average Pairwise Correlation", f"{advanced_metrics.get('avg_correlation', 0):.2f}")
+                col2.metric("Maximum Pairwise Correlation", f"{advanced_metrics.get('max_correlation', 0):.2f}")
+                col3.metric("Minimum Pairwise Correlation", f"{advanced_metrics.get('min_correlation', 0):.2f}")
+                
+                if st.session_state.get("historical_data") is not None and not st.session_state["historical_data"].empty:
+                    st.markdown("##### Returns Distribution")
+                    fig_dist = px.histogram(
+                        advanced_metrics['portfolio_returns'] * 100,
+                        nbins=50,
+                        title="Portfolio Daily Returns Distribution",
+                        labels={'value': 'Daily Return (%)'},
+                        color_discrete_sequence=['#1f77b4']
+                    )
+                    st.plotly_chart(fig_dist, use_container_width=True)
+                
+                st.markdown("---")
+                
+                st.markdown("#### Stress Testing Scenarios")
+                
+                stress_test_results = perform_stress_testing(results_df, advanced_metrics['portfolio_returns'].to_frame('portfolio_returns'), weights)
+                
+                st.subheader("Market Crash Scenarios (Impact on Portfolio Value)")
+                scenario_data = {
+                    "Scenario": list(stress_test_results['market_crash'].keys()),
+                    "Impact (%)": list(stress_test_results['market_crash'].values())
+                }
+                scenario_df = pd.DataFrame(scenario_data)
+                scenario_df['Portfolio Value Impact (Rs)'] = (total_value * scenario_df['Impact (%)'] / 100).round(2)
+                
+                fig_stress = px.bar(
+                    scenario_df,
+                    x="Scenario",
+                    y="Impact (%)",
+                    color="Impact (%)",
+                    color_continuous_scale=px.colors.sequential.Reds_r,
+                    title="Hypothetical Market Crash Impact on Portfolio"
+                )
+                st.plotly_chart(fig_stress, use_container_width=True)
+                
+                st.dataframe(scenario_df.style.format({
+                    'Impact (%)': '{:.2f}%',
+                    'Portfolio Value Impact (Rs)': '₹{:,.2f}'
+                }), use_container_width=True)
+                
+                st.subheader("Historical Worst Case Scenarios")
+                hist_scenario_df = pd.DataFrame([
+                    {"Period": "Worst Day", "Impact (%)": stress_test_results['historical']['worst_day']},
+                    {"Period": "Worst Week", "Impact (%)": stress_test_results['historical']['worst_week']},
+                    {"Period": "Worst Month", "Impact (%)": stress_test_results['historical']['worst_month']}
+                ])
+                hist_scenario_df['Portfolio Value Impact (Rs)'] = (total_value * hist_scenario_df['Impact (%)'] / 100).round(2)
+                st.dataframe(hist_scenario_df.style.format({
+                    'Impact (%)': '{:.2f}%',
+                    'Portfolio Value Impact (Rs)': '₹{:,.2f}'
+                }), use_container_width=True)
+                
+                st.subheader("Sector-Specific Shocks")
+                sector_shock_data = []
+                for sector, data in stress_test_results['sector_shocks'].items():
+                    sector_shock_data.append({
+                        "Sector": sector,
+                        "Sector Weight (%)": data['weight'],
+                        "10% Sector Shock Impact (%)": data['impact_10'],
+                        "20% Sector Shock Impact (%)": data['impact_20']
+                    })
+                sector_shock_df = pd.DataFrame(sector_shock_data)
+                
+                st.dataframe(sector_shock_df.style.format({
+                    'Sector Weight (%)': '{:.2f}%',
+                    '10% Sector Shock Impact (%)': '{:.2f}%',
+                    '20% Sector Shock Impact (%)': '{:.2f}%'
+                }), use_container_width=True)
+                
+                st.subheader("Interest Rate Scenarios")
+                for scenario, description in stress_test_results['interest_rate'].items():
+                    st.write(f"**{scenario.replace('_', ' ').title()}:** {description}")
+            else:
+                st.info("Click 'Calculate Advanced Risk Metrics' to view detailed risk analysis.")
+
+        # TAB 4: Rule Validation
+        with analysis_tabs[3]:
+            st.markdown("### ⚖️ Custom Rule Validation Results")
+            
+            # Re-run rule validation if needed
+            if st.button("Re-run Custom Rule Validation", key="rerun_custom_rules", use_container_width=True):
+                custom_rule_results = parse_and_validate_rules_enhanced(rules_text, results_df)
+                st.session_state.custom_rule_results = custom_rule_results
+            
+            custom_rule_results = st.session_state.get("custom_rule_results", [])
+            
+            if not custom_rule_results:
+                st.info("No custom rules defined or analysis not yet run. Define rules in the configuration section and click 'Analyze Portfolio'.")
+            else:
+                # Display overall compliance status
+                fail_count = sum(1 for r in custom_rule_results if r['status'] == '❌ FAIL')
+                total_rules = len(custom_rule_results)
+                
+                if fail_count == 0:
+                    st.success(f"✅ All {total_rules} custom rules passed!")
+                else:
+                    st.warning(f"⚠️ {fail_count} out of {total_rules} custom rules failed!")
+                
+                # Create DataFrame for display
+                custom_rules_df = pd.DataFrame(custom_rule_results)
+                
+                # Style breaches for better visibility
+                def color_status(val):
+                    if 'FAIL' in val:
+                        return 'background-color: #ffebee'
+                    elif 'Error' in val:
+                        return 'background-color: #fff3e0'
+                    elif 'Invalid' in val:
+                        return 'background-color: #e3f2fd'
+                    else:
+                        return ''
+                
+                st.dataframe(
+                    custom_rules_df[['rule_type', 'rule', 'status', 'details', 'severity']].style.applymap(color_status, subset=['status']),
+                    use_container_width=True
+                )
+        
+        # TAB 5: Security Compliance
+        with analysis_tabs[4]:
+            st.markdown("### 🔐 Security-Level Compliance Overview")
+            
+            security_compliance_df = st.session_state.get("security_level_compliance")
+            
+            if security_compliance_df.empty:
+                st.info("Security-level compliance data is not available. Please upload a portfolio and run the analysis.")
+            else:
+                # Overall compliance distribution
+                compliance_counts = security_compliance_df['Overall Status'].value_counts()
+                
+                fig_overall_status = px.pie(
+                    names=compliance_counts.index,
+                    values=compliance_counts.values,
+                    title='Overall Security Compliance Status Distribution',
+                    hole=0.4,
+                    color_discrete_map={
+                        '🟢 Excellent': 'green',
+                        '🟡 Good': 'lightgreen',
+                        '🟠 Fair': 'orange',
+                        '🔴 Poor': 'red'
+                    }
+                )
+                st.plotly_chart(fig_overall_status, use_container_width=True)
+                
+                st.markdown("#### Detailed Security Compliance Table")
+                
+                # Display selected columns from security_compliance_df
+                display_cols = [
+                    'Name', 'Symbol', 'Weight %', 'Stock Limit Status', 'Stock Limit Gap (%)',
+                    'Stock Limit Utilization (%)', 'Liquidity Status', 'Liquidity Score',
+                    'Rating', 'Rating Category', 'Rating Compliance',
+                    'Concentration Risk', 'Compliance Score', 'Overall Status'
+                ]
+                
+                # Filter out columns that don't exist in the DataFrame
+                display_cols_filtered = [col for col in display_cols if col in security_compliance_df.columns]
+                
+                st.dataframe(
+                    security_compliance_df[display_cols_filtered].style.format({
+                        'Weight %': '{:.2f}%',
+                        'Stock Limit Gap (%)': '{:.2f}%',
+                        'Stock Limit Utilization (%)': '{:.2f}%',
+                        'Liquidity Score': '{:.0f}',
+                        'Compliance Score': '{:.0f}'
+                    }).apply(
+                        lambda x: ['background-color: #ffebee' if '❌ Breach' in str(val) else 
+                                   'background-color: #fff3e0' if '⚠️ Low' in str(val) or '🟠 High' in str(val) or 'Below Threshold' in str(val) else 
+                                   'background-color: #fffde7' if '🟡 Medium' in str(val) else '' for val in x],
+                        subset=['Stock Limit Status', 'Liquidity Status', 'Rating Compliance', 'Concentration Risk']
+                    ).apply(
+                        lambda x: ['background-color: #e8f5e9' if '🟢 Excellent' in str(val) else 
+                                   'background-color: #fffde7' if '🟡 Good' in str(val) else 
+                                   'background-color: #fff3e0' if '🟠 Fair' in str(val) else 
+                                   'background-color: #ffebee' if '🔴 Poor' in str(val) else '' for val in x],
+                        subset=['Overall Status']
+                    ),
+                    use_container_width=True
+                )
+
+        # TAB 6: Concentration Analysis
+        with analysis_tabs[5]:
+            st.markdown("### 📉 Concentration Risk Analysis")
+            
+            concentration_metrics = st.session_state.get("concentration_analysis")
+            
+            if concentration_metrics:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("#### Herfindahl-Hirschman Index (HHI)")
+                    st.metric(
+                        "Stock HHI",
+                        f"{concentration_metrics.get('stock_hhi', 0):.0f}",
+                        help=concentration_metrics.get('stock_hhi_description', '')
+                    )
+                    st.markdown(f"**Status:** {concentration_metrics.get('stock_hhi_category')}")
+                    
+                    st.metric(
+                        "Sector HHI",
+                        f"{concentration_metrics.get('sector_hhi', 0):.0f}",
+                        help=concentration_metrics.get('sector_hhi_description', '')
+                    )
+                    st.markdown(f"**Status:** {concentration_metrics.get('sector_hhi_category')}")
+                
+                with col2:
+                    st.markdown("#### Diversification Metrics")
+                    st.metric("Effective Number of Stocks", f"{concentration_metrics.get('effective_n_stocks', 0):.1f}")
+                    st.metric("Effective Number of Sectors", f"{concentration_metrics.get('effective_n_sectors', 0):.1f}")
+                    st.metric("Gini Coefficient", f"{concentration_metrics.get('gini_coefficient', 0):.2f}")
+                
+                st.markdown("#### Top Holdings Concentration")
+                top_concentration_data = {
+                    "Metric": ["Top 1 Holding", "Top 3 Holdings", "Top 5 Holdings", "Top 10 Holdings", "Top 20 Holdings"],
+                    "Weight (%)": [
+                        concentration_metrics.get('top_1_weight', 0),
+                        concentration_metrics.get('top_3_weight', 0),
+                        concentration_metrics.get('top_5_weight', 0),
+                        concentration_metrics.get('top_10_weight', 0),
+                        concentration_metrics.get('top_20_weight', 0)
+                    ]
+                }
+                top_concentration_df = pd.DataFrame(top_concentration_data)
+                
+                fig_top_concentration = px.bar(
+                    top_concentration_df,
+                    x="Metric",
+                    y="Weight (%)",
+                    title="Portfolio Top Holdings Concentration",
+                    color="Weight (%)",
+                    color_continuous_scale=px.colors.sequential.YlOrRd
+                )
+                st.plotly_chart(fig_top_concentration, use_container_width=True)
+                
+                st.dataframe(top_concentration_df.style.format({'Weight (%)': '{:.2f}%'}), use_container_width=True)
+                
+                st.markdown("#### Top Sector Concentration")
+                sector_concentration_data = {
+                    "Metric": ["Top Sector", "Top 3 Sectors"],
+                    "Weight (%)": [
+                        concentration_metrics.get('top_sector_weight', 0),
+                        concentration_metrics.get('top_3_sectors_weight', 0)
+                    ]
+                }
+                sector_concentration_df = pd.DataFrame(sector_concentration_data)
+                
+                fig_top_sector_concentration = px.bar(
+                    sector_concentration_df,
+                    x="Metric",
+                    y="Weight (%)",
+                    title="Portfolio Top Sector Concentration",
+                    color="Weight (%)",
+                    color_continuous_scale=px.colors.sequential.Oranges
+                )
+                st.plotly_chart(fig_top_sector_concentration, use_container_width=True)
+                
+                st.dataframe(sector_concentration_df.style.format({'Weight (%)': '{:.2f}%'}), use_container_width=True)
+            else:
+                st.info("Concentration analysis results not available. Please upload a portfolio and run the analysis.")
+
+        # TAB 7: Liquidity Analysis
+        with analysis_tabs[6]:
+            st.markdown("### 💧 Liquidity Analysis")
+            
+            liquidity_metrics = calculate_liquidity_metrics(results_df) # Recalculate or use cached
+            
+            if 'error' not in liquidity_metrics:
+                st.markdown("#### Overall Portfolio Liquidity")
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Weighted Avg Volume (90d)", f"{liquidity_metrics.get('weighted_avg_volume', 0):,.0f}")
+                col2.metric("Portfolio Liquidity Score", f"{liquidity_metrics.get('portfolio_liquidity_score', 0):.1f}")
+                col3.metric("High Liquidity Assets", f"{liquidity_metrics.get('high_liquidity_pct', 0):.1f}%")
+                col4.metric("Low Liquidity Assets", f"{liquidity_metrics.get('low_liquidity_pct', 0):.1f}%")
+                
+                liquidity_data = pd.DataFrame({
+                    'Category': ['High Liquidity', 'Medium Liquidity', 'Low Liquidity'],
+                    'Weight %': [
+                        liquidity_metrics.get('high_liquidity_pct', 0),
+                        liquidity_metrics.get('medium_liquidity_pct', 0),
+                        liquidity_metrics.get('low_liquidity_pct', 0)
+                    ]
+                })
+                
+                fig_liquidity_pie = px.pie(
+                    liquidity_data,
+                    values='Weight %',
+                    names='Category',
+                    title='Portfolio Liquidity Distribution',
+                    hole=0.3,
+                    color='Category',
+                    color_discrete_map={
+                        'High Liquidity': 'green',
+                        'Medium Liquidity': 'orange',
+                        'Low Liquidity': 'red'
+                    }
+                )
+                st.plotly_chart(fig_liquidity_pie, use_container_width=True)
+                
+                st.markdown("#### Detailed Security Liquidity (Top 20 by Low Liquidity)")
+                
+                if 'Avg Volume (90d)' in results_df.columns:
+                    low_liquidity_stocks = results_df.nsmallest(20, 'Avg Volume (90d)')[
+                        ['Symbol', 'Name', 'Weight %', 'Avg Volume (90d)', 'Real-time Value (Rs)']
+                    ]
+                    
+                    if not low_liquidity_stocks.empty:
+                        st.dataframe(
+                            low_liquidity_stocks.style.format({
+                                'Weight %': '{:.2f}%',
+                                'Avg Volume (90d)': '{:,.0f}',
+                                'Real-time Value (Rs)': '₹{:,.2f}'
+                            }),
+                            use_container_width=True
+                        )
+                    else:
+                        st.info("No low liquidity stocks identified or sufficient volume data.")
+                else:
+                    st.info("Average Volume (90d) data not available for detailed liquidity analysis.")
+            else:
+                st.info("Liquidity analysis data not available. Please ensure 'Avg Volume (90d)' is in your portfolio upload.")
+
+
+        # TAB 8: Export Report
+        with analysis_tabs[7]:
+            st.markdown("### 📄 Export Comprehensive Compliance Report")
+            st.info("Generate and download a detailed report of your portfolio's compliance status and analytics.")
+            
+            report_format = st.selectbox("Select Report Format", ["PDF", "CSV (Raw Data)", "Markdown"])
+            
+            if st.button("Download Report", type="primary", use_container_width=True):
+                report_content = ""
+                file_name = f"InvsionConnect_Compliance_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                
+                if report_format == "CSV (Raw Data)":
+                    csv_data = results_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="Download Portfolio Data as CSV",
+                        data=csv_data,
+                        file_name=f"{file_name}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                    
+                    if not st.session_state.get("security_level_compliance", pd.DataFrame()).empty:
+                        csv_sec_comp = st.session_state["security_level_compliance"].to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="Download Security Compliance Data as CSV",
+                            data=csv_sec_comp,
+                            file_name=f"{file_name}_SecurityCompliance.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                    st.success("CSV files generated!")
+                
+                elif report_format == "Markdown" or report_format == "PDF": # Prepare markdown for both
+                    report_content += f"# Invsion Connect Pro - Portfolio Compliance Report\n\n"
+                    report_content += f"**Report Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    report_content += "## 📊 Executive Summary\n\n"
+                    
+                    total_value = results_df['Real-time Value (Rs)'].sum()
+                    breach_count = len(st.session_state.get("breach_alerts", []))
+                    compliance_rate = ((1 - breach_count / max(len(results_df), 1)) * 100) if breach_count < len(results_df) else 0
+
+                    report_content += f"- **Total Portfolio Value:** ₹{total_value:,.2f}\n"
+                    report_content += f"- **Number of Holdings:** {len(results_df)}\n"
+                    report_content += f"- **Compliance Status:** {compliance_rate:.0f}% compliant ({breach_count} breach(es))\n\n"
+
+                    if st.session_state.get("breach_alerts"):
+                        report_content += "### 🚨 Compliance Breach Alerts\n\n"
+                        for breach in st.session_state["breach_alerts"]:
+                            report_content += f"- **{breach['severity']} - {breach['type']}**: {breach['details']}. _Recommendation: {breach.get('recommendation', 'Review portfolio allocation')}_\n"
+                        report_content += "\n"
+
+                    report_content += "## 🔍 Detailed Analytics\n\n"
+                    report_content += "### Portfolio Holdings (Top 20)\n\n"
+                    report_content += results_df.nlargest(20, 'Weight %')[['Name', 'Symbol', 'Industry', 'Weight %', 'Real-time Value (Rs)']].to_markdown(index=False) + "\n\n"
+
+                    report_content += "### Sector-wise Analysis\n\n"
+                    sector_analysis = results_df.groupby('Industry').agg({
+                        'Weight %': 'sum',
+                        'Real-time Value (Rs)': 'sum',
+                        'Symbol': 'count'
+                    }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
+                    report_content += sector_analysis.head(15).to_markdown() + "\n\n"
+                    
+                    if 'Rating' in results_df.columns:
+                        report_content += "### Credit Rating Distribution\n\n"
+                        rating_analysis = results_df.groupby('Rating').agg({
+                            'Weight %': 'sum',
+                            'Symbol': 'count',
+                            'Real-time Value (Rs)': 'sum'
+                        }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
+                        report_content += rating_analysis.to_markdown() + "\n\n"
+
+                    report_content += "## 📈 Risk Metrics\n\n"
+                    advanced_metrics = st.session_state.get("advanced_metrics")
+                    if advanced_metrics:
+                        report_content += "### Key Risk Metrics\n\n"
+                        report_content += f"- **VaR (95%):** {(advanced_metrics.get('var_95', 0) * 100):.2f}%\n"
+                        report_content += f"- **Sharpe Ratio:** {advanced_metrics.get('sharpe_ratio', 0):.2f}\n"
+                        report_content += f"- **Beta:** {advanced_metrics.get('beta', 0):.2f}\n"
+                        report_content += f"- **Annualized Volatility:** {(advanced_metrics.get('portfolio_volatility', 0) * 100):.2f}%\n"
+                        report_content += f"- **Max Drawdown:** {(advanced_metrics.get('max_drawdown', 0) * 100):.2f}%\n\n"
+                    else:
+                        report_content += "Risk metrics not calculated or available.\n\n"
+                    
+                    concentration_metrics = st.session_state.get("concentration_analysis")
+                    if concentration_metrics:
+                        report_content += "### Concentration Analysis\n\n"
+                        report_content += f"- **Stock HHI:** {concentration_metrics.get('stock_hhi', 0):.0f} ({concentration_metrics.get('stock_hhi_category')})\n"
+                        report_content += f"- **Sector HHI:** {concentration_metrics.get('sector_hhi', 0):.0f} ({concentration_metrics.get('sector_hhi_category')})\n"
+                        report_content += f"- **Top 10 Holdings Weight:** {concentration_metrics.get('top_10_weight', 0):.2f}%\n\n"
+
+                    report_content += "## ⚖️ Custom Rule Validation\n\n"
+                    custom_rule_results = st.session_state.get("custom_rule_results", [])
+                    if custom_rule_results:
+                        custom_rules_df = pd.DataFrame(custom_rule_results)
+                        report_content += custom_rules_df[['rule_type', 'rule', 'status', 'details', 'severity']].to_markdown(index=False) + "\n\n"
+                    else:
+                        report_content += "No custom rule validation results available.\n\n"
+                    
+                    report_content += "--- Generated by Invsion Connect Pro ---\n"
+
+                    if report_format == "Markdown":
+                        st.download_button(
+                            label="Download Markdown Report",
+                            data=report_content.encode('utf-8'),
+                            file_name=f"{file_name}.md",
+                            mime="text/markdown",
+                            use_container_width=True
+                        )
+                    elif report_format == "PDF":
+                        # For PDF generation, you'd typically use a library like ReportLab or wkhtmltopdf
+                        # Streamlit doesn't have a direct PDF generation tool built-in.
+                        # As a workaround, you can convert markdown to PDF using external tools or services.
+                        # For simplicity, this example will offer a markdown download and mention external PDF conversion.
+                        st.warning("Direct PDF generation is complex and often requires external libraries or services.")
+                        st.download_button(
+                            label="Download Markdown for PDF Conversion",
+                            data=report_content.encode('utf-8'),
+                            file_name=f"{file_name}.md",
+                            mime="text/markdown",
+                            help="Download as Markdown and use a tool like Pandoc or an online converter to generate PDF.",
+                            use_container_width=True
+                        )
+                        st.info("💡 Tip: You can copy the Markdown content into an online Markdown to PDF converter (e.g., Dillinger, StackEdit) for a formatted PDF.")
+                    
+                st.success("Report generation complete!")
+
+# Render tabs
+with tab_market:
+    render_market_historical_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
+
+with tab_compliance:
+    render_investment_compliance_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
+
+with tab_ai:
+    # AI Analysis tab implementation
+    st.header("🤖 AI-Powered Compliance Analysis")
+    st.markdown("Advanced AI analysis using Google Gemini for comprehensive compliance insights")
+    
+    portfolio_df = st.session_state.get("compliance_results_df")
+    
+    if portfolio_df is None or portfolio_df.empty:
+        st.warning("⚠️ Please upload and analyze a portfolio in the 'Investment Compliance Pro' tab first")
+    else:
+        st.info("💡 Upload scheme documents (SID/KIM) for AI-powered compliance analysis")
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            uploaded_files = st.file_uploader(
+                "📄 Upload Scheme Documents",
+                type=["pdf", "txt"],
+                accept_multiple_files=True,
+                help="Upload SID, KIM, or investment policy documents"
+            )
+        
+        with col2:
+            st.markdown("**Analysis Configuration**")
+            analysis_depth = st.select_slider(
+                "Depth",
+                options=["Quick", "Standard", "Comprehensive"],
+                value="Standard"
+            )
+            include_recommendations = st.checkbox("Recommendations", value=True)
+            include_risk = st.checkbox("Risk Assessment", value=True)
+        
+        if uploaded_files:
+            st.success(f"✅ {len(uploaded_files)} document(s) uploaded")
+            
+            if st.button("🚀 Run AI Analysis", type="primary", use_container_width=True):
+                with st.spinner("🤖 AI analyzing portfolio..."):
+                    try:
+                        # Extract document text
+                        docs_text = ""
+                        for file in uploaded_files:
+                            if file.type == "application/pdf":
+                                with fitz.open(stream=file.getvalue(), filetype="pdf") as doc:
+                                    for page in doc:
+                                        docs_text += page.get_text()
+                            else:
+                                docs_text += file.getvalue().decode("utf-8")
+                        
+                        # Prepare portfolio summary
+                        total_value = portfolio_df['Real-time Value (Rs)'].sum()
+                        top_10 = portfolio_df.nlargest(10, 'Weight %')[['Name', 'Weight %']]
+                        sector_weights = portfolio_df.groupby('Industry')['Weight %'].sum().nlargest(10)
+                        
+                        portfolio_summary = f"""
+Portfolio Overview:
+- Total Value: ₹{total_value:,.2f}
+- Holdings: {len(portfolio_df)}
+- Top Stock: {portfolio_df.nlargest(1, 'Weight %')['Name'].values[0]} ({portfolio_df['Weight %'].max():.2f}%)
+- Top 10 Weight: {portfolio_df.nlargest(10, 'Weight %')['Weight %'].sum():.2f}%
+
+Top 10 Holdings:
+{top_10.to_string()}
+
+Sector Allocation:
+{sector_weights.to_string()}
+"""
+                        
+                        # Build prompt
+                        prompt = f"""You are an expert investment compliance analyst for Indian Asset Management Companies with deep knowledge of SEBI regulations.
+
+**PORTFOLIO DATA:**
+{portfolio_summary}
+
+**SCHEME DOCUMENTS:**
+{docs_text[:100000]}
+
+**TASK:**
+Perform comprehensive compliance analysis covering:
+
+1. **Executive Summary** - Overall compliance status and critical findings
+2. **Investment Objective Alignment** - Strategy vs implementation analysis
+3. **SEBI Regulatory Compliance** - Single issuer, sector, group limits
+4. **Scheme-Specific Restrictions** - Document-based validation
+5. **Risk Assessment** - Concentration, liquidity, credit risks
+6. **Violations & Concerns** - Severity-classified issues
+7. **Recommendations** - Actionable remediation steps
+
+Provide specific, quantitative analysis with document citations. Use markdown formatting with clear sections."""
+
+                        # Call Gemini
+                        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+                        response = model.generate_content(
+                            prompt,
+                            generation_config={
+                                'temperature': 0.3,
+                                'top_p': 0.8,
+                                'max_output_tokens': 8192,
+                            }
+                        )
+                        
+                        st.session_state.ai_analysis_response = response.text
+                        st.success("✅ AI Analysis Complete!")
+                        
+                    except Exception as e:
+                        st.error(f"❌ Analysis failed: {e}")
+        
+        # Display results
+        if st.session_state.get("ai_analysis_response"):
+            st.markdown("---")
+            st.markdown("## 📊 AI Compliance Analysis Report")
+            st.markdown(st.session_state.ai_analysis_response)
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                txt_data = st.session_state.ai_analysis_response.encode('utf-8')
+                st.download_button(
+                    "📄 Download Text",
+                    txt_data,
+                    f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                    "text/plain",
+                    use_container_width=True
+                )
+            
+            with col2:
+                md_data = st.session_state.ai_analysis_response.encode('utf-8')
+                st.download_button(
+                    "📝 Download Markdown",
+                    md_data,
+                    f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                    "text/markdown",
+                    use_container_width=True
+                )
+            
+            with col3:
+                if st.button("🗑️ Clear Analysis", use_container_width=True):
+                    st.session_state.ai_analysis_response = None
+                    st.rerun()
+
+
+# --- Footer ---
+st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+
+st.markdown("""
+<div style='text-align: center; color: #666; padding: 30px; background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); border-radius: 10px; margin-top: 30px;'>
+    <h3 style='color: #1e3c72; margin-bottom: 10px;'>Invsion Connect Pro</h3>
+    <p style='font-size: 1.1em; margin-bottom: 15px;'><strong>Enterprise Portfolio Compliance & Risk Analytics Platform</strong></p>
+    <p style='font-size: 0.9em; color: #555;'>⚠️ This tool provides informational analysis only. Always consult qualified professionals for investment decisions.</p>
+    <p style='font-size: 0.85em; color: #777; margin-top: 15px;'>
+        Powered by <strong>KiteConnect API</strong> & <strong>Google Gemini AI</strong><br>
+        © 2025 Invsion Connect | All Rights Reserved
+    </p>
+    <div style='margin-top: 20px; padding-top: 15px; border-top: 1px solid #ddd;'>
+        <p style='font-size: 0.8em; color: #888;'>
+            📊 Real-time Market Data | 🤖 AI-Powered Analysis | 🔒 Secure & Compliant<br>
+            Built for Asset Management Companies, Fund Managers & Compliance Teams
+        </p>
+    </div>
+</div>
+""", unsafe_allow_html=True)
