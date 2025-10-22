@@ -127,14 +127,15 @@ session_vars = [
     "last_fetched_symbol", "current_market_data", "holdings_data", "compliance_results_df",
     "advanced_metrics", "ai_analysis_response", "security_level_compliance", "breach_alerts",
     "risk_metrics_detailed", "concentration_analysis", "var_analysis", "stress_test_results",
-    "liquidity_analysis", "correlation_analysis", "attribution_analysis", "compliance_history"
+    "liquidity_analysis", "correlation_analysis", "attribution_analysis", "compliance_history",
+    "custom_rule_results" # Added custom_rule_results to session state
 ]
 
 for var in session_vars:
     if var not in st.session_state:
         if var.endswith('_df') or var.endswith('_analysis') or var.endswith('_results'):
             st.session_state[var] = pd.DataFrame()
-        elif var.endswith('_alerts') or var == 'compliance_history':
+        elif var.endswith('_alerts') or var == 'compliance_history' or var == 'custom_rule_results': # Added custom_rule_results
             st.session_state[var] = []
         else:
             st.session_state[var] = None
@@ -221,12 +222,24 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
     if not kite_instance: 
         return pd.DataFrame({"_error": ["Kite not authenticated."]})
     
-    instruments_df = load_instruments_cached(api_key, access_token)
+    # Ensure instruments_df is loaded only if kite_instance is valid
+    # and access_token exists
+    if kite_instance and access_token:
+        instruments_df = load_instruments_cached(api_key, access_token)
+    else:
+        return pd.DataFrame({"_error": ["Kite not authenticated, cannot load instruments."]})
+
+    if "_error" in instruments_df.columns:
+        return instruments_df # Propagate error from load_instruments_cached
+
     token = find_instrument_token(instruments_df, symbol, exchange)
     
     if not token and symbol in ["NIFTY BANK", "NIFTYBANK", "BANKNIFTY", BENCHMARK_SYMBOL, "SENSEX"]:
         index_exchange = "NSE" if symbol not in ["SENSEX"] else "BSE"
         instruments_secondary = load_instruments_cached(api_key, access_token, index_exchange)
+        # Ensure instruments_secondary is valid
+        if "_error" in instruments_secondary.columns:
+            return instruments_secondary
         token = find_instrument_token(instruments_secondary, symbol, index_exchange)
     
     if not token: 
@@ -318,8 +331,9 @@ def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: flo
     annualized_return = ((1 + daily_returns_decimal.mean()) ** TRADING_DAYS_PER_YEAR - 1) * 100
     annualized_volatility = daily_returns_decimal.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100
     
+    # Adjusted Sharpe ratio calculation to avoid division by zero
     risk_free_rate_decimal = risk_free_rate / 100.0
-    sharpe_ratio = (annualized_return - risk_free_rate) / annualized_volatility if annualized_volatility > 0 else np.nan
+    sharpe_ratio = (annualized_return - risk_free_rate) / annualized_volatility if annualized_volatility > 1e-9 else np.nan # Use small epsilon
     
     if not cumulative_returns.empty:
         max_drawdown = (((1 + cumulative_returns).cummax() - (1 + cumulative_returns)) / \
@@ -518,7 +532,7 @@ def parse_and_validate_rules_enhanced(rules_text: str, portfolio_df: pd.DataFram
             
             # Additional rule types
             elif rule_type == 'PORTFOLIO_TURNOVER' and len(parts) == 3:
-                if 'Turnover' in portfolio_df.columns:
+                if 'Turnover' in portfolio_df.columns: # Assuming 'Turnover' is a column in the uploaded data
                     actual_value = portfolio_df['Turnover'].mean()
                     details = f"Actual average turnover: {actual_value:.2f}%"
                 else:
@@ -529,7 +543,7 @@ def parse_and_validate_rules_enhanced(rules_text: str, portfolio_df: pd.DataFram
                     continue
             
             elif rule_type == 'EXPENSE_RATIO' and len(parts) == 3:
-                if 'Expense Ratio' in portfolio_df.columns:
+                if 'Expense Ratio' in portfolio_df.columns: # Assuming 'Expense Ratio' is a column in the uploaded data
                     actual_value = portfolio_df['Expense Ratio'].iloc[0] if not portfolio_df.empty else 0
                     details = f"Actual expense ratio: {actual_value:.2f}%"
                 else:
@@ -610,6 +624,9 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, rules_config
             lambda x: '✅ Adequate' if x >= min_liquidity else '⚠️ Low' if x >= min_liquidity * 0.5 else '🔴 Critical'
         )
         security_compliance['Liquidity Score'] = (security_compliance['Avg Volume (90d)'] / min_liquidity * 100).clip(0, 100).round(2)
+    else: # If Avg Volume is missing, set default values
+        security_compliance['Liquidity Status'] = 'N/A - Missing Data'
+        security_compliance['Liquidity Score'] = 0.0
     
     # Rating check
     if 'Rating' in security_compliance.columns:
@@ -621,6 +638,9 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, rules_config
         security_compliance['Rating Compliance'] = security_compliance['Rating Category'].apply(
             lambda x: '✅ Compliant' if x == 'Investment Grade' else '⚠️ Below Threshold' if x == 'Below Investment Grade' else '🔴 Unrated'
         )
+    else: # If Rating is missing, set default values
+        security_compliance['Rating Category'] = 'N/A - Missing Data'
+        security_compliance['Rating Compliance'] = '🔴 Unrated'
     
     # Concentration risk scoring
     security_compliance['Concentration Risk Score'] = security_compliance['Weight %'].apply(
@@ -630,10 +650,18 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, rules_config
         lambda x: '🔴 Critical' if x > 10 else '🟠 High' if x > 8 else '🟡 Medium' if x > 5 else '🟢 Low'
     )
     
-    # Sector concentration within security
-    sector_totals = security_compliance.groupby('Industry')['Weight %'].sum()
-    security_compliance['Sector Weight'] = security_compliance['Industry'].map(sector_totals)
-    security_compliance['% of Sector'] = (security_compliance['Weight %'] / security_compliance['Sector Weight'] * 100).round(2)
+    # Sector concentration within security - ensure 'Industry' exists
+    if 'Industry' in security_compliance.columns:
+        sector_totals = security_compliance.groupby('Industry')['Weight %'].sum()
+        security_compliance['Sector Weight'] = security_compliance['Industry'].map(sector_totals)
+        # Avoid division by zero if sector_totals has a zero for a sector
+        security_compliance['% of Sector'] = security_compliance.apply(
+            lambda row: (row['Weight %'] / row['Sector Weight'] * 100).round(2) if row['Sector Weight'] > 0 else 0.0,
+            axis=1
+        )
+    else:
+        security_compliance['Sector Weight'] = 0.0
+        security_compliance['% of Sector'] = 0.0
     
     # Overall compliance score (0-100)
     def calculate_compliance_score(row):
@@ -668,8 +696,16 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, rules_config
 
 def calculate_advanced_metrics(portfolio_df: pd.DataFrame, api_key: str, access_token: str) -> Dict:
     """Calculate comprehensive advanced risk metrics"""
+    if portfolio_df.empty:
+        return None # Return None if portfolio_df is empty
+    
     symbols = portfolio_df['Symbol'].tolist()
-    weights = (portfolio_df['Real-time Value (Rs)'] / portfolio_df['Real-time Value (Rs)'].sum()).values
+    total_value_sum = portfolio_df['Real-time Value (Rs)'].sum()
+    if total_value_sum == 0: # Avoid division by zero if total value is zero
+        st.warning("Total portfolio value is zero. Cannot calculate weighted returns.")
+        return None
+    weights = (portfolio_df['Real-time Value (Rs)'] / total_value_sum).values
+    
     from_date = datetime.now().date() - timedelta(days=366)
     to_date = datetime.now().date()
     
@@ -680,7 +716,7 @@ def calculate_advanced_metrics(portfolio_df: pd.DataFrame, api_key: str, access_
     
     for i, symbol in enumerate(symbols):
         hist_data = get_historical_data_cached(api_key, access_token, symbol, from_date, to_date, 'day')
-        if not hist_data.empty and '_error' not in hist_data.columns:
+        if not hist_data.empty and "_error" not in hist_data.columns:
             returns_df[symbol] = hist_data['close'].pct_change()
         else:
             failed_symbols.append(symbol)
@@ -702,113 +738,118 @@ def calculate_advanced_metrics(portfolio_df: pd.DataFrame, api_key: str, access_
     portfolio_returns = returns_df.dot(weights)
     
     # Value at Risk calculations
-    var_95 = portfolio_returns.quantile(0.05)
-    var_99 = portfolio_returns.quantile(0.01)
-    var_90 = portfolio_returns.quantile(0.10)
+    var_95 = portfolio_returns.quantile(0.05) if not portfolio_returns.empty else np.nan
+    var_99 = portfolio_returns.quantile(0.01) if not portfolio_returns.empty else np.nan
+    var_90 = portfolio_returns.quantile(0.10) if not portfolio_returns.empty else np.nan
     
     # Conditional VaR (Expected Shortfall)
-    cvar_95 = portfolio_returns[portfolio_returns <= var_95].mean()
-    cvar_99 = portfolio_returns[portfolio_returns <= var_99].mean()
+    cvar_95 = portfolio_returns[portfolio_returns <= var_95].mean() if not portfolio_returns.empty else np.nan
+    cvar_99 = portfolio_returns[portfolio_returns <= var_99].mean() if not portfolio_returns.empty else np.nan
     
     # Benchmark data
     benchmark_data = get_historical_data_cached(api_key, access_token, BENCHMARK_SYMBOL, from_date, to_date, 'day')
     
+    portfolio_beta = None
+    alpha = None
+    tracking_error = None
+    information_ratio = None
+    treynor_ratio = None
+    jensen_alpha = None
+    
     if benchmark_data.empty or '_error' in benchmark_data.columns:
         st.warning(f"⚠️ Benchmark data unavailable. Beta, Alpha, and related metrics will be N/A.")
-        portfolio_beta = None
-        alpha = None
-        tracking_error = None
-        information_ratio = None
-        treynor_ratio = None
-        jensen_alpha = None
     else:
         benchmark_returns = benchmark_data['close'].pct_change()
-        aligned_returns = pd.concat([portfolio_returns, benchmark_returns], axis=1, join='inner').dropna()
-        aligned_returns.columns = ['portfolio', 'benchmark']
+        # Align portfolio and benchmark returns
+        aligned_returns = pd.concat([portfolio_returns.rename('portfolio'), benchmark_returns.rename('benchmark')], axis=1, join='inner').dropna()
         
-        # Beta calculation
-        covariance = aligned_returns.cov().iloc[0, 1]
-        benchmark_variance = aligned_returns['benchmark'].var()
-        portfolio_beta = covariance / benchmark_variance if benchmark_variance > 0 else None
-        
-        # Alpha calculation
-        portfolio_annual_return = ((1 + aligned_returns['portfolio'].mean()) ** 252 - 1)
-        benchmark_annual_return = ((1 + aligned_returns['benchmark'].mean()) ** 252 - 1)
-        risk_free_rate = 0.06  # 6% assumed
-        
-        if portfolio_beta:
-            alpha = portfolio_annual_return - (risk_free_rate + portfolio_beta * (benchmark_annual_return - risk_free_rate))
-            jensen_alpha = alpha  # Jensen's Alpha
+        if not aligned_returns.empty and len(aligned_returns) > 1: # Ensure enough data points for covariance
+            # Beta calculation
+            covariance = aligned_returns.cov().iloc[0, 1]
+            benchmark_variance = aligned_returns['benchmark'].var()
+            portfolio_beta = covariance / benchmark_variance if benchmark_variance > 1e-9 else None # Avoid division by zero
+            
+            # Alpha calculation
+            portfolio_annual_return = ((1 + aligned_returns['portfolio'].mean()) ** TRADING_DAYS_PER_YEAR - 1)
+            benchmark_annual_return = ((1 + aligned_returns['benchmark'].mean()) ** TRADING_DAYS_PER_YEAR - 1)
+            risk_free_rate = 0.06  # 6% assumed
+            
+            if portfolio_beta is not None:
+                alpha = portfolio_annual_return - (risk_free_rate + portfolio_beta * (benchmark_annual_return - risk_free_rate))
+                jensen_alpha = alpha  # Jensen's Alpha
+            
+            # Tracking Error
+            tracking_diff = aligned_returns['portfolio'] - aligned_returns['benchmark']
+            tracking_error = tracking_diff.std() * np.sqrt(TRADING_DAYS_PER_YEAR) if len(tracking_diff) > 1 else None
+            
+            # Information Ratio
+            if tracking_error and tracking_error > 1e-9: # Avoid division by zero
+                information_ratio = (portfolio_annual_return - benchmark_annual_return) / tracking_error
+            
+            # Treynor Ratio
+            if portfolio_beta is not None and portfolio_beta > 1e-9: # Avoid division by zero
+                treynor_ratio = (portfolio_annual_return - risk_free_rate) / portfolio_beta
         else:
-            alpha = None
-            jensen_alpha = None
-        
-        # Tracking Error
-        tracking_diff = aligned_returns['portfolio'] - aligned_returns['benchmark']
-        tracking_error = tracking_diff.std() * np.sqrt(252)
-        
-        # Information Ratio
-        if tracking_error and tracking_error > 0:
-            information_ratio = (portfolio_annual_return - benchmark_annual_return) / tracking_error
-        else:
-            information_ratio = None
-        
-        # Treynor Ratio
-        if portfolio_beta and portfolio_beta > 0:
-            treynor_ratio = (portfolio_annual_return - risk_free_rate) / portfolio_beta
-        else:
-            treynor_ratio = None
+            st.warning("Not enough aligned historical data for Beta, Alpha, and related metrics.")
     
     # Sortino Ratio
     downside_returns = portfolio_returns[portfolio_returns < 0]
-    downside_std = downside_returns.std() * np.sqrt(252) if len(downside_returns) > 0 else 0
-    portfolio_annual_return = ((1 + portfolio_returns.mean()) ** 252 - 1)
-    sortino_ratio = (portfolio_annual_return - 0.06) / downside_std if downside_std > 0 else None
+    downside_std = downside_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) if len(downside_returns) > 0 else 0
+    portfolio_annual_return = ((1 + portfolio_returns.mean()) ** TRADING_DAYS_PER_YEAR - 1)
+    sortino_ratio = (portfolio_annual_return - 0.06) / downside_std if downside_std > 1e-9 else np.nan
     
     # Calmar Ratio
     cumulative_returns = (1 + portfolio_returns).cumprod() - 1
-    max_drawdown = ((cumulative_returns.cummax() - cumulative_returns) / (cumulative_returns.cummax() + 1)).max()
-    calmar_ratio = portfolio_annual_return / max_drawdown if max_drawdown > 0 else None
+    max_drawdown = ((cumulative_returns.cummax() - cumulative_returns) / (cumulative_returns.cummax() + 1)).max() if not cumulative_returns.empty else np.nan
+    calmar_ratio = portfolio_annual_return / max_drawdown if max_drawdown > 1e-9 else np.nan
     
     # Correlation analysis
-    correlation_matrix = returns_df.corr()
-    avg_correlation = correlation_matrix.values[np.triu_indices_from(correlation_matrix.values, k=1)].mean()
-    max_correlation = correlation_matrix.values[np.triu_indices_from(correlation_matrix.values, k=1)].max()
-    min_correlation = correlation_matrix.values[np.triu_indices_from(correlation_matrix.values, k=1)].min()
-    
+    correlation_matrix = returns_df.corr() if not returns_df.empty else pd.DataFrame()
+    avg_correlation, max_correlation, min_correlation = np.nan, np.nan, np.nan
+    if not correlation_matrix.empty:
+        # Check if there are off-diagonal elements to compute correlation
+        if correlation_matrix.shape[0] > 1:
+            upper_triangle_indices = np.triu_indices_from(correlation_matrix.values, k=1)
+            if upper_triangle_indices[0].size > 0: # Check if there are any elements in the upper triangle
+                avg_correlation = correlation_matrix.values[upper_triangle_indices].mean()
+                max_correlation = correlation_matrix.values[upper_triangle_indices].max()
+                min_correlation = correlation_matrix.values[upper_triangle_indices].min()
+        else: # Only one asset, correlation is not meaningful
+            avg_correlation, max_correlation, min_correlation = 1.0, 1.0, 1.0 # Or set to NaN as it's not a portfolio correlation
+
     # Diversification metrics
-    portfolio_vol = portfolio_returns.std() * np.sqrt(252)
-    weighted_vol = np.sum(weights * returns_df.std() * np.sqrt(252))
-    diversification_ratio = weighted_vol / portfolio_vol if portfolio_vol > 0 else None
+    portfolio_vol = portfolio_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) if len(portfolio_returns) > 1 else np.nan
+    weighted_vol = np.sum(weights * returns_df.std() * np.sqrt(TRADING_DAYS_PER_YEAR)) if not returns_df.empty else np.nan
+    diversification_ratio = weighted_vol / portfolio_vol if portfolio_vol > 1e-9 else np.nan
     
     # Effective number of holdings
-    effective_n = 1 / np.sum(weights ** 2)
+    effective_n = 1 / np.sum(weights ** 2) if len(weights) > 0 else np.nan
     
     # Skewness and Kurtosis
-    skewness = portfolio_returns.skew()
-    kurtosis = portfolio_returns.kurtosis()
+    skewness = portfolio_returns.skew() if len(portfolio_returns) > 1 else np.nan
+    kurtosis = portfolio_returns.kurtosis() if len(portfolio_returns) > 1 else np.nan
     
     # Maximum gain/loss
-    max_daily_gain = portfolio_returns.max()
-    max_daily_loss = portfolio_returns.min()
+    max_daily_gain = portfolio_returns.max() if not portfolio_returns.empty else np.nan
+    max_daily_loss = portfolio_returns.min() if not portfolio_returns.empty else np.nan
     
     # Win rate
     positive_days = (portfolio_returns > 0).sum()
     total_days = len(portfolio_returns)
-    win_rate = positive_days / total_days if total_days > 0 else 0
+    win_rate = positive_days / total_days if total_days > 0 else np.nan
     
     # Ulcer Index (measure of downside volatility)
-    drawdown_series = (cumulative_returns.cummax() - cumulative_returns) / (cumulative_returns.cummax() + 1)
-    ulcer_index = np.sqrt((drawdown_series ** 2).mean()) * np.sqrt(252)
+    drawdown_series = (cumulative_returns.cummax() - cumulative_returns) / (cumulative_returns.cummax() + 1) if not cumulative_returns.empty else pd.Series()
+    ulcer_index = np.sqrt((drawdown_series ** 2).mean()) * np.sqrt(TRADING_DAYS_PER_YEAR) if not drawdown_series.empty else np.nan
     
     # Modified Sharpe Ratio (accounts for skewness and kurtosis)
-    sharpe_ratio = (portfolio_annual_return - 0.06) / portfolio_vol if portfolio_vol > 0 else None
-    if sharpe_ratio and not np.isnan(skewness) and not np.isnan(kurtosis):
-        modified_sharpe = sharpe_ratio * (1 + (skewness / 6) * sharpe_ratio - ((kurtosis - 3) / 24) * sharpe_ratio ** 2)
-    else:
-        modified_sharpe = None
+    sharpe_ratio_calc = (portfolio_annual_return - 0.06) / portfolio_vol if portfolio_vol > 1e-9 else np.nan
+    modified_sharpe = np.nan
+    if not np.isnan(sharpe_ratio_calc) and not np.isnan(skewness) and not np.isnan(kurtosis):
+        modified_sharpe = sharpe_ratio_calc * (1 + (skewness / 6) * sharpe_ratio_calc - ((kurtosis - 3) / 24) * sharpe_ratio_calc ** 2)
     
     return {
+        "portfolio_returns": portfolio_returns, # Include portfolio returns for plotting
         "var_95": var_95,
         "var_99": var_99,
         "var_90": var_90,
@@ -834,13 +875,17 @@ def calculate_advanced_metrics(portfolio_df: pd.DataFrame, api_key: str, access_
         "max_daily_loss": max_daily_loss,
         "win_rate": win_rate,
         "ulcer_index": ulcer_index,
-        "sharpe_ratio": sharpe_ratio,
-        "modified_sharpe_ratio": modified_sharpe
+        "sharpe_ratio": sharpe_ratio_calc, # Use the calculated sharpe_ratio_calc
+        "modified_sharpe_ratio": modified_sharpe,
+        "max_drawdown": max_drawdown # Added Max Drawdown to advanced_metrics
     }
 
 
 def calculate_concentration_metrics(portfolio_df: pd.DataFrame) -> Dict:
     """Calculate comprehensive concentration risk metrics"""
+    
+    if portfolio_df.empty:
+        return {} # Return empty dict if portfolio is empty
     
     # Herfindahl-Hirschman Index (HHI)
     stock_hhi = (portfolio_df['Weight %'] ** 2).sum()
@@ -861,25 +906,34 @@ def calculate_concentration_metrics(portfolio_df: pd.DataFrame) -> Dict:
     # Gini coefficient (inequality measure)
     sorted_weights = np.sort(portfolio_df['Weight %'].values)
     n = len(sorted_weights)
-    cumsum = np.cumsum(sorted_weights)
-    gini = (2 * np.sum((n - np.arange(1, n + 1) + 0.5) * sorted_weights)) / (n * np.sum(sorted_weights)) - 1
+    if n > 0 and np.sum(sorted_weights) > 0: # Avoid division by zero
+        cumsum = np.cumsum(sorted_weights)
+        # Using simplified Gini formula: (2 * sum(i * yi) / (n * sum(yi))) - (n+1)/n
+        # Or alternatively: 1 - sum_{i=0}^{n-1} (y_{i+1} + y_i) / sum_{i=0}^{n-1} y_i * 1/n
+        # More common formula: 1/n * (n+1 - 2 * sum(rank_i * val_i) / sum(val_i))
+        # Let's use the provided one with safety checks:
+        gini = (2 * np.sum((np.arange(1, n + 1)) * sorted_weights)) / (n * np.sum(sorted_weights)) - (n + 1) / n
+    else:
+        gini = np.nan
     
     # Effective number of holdings
-    effective_n_stocks = 1 / ((portfolio_df['Weight %'] / 100) ** 2).sum()
+    weights_normalized = portfolio_df['Weight %'] / 100
+    effective_n_stocks = 1 / (weights_normalized ** 2).sum() if not weights_normalized.empty and (weights_normalized ** 2).sum() > 0 else np.nan
+
     sector_weights = portfolio_df.groupby('Industry')['Weight %'].sum() / 100
-    effective_n_sectors = 1 / (sector_weights ** 2).sum()
+    effective_n_sectors = 1 / (sector_weights ** 2).sum() if not sector_weights.empty and (sector_weights ** 2).sum() > 0 else np.nan
     
     # Top N concentration
-    top_1 = portfolio_df.nlargest(1, 'Weight %')['Weight %'].sum()
-    top_3 = portfolio_df.nlargest(3, 'Weight %')['Weight %'].sum()
-    top_5 = portfolio_df.nlargest(5, 'Weight %')['Weight %'].sum()
-    top_10 = portfolio_df.nlargest(10, 'Weight %')['Weight %'].sum()
-    top_20 = portfolio_df.nlargest(20, 'Weight %')['Weight %'].sum() if len(portfolio_df) >= 20 else portfolio_df['Weight %'].sum()
+    top_1 = portfolio_df.nlargest(1, 'Weight %')['Weight %'].sum() if not portfolio_df.empty else 0
+    top_3 = portfolio_df.nlargest(3, 'Weight %')['Weight %'].sum() if not portfolio_df.empty else 0
+    top_5 = portfolio_df.nlargest(5, 'Weight %')['Weight %'].sum() if not portfolio_df.empty else 0
+    top_10 = portfolio_df.nlargest(10, 'Weight %')['Weight %'].sum() if not portfolio_df.empty else 0
+    top_20 = portfolio_df.nlargest(20, 'Weight %')['Weight %'].sum() if len(portfolio_df) >= 20 else portfolio_df['Weight %'].sum() if not portfolio_df.empty else 0
     
     # Sector concentration
     sector_analysis = portfolio_df.groupby('Industry')['Weight %'].sum().sort_values(ascending=False)
     top_sector = sector_analysis.iloc[0] if not sector_analysis.empty else 0
-    top_3_sectors = sector_analysis.head(3).sum()
+    top_3_sectors = sector_analysis.head(3).sum() if not sector_analysis.empty else 0
     
     return {
         "stock_hhi": stock_hhi,
@@ -901,21 +955,24 @@ def calculate_concentration_metrics(portfolio_df: pd.DataFrame) -> Dict:
     }
 
 
-def perform_stress_testing(portfolio_df: pd.DataFrame, returns_df: pd.DataFrame, weights: np.ndarray) -> Dict:
+def perform_stress_testing(portfolio_df: pd.DataFrame, portfolio_returns: pd.Series, weights: np.ndarray) -> Dict:
     """Perform comprehensive stress testing scenarios"""
     
     scenarios = {}
     
+    if portfolio_returns.empty:
+        st.warning("Cannot perform stress testing: Insufficient portfolio returns data.")
+        return {}
+    
     # Historical worst scenarios
-    portfolio_returns = returns_df.dot(weights)
-    worst_day = portfolio_returns.min()
-    worst_week = portfolio_returns.rolling(5).sum().min()
-    worst_month = portfolio_returns.rolling(21).sum().min()
+    worst_day = portfolio_returns.min() if not portfolio_returns.empty else np.nan
+    worst_week = portfolio_returns.rolling(5).sum().min() if len(portfolio_returns) >= 5 else np.nan
+    worst_month = portfolio_returns.rolling(21).sum().min() if len(portfolio_returns) >= 21 else np.nan
     
     scenarios['historical'] = {
-        'worst_day': worst_day * 100,
-        'worst_week': worst_week * 100,
-        'worst_month': worst_month * 100
+        'worst_day': worst_day * 100 if not np.isnan(worst_day) else np.nan,
+        'worst_week': worst_week * 100 if not np.isnan(worst_week) else np.nan,
+        'worst_month': worst_month * 100 if not np.isnan(worst_month) else np.nan
     }
     
     # Hypothetical market crash scenarios
@@ -928,13 +985,14 @@ def perform_stress_testing(portfolio_df: pd.DataFrame, returns_df: pd.DataFrame,
     
     # Sector-specific shocks
     sector_impacts = {}
-    for sector in portfolio_df['Industry'].unique():
-        sector_weight = portfolio_df[portfolio_df['Industry'] == sector]['Weight %'].sum()
-        sector_impacts[sector] = {
-            'weight': sector_weight,
-            'impact_10': sector_weight * -0.10,
-            'impact_20': sector_weight * -0.20
-        }
+    if 'Industry' in portfolio_df.columns:
+        for sector in portfolio_df['Industry'].unique():
+            sector_weight = portfolio_df[portfolio_df['Industry'] == sector]['Weight %'].sum()
+            sector_impacts[sector] = {
+                'weight': sector_weight,
+                'impact_10': sector_weight * -0.10,
+                'impact_20': sector_weight * -0.20
+            }
     
     scenarios['sector_shocks'] = sector_impacts
     
@@ -952,6 +1010,10 @@ def calculate_liquidity_metrics(portfolio_df: pd.DataFrame) -> Dict:
     """Calculate comprehensive liquidity metrics"""
     
     liquidity_metrics = {}
+    
+    if portfolio_df.empty:
+        liquidity_metrics['error'] = 'Portfolio data is empty.'
+        return liquidity_metrics
     
     if 'Avg Volume (90d)' in portfolio_df.columns:
         total_value = portfolio_df['Real-time Value (Rs)'].sum()
@@ -1037,21 +1099,27 @@ with st.sidebar:
         with col1:
             if st.button("📊 Holdings", key="sidebar_holdings", use_container_width=True):
                 k_client = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
-                try:
-                    holdings = k_client.holdings()
-                    st.session_state["holdings_data"] = pd.DataFrame(holdings)
-                    st.success(f"✅ Fetched {len(holdings)} holdings")
-                except Exception as e:
-                    st.error(f"❌ Error: {e}")
+                if k_client: # Ensure client is authenticated
+                    try:
+                        holdings = k_client.holdings()
+                        st.session_state["holdings_data"] = pd.DataFrame(holdings)
+                        st.success(f"✅ Fetched {len(holdings)} holdings")
+                    except Exception as e:
+                        st.error(f"❌ Error fetching holdings: {e}")
+                else:
+                    st.warning("Kite client not authenticated.")
         
         with col2:
             if st.button("💰 Positions", key="sidebar_positions", use_container_width=True):
                 k_client = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
-                try:
-                    positions = k_client.positions()
-                    st.info(f"Net: {len(positions.get('net', []))}, Day: {len(positions.get('day', []))}")
-                except Exception as e:
-                    st.error(f"❌ Error: {e}")
+                if k_client: # Ensure client is authenticated
+                    try:
+                        positions = k_client.positions()
+                        st.info(f"Net: {len(positions.get('net', []))}, Day: {len(positions.get('day', []))}")
+                    except Exception as e:
+                        st.error(f"❌ Error fetching positions: {e}")
+                else:
+                    st.warning("Kite client not authenticated.")
         
         if st.session_state.get("holdings_data") is not None and not st.session_state["holdings_data"].empty:
             with st.expander("📋 Holdings Data"):
@@ -1080,6 +1148,7 @@ with st.sidebar:
 
 
 # --- Authenticated KiteConnect client ---
+# `k` will be None if not authenticated. This is handled by checks within render functions.
 k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
 
 # --- Main Tabs ---
@@ -1095,7 +1164,7 @@ tab_market, tab_compliance, tab_ai = tabs
 def render_market_historical_tab(kite_client, api_key, access_token):
     st.header("📈 Market Data & Technical Analysis")
     
-    if not kite_client:
+    if not kite_client or not access_token: # Check both client and token
         st.info("🔐 Please connect your Kite account to access market data")
         return
     
@@ -1116,6 +1185,7 @@ def render_market_historical_tab(kite_client, api_key, access_token):
     
     if fetch_quote or st.session_state.get("current_market_data"):
         if fetch_quote:
+            # Ensure kite_client is passed to get_ltp_price_cached
             ltp_data = get_ltp_price_cached(api_key, access_token, q_symbol, q_exchange)
             if ltp_data and "_error" not in ltp_data:
                 st.session_state["current_market_data"] = ltp_data
@@ -1163,6 +1233,7 @@ def render_market_historical_tab(kite_client, api_key, access_token):
     
     if st.button("📥 Fetch Historical Data", key="fetch_hist_btn", type="primary", use_container_width=True):
         with st.spinner(f"🔄 Fetching data for {hist_symbol}..."):
+            # Ensure kite_client is passed to get_historical_data_cached
             df_hist = get_historical_data_cached(api_key, access_token, hist_symbol, from_date, to_date, interval, DEFAULT_EXCHANGE)
             if isinstance(df_hist, pd.DataFrame) and "_error" not in df_hist.columns:
                 st.session_state["historical_data"] = df_hist
@@ -1171,7 +1242,8 @@ def render_market_historical_tab(kite_client, api_key, access_token):
             else:
                 st.error(f"❌ {df_hist.get('_error', ['Unknown error'])[0]}")
     
-    if not st.session_state.get("historical_data", pd.DataFrame()).empty:
+    # Check if historical_data is valid before attempting to use it
+    if st.session_state.get("historical_data") is not None and not st.session_state["historical_data"].empty and "_error" not in st.session_state["historical_data"].columns:
         df = st.session_state["historical_data"]
         
         with st.expander("⚙️ Technical Indicator Settings", expanded=False):
@@ -1331,13 +1403,15 @@ def render_market_historical_tab(kite_client, api_key, access_token):
                         st.metric(key, f"{value:.2f}")
                     else:
                         st.metric(key, "N/A")
+    else:
+        st.info("No historical data available to display. Please fetch data first.")
 
 
 # --- TAB 2: Enhanced Investment Compliance ---
 def render_investment_compliance_tab(kite_client, api_key, access_token):
     st.header("💼 Investment Compliance Pro - Enterprise Analytics")
     
-    if not kite_client:
+    if not kite_client or not access_token: # Check both client and token
         st.warning("🔐 Please connect to Kite to fetch live prices and perform real-time analysis")
         return
     
@@ -1469,6 +1543,13 @@ UNRATED_EXPOSURE <= 10""",
             }
             df = df.rename(columns=header_map)
             
+            # Ensure mandatory columns exist
+            mandatory_cols = ['Symbol', 'Industry', 'Quantity']
+            missing_mandatory = [col for col in mandatory_cols if col not in df.columns]
+            if missing_mandatory:
+                st.error(f"❌ Missing mandatory columns in the uploaded CSV: {', '.join(missing_mandatory)}. Please check your file.")
+                st.stop()
+            
             # Normalize data
             for col in ['Rating', 'Asset Class', 'Industry', 'Market Cap', 'Issuer Group', 'Country', 'Instrument Type']:
                 if col in df.columns:
@@ -1514,16 +1595,27 @@ UNRATED_EXPOSURE <= 10""",
                     security_compliance = calculate_security_level_compliance(df_results, rules_config)
                     
                     # Concentration analysis
-                    progress.progress(80, "Analyzing concentration risk...")
+                    progress.progress(70, "Analyzing concentration risk...")
                     concentration_metrics = calculate_concentration_metrics(df_results)
+
+                    # Custom rule validation
+                    progress.progress(80, "Validating custom rules...")
+                    custom_rule_results = parse_and_validate_rules_enhanced(rules_text, df_results)
+
+                    # Advanced metrics for Risk tab
+                    progress.progress(90, "Calculating advanced risk metrics...")
+                    # Pass the access token directly
+                    advanced_metrics = calculate_advanced_metrics(df_results, api_key, access_token)
                     
                     # Store results
                     st.session_state.compliance_results_df = df_results
                     st.session_state.security_level_compliance = security_compliance
                     st.session_state.concentration_analysis = concentration_metrics
+                    st.session_state.custom_rule_results = custom_rule_results # Store custom rule results
+                    st.session_state.advanced_metrics = advanced_metrics # Store advanced metrics
                     
                     # Generate breach alerts
-                    progress.progress(90, "Generating compliance alerts...")
+                    progress.progress(95, "Generating compliance alerts...")
                     breaches = []
                     
                     # Stock limit breaches
@@ -1558,6 +1650,17 @@ UNRATED_EXPOSURE <= 10""",
                             'details': f"Top 10 holdings: {top_10_weight:.2f}% (Limit: {top_10_limit}%)",
                             'recommendation': "Increase diversification across portfolio"
                         })
+
+                    # Unrated securities limit
+                    if 'Rating' in df_results.columns:
+                        unrated_exposure = df_results[df_results['Rating'].isin(['UNRATED', 'NR', 'NOT RATED', '', 'UNKNOWN'])]['Weight %'].sum()
+                        if unrated_exposure > unrated_limit:
+                            breaches.append({
+                                'type': 'Unrated Exposure Limit',
+                                'severity': '🟡 Medium',
+                                'details': f"Unrated exposure: {unrated_exposure:.2f}% (Limit: {unrated_limit}%)",
+                                'recommendation': "Seek ratings for unrated securities or reduce exposure."
+                            })
                     
                     st.session_state.breach_alerts = breaches
                     
@@ -1808,7 +1911,7 @@ UNRATED_EXPOSURE <= 10""",
                 )
             
             with detail_subtabs[2]:
-                if 'Rating' in results_df.columns:
+                if 'Rating' in results_df.columns and not results_df['Rating'].eq('UNKNOWN').all():
                     st.markdown("#### Credit Rating Distribution Analysis")
                     
                     rating_analysis = results_df.groupby('Rating').agg({
@@ -1827,6 +1930,7 @@ UNRATED_EXPOSURE <= 10""",
                             title='Rating Distribution by Weight',
                             hole=0.3
                         )
+                        fig.update_traces(textposition='inside', textinfo='percent+label') # Added text info
                         st.plotly_chart(fig, use_container_width=True)
                     
                     with col2:
@@ -1850,10 +1954,10 @@ UNRATED_EXPOSURE <= 10""",
                         use_container_width=True
                     )
                 else:
-                    st.info("Rating information not available in portfolio data")
+                    st.info("Rating information not available or all ratings are 'UNKNOWN' in portfolio data")
             
             with detail_subtabs[3]:
-                if 'Market Cap' in results_df.columns:
+                if 'Market Cap' in results_df.columns and not results_df['Market Cap'].eq('UNKNOWN').all():
                     st.markdown("#### Market Capitalization Distribution Analysis")
                     market_cap_analysis = results_df.groupby('Market Cap').agg({
                         'Weight %': 'sum',
@@ -1870,6 +1974,7 @@ UNRATED_EXPOSURE <= 10""",
                             title='Market Cap Distribution by Weight',
                             hole=0.3
                         )
+                        fig.update_traces(textposition='inside', textinfo='percent+label') # Added text info
                         st.plotly_chart(fig, use_container_width=True)
                     
                     with col2:
@@ -1893,10 +1998,10 @@ UNRATED_EXPOSURE <= 10""",
                         use_container_width=True
                     )
                 else:
-                    st.info("Market Cap information not available in portfolio data")
+                    st.info("Market Cap information not available or all market caps are 'UNKNOWN' in portfolio data")
             
             with detail_subtabs[4]:
-                if 'Country' in results_df.columns and results_df['Country'].nunique() > 1:
+                if 'Country' in results_df.columns and results_df['Country'].nunique() > 1 and not results_df['Country'].eq('UNKNOWN').all():
                     st.markdown("#### Geographic Exposure Analysis")
                     geo_analysis = results_df.groupby('Country').agg({
                         'Weight %': 'sum',
@@ -1913,6 +2018,7 @@ UNRATED_EXPOSURE <= 10""",
                             title='Geographic Distribution by Weight',
                             hole=0.3
                         )
+                        fig.update_traces(textposition='inside', textinfo='percent+label') # Added text info
                         st.plotly_chart(fig, use_container_width=True)
                     
                     with col2:
@@ -1936,67 +2042,68 @@ UNRATED_EXPOSURE <= 10""",
                         use_container_width=True
                     )
                 else:
-                    st.info("Geographic information not available or only single country in portfolio data")
+                    st.info("Geographic information not available, only single country, or all countries are 'UNKNOWN' in portfolio data")
         
         # TAB 3: Risk Metrics
         with analysis_tabs[2]:
             st.markdown("### 📈 Portfolio Risk Metrics")
             
-            # Placeholder for advanced risk metrics calculation
-            advanced_metrics_calculated = False
-            if st.button("Calculate Advanced Risk Metrics", key="calc_adv_risk", type="secondary", use_container_width=True):
-                if k and st.session_state["kite_access_token"]:
-                    advanced_metrics_data = calculate_advanced_metrics(results_df, api_key, access_token)
-                    if advanced_metrics_data:
-                        st.session_state.advanced_metrics = advanced_metrics_data
-                        advanced_metrics_calculated = True
-                        st.success("✅ Advanced risk metrics calculated!")
-                    else:
-                        st.warning("⚠️ Could not calculate advanced risk metrics due to insufficient data.")
-                else:
-                    st.warning("🔐 Please connect Kite for live data to calculate advanced risk metrics.")
-            
             advanced_metrics = st.session_state.get("advanced_metrics")
+            
+            if advanced_metrics is None: # Only show button if metrics haven't been calculated or were cleared
+                if st.button("Calculate Advanced Risk Metrics", key="calc_adv_risk", type="secondary", use_container_width=True):
+                    if kite_client and access_token:
+                        advanced_metrics_data = calculate_advanced_metrics(results_df, api_key, access_token)
+                        if advanced_metrics_data:
+                            st.session_state.advanced_metrics = advanced_metrics_data
+                            st.success("✅ Advanced risk metrics calculated!")
+                            # Re-fetch advanced_metrics after calculation
+                            advanced_metrics = st.session_state.get("advanced_metrics") 
+                        else:
+                            st.warning("⚠️ Could not calculate advanced risk metrics due to insufficient data.")
+                    else:
+                        st.warning("🔐 Please connect Kite for live data to calculate advanced risk metrics.")
             
             if advanced_metrics:
                 st.markdown("#### VaR & Expected Shortfall (CVaR)")
                 col1, col2, col3, col4, col5, col6 = st.columns(6)
-                col1.metric("VaR (95%)", f"{(advanced_metrics.get('var_95', 0) * 100):.2f}%")
-                col2.metric("VaR (99%)", f"{(advanced_metrics.get('var_99', 0) * 100):.2f}%")
-                col3.metric("VaR (90%)", f"{(advanced_metrics.get('var_90', 0) * 100):.2f}%")
-                col4.metric("CVaR (95%)", f"{(advanced_metrics.get('cvar_95', 0) * 100):.2f}%")
-                col5.metric("CVaR (99%)", f"{(advanced_metrics.get('cvar_99', 0) * 100):.2f}%")
+                col1.metric("VaR (95%)", f"{(advanced_metrics.get('var_95', 0) * 100):.2f}%" if not np.isnan(advanced_metrics.get('var_95', np.nan)) else "N/A")
+                col2.metric("VaR (99%)", f"{(advanced_metrics.get('var_99', 0) * 100):.2f}%" if not np.isnan(advanced_metrics.get('var_99', np.nan)) else "N/A")
+                col3.metric("VaR (90%)", f"{(advanced_metrics.get('var_90', 0) * 100):.2f}%" if not np.isnan(advanced_metrics.get('var_90', np.nan)) else "N/A")
+                col4.metric("CVaR (95%)", f"{(advanced_metrics.get('cvar_95', 0) * 100):.2f}%" if not np.isnan(advanced_metrics.get('cvar_95', np.nan)) else "N/A")
+                col5.metric("CVaR (99%)", f"{(advanced_metrics.get('cvar_99', 0) * 100):.2f}%" if not np.isnan(advanced_metrics.get('cvar_99', np.nan)) else "N/A")
                 
                 st.markdown("#### Modern Portfolio Theory Metrics")
                 col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric("Sharpe Ratio", f"{advanced_metrics.get('sharpe_ratio', 0):.2f}")
-                col2.metric("Sortino Ratio", f"{advanced_metrics.get('sortino_ratio', 0):.2f}")
-                col3.metric("Beta", f"{advanced_metrics.get('beta', 0):.2f}")
-                col4.metric("Alpha (Annualized)", f"{(advanced_metrics.get('alpha', 0) * 100):.2f}%")
-                col5.metric("Tracking Error", f"{(advanced_metrics.get('tracking_error', 0) * 100):.2f}%")
+                col1.metric("Sharpe Ratio", f"{advanced_metrics.get('sharpe_ratio', np.nan):.2f}" if not np.isnan(advanced_metrics.get('sharpe_ratio', np.nan)) else "N/A")
+                col2.metric("Sortino Ratio", f"{advanced_metrics.get('sortino_ratio', np.nan):.2f}" if not np.isnan(advanced_metrics.get('sortino_ratio', np.nan)) else "N/A")
+                col3.metric("Beta", f"{advanced_metrics.get('beta', np.nan):.2f}" if not np.isnan(advanced_metrics.get('beta', np.nan)) else "N/A")
+                col4.metric("Alpha (Annualized)", f"{(advanced_metrics.get('alpha', np.nan) * 100):.2f}%" if not np.isnan(advanced_metrics.get('alpha', np.nan)) else "N/A")
+                col5.metric("Tracking Error", f"{(advanced_metrics.get('tracking_error', np.nan) * 100):.2f}%" if not np.isnan(advanced_metrics.get('tracking_error', np.nan)) else "N/A")
                 
                 col6, col7, col8, col9, col10 = st.columns(5)
-                col6.metric("Information Ratio", f"{advanced_metrics.get('information_ratio', 0):.2f}")
-                col7.metric("Treynor Ratio", f"{(advanced_metrics.get('treynor_ratio', 0) * 100):.2f}%")
-                col8.metric("Calmar Ratio", f"{advanced_metrics.get('calmar_ratio', 0):.2f}")
-                col9.metric("Max Drawdown", f"{(advanced_metrics.get('max_drawdown', 0) * 100):.2f}%")
-                col10.metric("Ulcer Index", f"{(advanced_metrics.get('ulcer_index', 0) * 100):.2f}%")
+                col6.metric("Information Ratio", f"{advanced_metrics.get('information_ratio', np.nan):.2f}" if not np.isnan(advanced_metrics.get('information_ratio', np.nan)) else "N/A")
+                col7.metric("Treynor Ratio", f"{(advanced_metrics.get('treynor_ratio', np.nan) * 100):.2f}%" if not np.isnan(advanced_metrics.get('treynor_ratio', np.nan)) else "N/A")
+                col8.metric("Calmar Ratio", f"{advanced_metrics.get('calmar_ratio', np.nan):.2f}" if not np.isnan(advanced_metrics.get('calmar_ratio', np.nan)) else "N/A")
+                col9.metric("Max Drawdown", f"{(advanced_metrics.get('max_drawdown', np.nan) * 100):.2f}%" if not np.isnan(advanced_metrics.get('max_drawdown', np.nan)) else "N/A")
+                col10.metric("Ulcer Index", f"{(advanced_metrics.get('ulcer_index', np.nan) * 100):.2f}%" if not np.isnan(advanced_metrics.get('ulcer_index', np.nan)) else "N/A")
 
                 st.markdown("#### Statistical & Distribution Metrics")
                 col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric("Portfolio Volatility (Annualized)", f"{(advanced_metrics.get('portfolio_volatility', 0) * 100):.2f}%")
-                col2.metric("Skewness", f"{advanced_metrics.get('skewness', 0):.2f}")
-                col3.metric("Kurtosis", f"{advanced_metrics.get('kurtosis', 0):.2f}")
-                col4.metric("Max Daily Gain", f"{(advanced_metrics.get('max_daily_gain', 0) * 100):.2f}%")
-                col5.metric("Max Daily Loss", f"{(advanced_metrics.get('max_daily_loss', 0) * 100):.2f}%")
+                col1.metric("Portfolio Volatility (Annualized)", f"{(advanced_metrics.get('portfolio_volatility', np.nan) * 100):.2f}%" if not np.isnan(advanced_metrics.get('portfolio_volatility', np.nan)) else "N/A")
+                col2.metric("Skewness", f"{advanced_metrics.get('skewness', np.nan):.2f}" if not np.isnan(advanced_metrics.get('skewness', np.nan)) else "N/A")
+                col3.metric("Kurtosis", f"{advanced_metrics.get('kurtosis', np.nan):.2f}" if not np.isnan(advanced_metrics.get('kurtosis', np.nan)) else "N/A")
+                col4.metric("Max Daily Gain", f"{(advanced_metrics.get('max_daily_gain', np.nan) * 100):.2f}%" if not np.isnan(advanced_metrics.get('max_daily_gain', np.nan)) else "N/A")
+                col5.metric("Max Daily Loss", f"{(advanced_metrics.get('max_daily_loss', np.nan) * 100):.2f}%" if not np.isnan(advanced_metrics.get('max_daily_loss', np.nan)) else "N/A")
 
                 st.markdown("#### Correlation Analysis")
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Average Pairwise Correlation", f"{advanced_metrics.get('avg_correlation', 0):.2f}")
-                col2.metric("Maximum Pairwise Correlation", f"{advanced_metrics.get('max_correlation', 0):.2f}")
-                col3.metric("Minimum Pairwise Correlation", f"{advanced_metrics.get('min_correlation', 0):.2f}")
+                col1.metric("Average Pairwise Correlation", f"{advanced_metrics.get('avg_correlation', np.nan):.2f}" if not np.isnan(advanced_metrics.get('avg_correlation', np.nan)) else "N/A")
+                col2.metric("Maximum Pairwise Correlation", f"{advanced_metrics.get('max_correlation', np.nan):.2f}" if not np.isnan(advanced_metrics.get('max_correlation', np.nan)) else "N/A")
+                col3.metric("Minimum Pairwise Correlation", f"{advanced_metrics.get('min_correlation', np.nan):.2f}" if not np.isnan(advanced_metrics.get('min_correlation', np.nan)) else "N/A")
                 
-                if st.session_state.get("historical_data") is not None and not st.session_state["historical_data"].empty:
+                # Plot returns distribution only if portfolio_returns is available and not empty
+                if advanced_metrics.get("portfolio_returns") is not None and not advanced_metrics["portfolio_returns"].empty:
                     st.markdown("##### Returns Distribution")
                     fig_dist = px.histogram(
                         advanced_metrics['portfolio_returns'] * 100,
@@ -2010,64 +2117,74 @@ UNRATED_EXPOSURE <= 10""",
                 st.markdown("---")
                 
                 st.markdown("#### Stress Testing Scenarios")
+                # Ensure portfolio_returns is a Series before passing to stress testing
+                portfolio_returns_series = advanced_metrics.get("portfolio_returns")
+                total_value = results_df['Real-time Value (Rs)'].sum()
+                weights = (results_df['Real-time Value (Rs)'] / total_value).values if total_value > 0 else np.array([])
                 
-                stress_test_results = perform_stress_testing(results_df, advanced_metrics['portfolio_returns'].to_frame('portfolio_returns'), weights)
-                
-                st.subheader("Market Crash Scenarios (Impact on Portfolio Value)")
-                scenario_data = {
-                    "Scenario": list(stress_test_results['market_crash'].keys()),
-                    "Impact (%)": list(stress_test_results['market_crash'].values())
-                }
-                scenario_df = pd.DataFrame(scenario_data)
-                scenario_df['Portfolio Value Impact (Rs)'] = (total_value * scenario_df['Impact (%)'] / 100).round(2)
-                
-                fig_stress = px.bar(
-                    scenario_df,
-                    x="Scenario",
-                    y="Impact (%)",
-                    color="Impact (%)",
-                    color_continuous_scale=px.colors.sequential.Reds_r,
-                    title="Hypothetical Market Crash Impact on Portfolio"
-                )
-                st.plotly_chart(fig_stress, use_container_width=True)
-                
-                st.dataframe(scenario_df.style.format({
-                    'Impact (%)': '{:.2f}%',
-                    'Portfolio Value Impact (Rs)': '₹{:,.2f}'
-                }), use_container_width=True)
-                
-                st.subheader("Historical Worst Case Scenarios")
-                hist_scenario_df = pd.DataFrame([
-                    {"Period": "Worst Day", "Impact (%)": stress_test_results['historical']['worst_day']},
-                    {"Period": "Worst Week", "Impact (%)": stress_test_results['historical']['worst_week']},
-                    {"Period": "Worst Month", "Impact (%)": stress_test_results['historical']['worst_month']}
-                ])
-                hist_scenario_df['Portfolio Value Impact (Rs)'] = (total_value * hist_scenario_df['Impact (%)'] / 100).round(2)
-                st.dataframe(hist_scenario_df.style.format({
-                    'Impact (%)': '{:.2f}%',
-                    'Portfolio Value Impact (Rs)': '₹{:,.2f}'
-                }), use_container_width=True)
-                
-                st.subheader("Sector-Specific Shocks")
-                sector_shock_data = []
-                for sector, data in stress_test_results['sector_shocks'].items():
-                    sector_shock_data.append({
-                        "Sector": sector,
-                        "Sector Weight (%)": data['weight'],
-                        "10% Sector Shock Impact (%)": data['impact_10'],
-                        "20% Sector Shock Impact (%)": data['impact_20']
-                    })
-                sector_shock_df = pd.DataFrame(sector_shock_data)
-                
-                st.dataframe(sector_shock_df.style.format({
-                    'Sector Weight (%)': '{:.2f}%',
-                    '10% Sector Shock Impact (%)': '{:.2f}%',
-                    '20% Sector Shock Impact (%)': '{:.2f}%'
-                }), use_container_width=True)
-                
-                st.subheader("Interest Rate Scenarios")
-                for scenario, description in stress_test_results['interest_rate'].items():
-                    st.write(f"**{scenario.replace('_', ' ').title()}:** {description}")
+                if portfolio_returns_series is not None and not portfolio_returns_series.empty and total_value > 0:
+                    stress_test_results = perform_stress_testing(results_df, portfolio_returns_series, weights)
+                    
+                    if stress_test_results:
+                        st.subheader("Market Crash Scenarios (Impact on Portfolio Value)")
+                        scenario_data = {
+                            "Scenario": list(stress_test_results['market_crash'].keys()),
+                            "Impact (%)": list(stress_test_results['market_crash'].values())
+                        }
+                        scenario_df = pd.DataFrame(scenario_data)
+                        scenario_df['Portfolio Value Impact (Rs)'] = (total_value * scenario_df['Impact (%)'] / 100).round(2)
+                        
+                        fig_stress = px.bar(
+                            scenario_df,
+                            x="Scenario",
+                            y="Impact (%)",
+                            color="Impact (%)",
+                            color_continuous_scale=px.colors.sequential.Reds_r,
+                            title="Hypothetical Market Crash Impact on Portfolio"
+                        )
+                        st.plotly_chart(fig_stress, use_container_width=True)
+                        
+                        st.dataframe(scenario_df.style.format({
+                            'Impact (%)': '{:.2f}%',
+                            'Portfolio Value Impact (Rs)': '₹{:,.2f}'
+                        }), use_container_width=True)
+                        
+                        st.subheader("Historical Worst Case Scenarios")
+                        hist_scenario_df = pd.DataFrame([
+                            {"Period": "Worst Day", "Impact (%)": stress_test_results['historical'].get('worst_day', np.nan)},
+                            {"Period": "Worst Week", "Impact (%)": stress_test_results['historical'].get('worst_week', np.nan)},
+                            {"Period": "Worst Month", "Impact (%)": stress_test_results['historical'].get('worst_month', np.nan)}
+                        ])
+                        hist_scenario_df['Portfolio Value Impact (Rs)'] = (total_value * hist_scenario_df['Impact (%)'] / 100).round(2)
+                        st.dataframe(hist_scenario_df.style.format({
+                            'Impact (%)': '{:.2f}%',
+                            'Portfolio Value Impact (Rs)': '₹{:,.2f}'
+                        }), use_container_width=True)
+                        
+                        st.subheader("Sector-Specific Shocks")
+                        sector_shock_data = []
+                        for sector, data in stress_test_results['sector_shocks'].items():
+                            sector_shock_data.append({
+                                "Sector": sector,
+                                "Sector Weight (%)": data['weight'],
+                                "10% Sector Shock Impact (%)": data['impact_10'],
+                                "20% Sector Shock Impact (%)": data['impact_20']
+                            })
+                        sector_shock_df = pd.DataFrame(sector_shock_data)
+                        
+                        st.dataframe(sector_shock_df.style.format({
+                            'Sector Weight (%)': '{:.2f}%',
+                            '10% Sector Shock Impact (%)': '{:.2f}%',
+                            '20% Sector Shock Impact (%)': '{:.2f}%'
+                        }), use_container_width=True)
+                        
+                        st.subheader("Interest Rate Scenarios")
+                        for scenario, description in stress_test_results['interest_rate'].items():
+                            st.write(f"**{scenario.replace('_', ' ').title()}:** {description}")
+                    else:
+                        st.info("Stress testing results could not be generated.")
+                else:
+                    st.info("Insufficient portfolio data or returns history for stress testing.")
             else:
                 st.info("Click 'Calculate Advanced Risk Metrics' to view detailed risk analysis.")
 
@@ -2075,9 +2192,9 @@ UNRATED_EXPOSURE <= 10""",
         with analysis_tabs[3]:
             st.markdown("### ⚖️ Custom Rule Validation Results")
             
-            # Re-run rule validation if needed
+            # Re-run rule validation if needed. This now uses the `rules_text` from the configuration.
             if st.button("Re-run Custom Rule Validation", key="rerun_custom_rules", use_container_width=True):
-                custom_rule_results = parse_and_validate_rules_enhanced(rules_text, results_df)
+                custom_rule_results = parse_and_validate_rules_enhanced(st.session_state.get("compliance_rules", ""), results_df)
                 st.session_state.custom_rule_results = custom_rule_results
             
             custom_rule_results = st.session_state.get("custom_rule_results", [])
@@ -2086,7 +2203,7 @@ UNRATED_EXPOSURE <= 10""",
                 st.info("No custom rules defined or analysis not yet run. Define rules in the configuration section and click 'Analyze Portfolio'.")
             else:
                 # Display overall compliance status
-                fail_count = sum(1 for r in custom_rule_results if r['status'] == '❌ FAIL')
+                fail_count = sum(1 for r in custom_rule_results if '❌ FAIL' in r['status']) # Check for '❌ FAIL'
                 total_rules = len(custom_rule_results)
                 
                 if fail_count == 0:
@@ -2098,7 +2215,7 @@ UNRATED_EXPOSURE <= 10""",
                 custom_rules_df = pd.DataFrame(custom_rule_results)
                 
                 # Style breaches for better visibility
-                def color_status(val):
+                def color_status_text(val):
                     if 'FAIL' in val:
                         return 'background-color: #ffebee'
                     elif 'Error' in val:
@@ -2109,7 +2226,7 @@ UNRATED_EXPOSURE <= 10""",
                         return ''
                 
                 st.dataframe(
-                    custom_rules_df[['rule_type', 'rule', 'status', 'details', 'severity']].style.applymap(color_status, subset=['status']),
+                    custom_rules_df[['rule_type', 'rule', 'status', 'details', 'severity']].style.applymap(color_status_text, subset=['status']),
                     use_container_width=True
                 )
         
@@ -2119,7 +2236,7 @@ UNRATED_EXPOSURE <= 10""",
             
             security_compliance_df = st.session_state.get("security_level_compliance")
             
-            if security_compliance_df.empty:
+            if security_compliance_df is None or security_compliance_df.empty: # Check if DataFrame is empty or None
                 st.info("Security-level compliance data is not available. Please upload a portfolio and run the analysis.")
             else:
                 # Overall compliance distribution
@@ -2130,6 +2247,7 @@ UNRATED_EXPOSURE <= 10""",
                     values=compliance_counts.values,
                     title='Overall Security Compliance Status Distribution',
                     hole=0.4,
+                    color='Overall Status', # Map color based on status
                     color_discrete_map={
                         '🟢 Excellent': 'green',
                         '🟡 Good': 'lightgreen',
@@ -2137,11 +2255,13 @@ UNRATED_EXPOSURE <= 10""",
                         '🔴 Poor': 'red'
                     }
                 )
+                fig_overall_status.update_traces(textposition='inside', textinfo='percent+label') # Added text info
                 st.plotly_chart(fig_overall_status, use_container_width=True)
                 
                 st.markdown("#### Detailed Security Compliance Table")
                 
                 # Display selected columns from security_compliance_df
+                # Ensure only columns that actually exist are included to prevent KeyError
                 display_cols = [
                     'Name', 'Symbol', 'Weight %', 'Stock Limit Status', 'Stock Limit Gap (%)',
                     'Stock Limit Utilization (%)', 'Liquidity Status', 'Liquidity Score',
@@ -2149,7 +2269,6 @@ UNRATED_EXPOSURE <= 10""",
                     'Concentration Risk', 'Compliance Score', 'Overall Status'
                 ]
                 
-                # Filter out columns that don't exist in the DataFrame
                 display_cols_filtered = [col for col in display_cols if col in security_compliance_df.columns]
                 
                 st.dataframe(
@@ -2163,13 +2282,13 @@ UNRATED_EXPOSURE <= 10""",
                         lambda x: ['background-color: #ffebee' if '❌ Breach' in str(val) else 
                                    'background-color: #fff3e0' if '⚠️ Low' in str(val) or '🟠 High' in str(val) or 'Below Threshold' in str(val) else 
                                    'background-color: #fffde7' if '🟡 Medium' in str(val) else '' for val in x],
-                        subset=['Stock Limit Status', 'Liquidity Status', 'Rating Compliance', 'Concentration Risk']
+                        subset=[col for col in ['Stock Limit Status', 'Liquidity Status', 'Rating Compliance', 'Concentration Risk'] if col in security_compliance_df.columns]
                     ).apply(
                         lambda x: ['background-color: #e8f5e9' if '🟢 Excellent' in str(val) else 
                                    'background-color: #fffde7' if '🟡 Good' in str(val) else 
                                    'background-color: #fff3e0' if '🟠 Fair' in str(val) else 
                                    'background-color: #ffebee' if '🔴 Poor' in str(val) else '' for val in x],
-                        subset=['Overall Status']
+                        subset=[col for col in ['Overall Status'] if col in security_compliance_df.columns]
                     ),
                     use_container_width=True
                 )
@@ -2180,7 +2299,7 @@ UNRATED_EXPOSURE <= 10""",
             
             concentration_metrics = st.session_state.get("concentration_analysis")
             
-            if concentration_metrics:
+            if concentration_metrics and any(not np.isnan(v) for v in concentration_metrics.values() if isinstance(v, (int, float))): # Check if metrics are not empty/NaN
                 col1, col2 = st.columns(2)
                 with col1:
                     st.markdown("#### Herfindahl-Hirschman Index (HHI)")
@@ -2200,9 +2319,9 @@ UNRATED_EXPOSURE <= 10""",
                 
                 with col2:
                     st.markdown("#### Diversification Metrics")
-                    st.metric("Effective Number of Stocks", f"{concentration_metrics.get('effective_n_stocks', 0):.1f}")
-                    st.metric("Effective Number of Sectors", f"{concentration_metrics.get('effective_n_sectors', 0):.1f}")
-                    st.metric("Gini Coefficient", f"{concentration_metrics.get('gini_coefficient', 0):.2f}")
+                    st.metric("Effective Number of Stocks", f"{concentration_metrics.get('effective_n_stocks', 0):.1f}" if not np.isnan(concentration_metrics.get('effective_n_stocks', np.nan)) else "N/A")
+                    st.metric("Effective Number of Sectors", f"{concentration_metrics.get('effective_n_sectors', 0):.1f}" if not np.isnan(concentration_metrics.get('effective_n_sectors', np.nan)) else "N/A")
+                    st.metric("Gini Coefficient", f"{concentration_metrics.get('gini_coefficient', 0):.2f}" if not np.isnan(concentration_metrics.get('gini_coefficient', np.nan)) else "N/A")
                 
                 st.markdown("#### Top Holdings Concentration")
                 top_concentration_data = {
@@ -2289,6 +2408,7 @@ UNRATED_EXPOSURE <= 10""",
                         'Low Liquidity': 'red'
                     }
                 )
+                fig_liquidity_pie.update_traces(textposition='inside', textinfo='percent+label') # Added text info
                 st.plotly_chart(fig_liquidity_pie, use_container_width=True)
                 
                 st.markdown("#### Detailed Security Liquidity (Top 20 by Low Liquidity)")
@@ -2378,7 +2498,7 @@ UNRATED_EXPOSURE <= 10""",
                     }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
                     report_content += sector_analysis.head(15).to_markdown() + "\n\n"
                     
-                    if 'Rating' in results_df.columns:
+                    if 'Rating' in results_df.columns and not results_df['Rating'].eq('UNKNOWN').all():
                         report_content += "### Credit Rating Distribution\n\n"
                         rating_analysis = results_df.groupby('Rating').agg({
                             'Weight %': 'sum',
@@ -2391,20 +2511,23 @@ UNRATED_EXPOSURE <= 10""",
                     advanced_metrics = st.session_state.get("advanced_metrics")
                     if advanced_metrics:
                         report_content += "### Key Risk Metrics\n\n"
-                        report_content += f"- **VaR (95%):** {(advanced_metrics.get('var_95', 0) * 100):.2f}%\n"
-                        report_content += f"- **Sharpe Ratio:** {advanced_metrics.get('sharpe_ratio', 0):.2f}\n"
-                        report_content += f"- **Beta:** {advanced_metrics.get('beta', 0):.2f}\n"
-                        report_content += f"- **Annualized Volatility:** {(advanced_metrics.get('portfolio_volatility', 0) * 100):.2f}%\n"
-                        report_content += f"- **Max Drawdown:** {(advanced_metrics.get('max_drawdown', 0) * 100):.2f}%\n\n"
+                        report_content += f"- **VaR (95%):** {(advanced_metrics.get('var_95', 0) * 100):.2f}%\n" if not np.isnan(advanced_metrics.get('var_95', np.nan)) else "- **VaR (95%):** N/A\n"
+                        report_content += f"- **Sharpe Ratio:** {advanced_metrics.get('sharpe_ratio', 0):.2f}\n" if not np.isnan(advanced_metrics.get('sharpe_ratio', np.nan)) else "- **Sharpe Ratio:** N/A\n"
+                        report_content += f"- **Beta:** {advanced_metrics.get('beta', 0):.2f}\n" if not np.isnan(advanced_metrics.get('beta', np.nan)) else "- **Beta:** N/A\n"
+                        report_content += f"- **Annualized Volatility:** {(advanced_metrics.get('portfolio_volatility', 0) * 100):.2f}%\n" if not np.isnan(advanced_metrics.get('portfolio_volatility', np.nan)) else "- **Annualized Volatility:** N/A\n"
+                        report_content += f"- **Max Drawdown:** {(advanced_metrics.get('max_drawdown', 0) * 100):.2f}%\n\n" if not np.isnan(advanced_metrics.get('max_drawdown', np.nan)) else "- **Max Drawdown:** N/A\n\n"
                     else:
                         report_content += "Risk metrics not calculated or available.\n\n"
                     
                     concentration_metrics = st.session_state.get("concentration_analysis")
-                    if concentration_metrics:
+                    if concentration_metrics and any(not np.isnan(v) for v in concentration_metrics.values() if isinstance(v, (int, float))):
                         report_content += "### Concentration Analysis\n\n"
                         report_content += f"- **Stock HHI:** {concentration_metrics.get('stock_hhi', 0):.0f} ({concentration_metrics.get('stock_hhi_category')})\n"
                         report_content += f"- **Sector HHI:** {concentration_metrics.get('sector_hhi', 0):.0f} ({concentration_metrics.get('sector_hhi_category')})\n"
                         report_content += f"- **Top 10 Holdings Weight:** {concentration_metrics.get('top_10_weight', 0):.2f}%\n\n"
+                    else:
+                        report_content += "Concentration analysis not available.\n\n"
+
 
                     report_content += "## ⚖️ Custom Rule Validation\n\n"
                     custom_rule_results = st.session_state.get("custom_rule_results", [])
@@ -2443,12 +2566,18 @@ UNRATED_EXPOSURE <= 10""",
                 st.success("Report generation complete!")
 
 # Render tabs
-with tab_market:
+# Ensure k and kite_access_token are valid before calling render functions
+if st.session_state["kite_access_token"]:
     render_market_historical_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
-
-with tab_compliance:
+    render_investment_compliance_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
+else:
+    # Render tabs with a warning if not authenticated, as the render functions handle the `None` case
+    st.info("Please connect your Kite account in the sidebar to use Market & Technical Analysis and Investment Compliance Pro tabs.")
+    # Still call the render functions so the UI loads, but they will display their own auth warnings.
+    render_market_historical_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
     render_investment_compliance_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
 
+# AI tab always renders, but its content depends on compliance_results_df
 with tab_ai:
     # AI Analysis tab implementation
     st.header("🤖 AI-Powered Compliance Analysis")
