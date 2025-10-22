@@ -654,9 +654,9 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, rules_config
     if 'Industry' in security_compliance.columns:
         sector_totals = security_compliance.groupby('Industry')['Weight %'].sum()
         security_compliance['Sector Weight'] = security_compliance['Industry'].map(sector_totals)
-        # Avoid division by zero if sector_totals has a zero for a sector
+        # Fix: Ensure the result of the division is cast to a float before calling .round()
         security_compliance['% of Sector'] = security_compliance.apply(
-            lambda row: (row['Weight %'] / row['Sector Weight'] * 100).round(2) if row['Sector Weight'] > 0 else 0.0,
+            lambda row: (float(row['Weight %']) / row['Sector Weight'] * 100).round(2) if row['Sector Weight'] > 0 else 0.0,
             axis=1
         )
     else:
@@ -2502,7 +2502,6 @@ UNRATED_EXPOSURE <= 10""",
                         report_content += "### Credit Rating Distribution\n\n"
                         rating_analysis = results_df.groupby('Rating').agg({
                             'Weight %': 'sum',
-                            'Symbol': 'count',
                             'Real-time Value (Rs)': 'sum'
                         }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
                         report_content += rating_analysis.to_markdown() + "\n\n"
