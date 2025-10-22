@@ -2020,8 +2020,8 @@ UNRATED_EXPOSURE <= 10""",
                         'Avg Weight per Stock': '{:.2f}%'
                     }),
                     use_container_width=True
-                )
+)
             
-            with detail_subtabs[2]:
-                if 'Rating' in results_df.columns:
-                    st.markdown("####)
+with detail_subtabs[2]:
+    if 'Rating' in results_df.columns:
+        st.markdown("#### Rating")
