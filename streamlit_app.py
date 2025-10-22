@@ -654,7 +654,8 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, rules_config
     if 'Industry' in security_compliance.columns:
         sector_totals = security_compliance.groupby('Industry')['Weight %'].sum()
         security_compliance['Sector Weight'] = security_compliance['Industry'].map(sector_totals)
-        # Fix: Ensure the result of the division is cast to a float before calling .round()
+        # Avoid division by zero if sector_totals has a zero for a sector
+        # Convert to float before applying .round()
         security_compliance['% of Sector'] = security_compliance.apply(
             lambda row: (float(row['Weight %']) / row['Sector Weight'] * 100).round(2) if row['Sector Weight'] > 0 else 0.0,
             axis=1
@@ -2194,25 +2195,34 @@ UNRATED_EXPOSURE <= 10""",
             
             # Re-run rule validation if needed. This now uses the `rules_text` from the configuration.
             if st.button("Re-run Custom Rule Validation", key="rerun_custom_rules", use_container_width=True):
-                custom_rule_results = parse_and_validate_rules_enhanced(st.session_state.get("compliance_rules", ""), results_df)
-                st.session_state.custom_rule_results = custom_rule_results
+                custom_rule_results_list = parse_and_validate_rules_enhanced(st.session_state.get("compliance_rules", ""), results_df)
+                st.session_state.custom_rule_results = custom_rule_results_list
             
-            custom_rule_results = st.session_state.get("custom_rule_results", [])
+            custom_rule_results_data = st.session_state.get("custom_rule_results", [])
             
-            if not custom_rule_results:
+            # Check if it's a DataFrame and if it's empty, or if it's a list and empty
+            if isinstance(custom_rule_results_data, pd.DataFrame):
+                is_empty = custom_rule_results_data.empty
+            else: # Assume it's a list (or other iterable)
+                is_empty = not custom_rule_results_data
+
+            if is_empty:
                 st.info("No custom rules defined or analysis not yet run. Define rules in the configuration section and click 'Analyze Portfolio'.")
             else:
+                # If it's a list of dicts, convert it to DataFrame here for consistency
+                if isinstance(custom_rule_results_data, list):
+                    custom_rules_df = pd.DataFrame(custom_rule_results_data)
+                else: # It's already a DataFrame
+                    custom_rules_df = custom_rule_results_data
+
                 # Display overall compliance status
-                fail_count = sum(1 for r in custom_rule_results if '❌ FAIL' in r['status']) # Check for '❌ FAIL'
-                total_rules = len(custom_rule_results)
+                fail_count = sum(1 for status_val in custom_rules_df['status'] if '❌ FAIL' in status_val)
+                total_rules = len(custom_rules_df)
                 
                 if fail_count == 0:
                     st.success(f"✅ All {total_rules} custom rules passed!")
                 else:
                     st.warning(f"⚠️ {fail_count} out of {total_rules} custom rules failed!")
-                
-                # Create DataFrame for display
-                custom_rules_df = pd.DataFrame(custom_rule_results)
                 
                 # Style breaches for better visibility
                 def color_status_text(val):
@@ -2529,10 +2539,18 @@ UNRATED_EXPOSURE <= 10""",
 
 
                     report_content += "## ⚖️ Custom Rule Validation\n\n"
-                    custom_rule_results = st.session_state.get("custom_rule_results", [])
-                    if custom_rule_results:
-                        custom_rules_df = pd.DataFrame(custom_rule_results)
-                        report_content += custom_rules_df[['rule_type', 'rule', 'status', 'details', 'severity']].to_markdown(index=False) + "\n\n"
+                    custom_rule_results_data = st.session_state.get("custom_rule_results", [])
+                    
+                    # Ensure custom_rules_df is created for the report
+                    if isinstance(custom_rule_results_data, list) and custom_rule_results_data:
+                        custom_rules_df_report = pd.DataFrame(custom_rule_results_data)
+                    elif isinstance(custom_rule_results_data, pd.DataFrame) and not custom_rule_results_data.empty:
+                        custom_rules_df_report = custom_rule_results_data
+                    else:
+                        custom_rules_df_report = pd.DataFrame() # Empty DataFrame if no results
+
+                    if not custom_rules_df_report.empty:
+                        report_content += custom_rules_df_report[['rule_type', 'rule', 'status', 'details', 'severity']].to_markdown(index=False) + "\n\n"
                     else:
                         report_content += "No custom rule validation results available.\n\n"
                     
