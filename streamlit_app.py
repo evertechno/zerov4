@@ -1789,7 +1789,7 @@ UNRATED_EXPOSURE <= 10""",
                     hole=0.4,
                     color_discrete_sequence=px.colors.qualitative.Set3
                 )
-                fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                fig_pie.update_traces(textposition='inside', textinfo='percent+label') # Added text info
                 fig_pie.update_layout(showlegend=False, height=400)
                 st.plotly_chart(fig_pie, use_container_width=True)
             
@@ -2565,19 +2565,16 @@ UNRATED_EXPOSURE <= 10""",
                     
                 st.success("Report generation complete!")
 
-# Render tabs
-# Ensure k and kite_access_token are valid before calling render functions
-if st.session_state["kite_access_token"]:
+# --- Render Tabs (Corrected Structure) ---
+# Each tab's content must be within its respective 'with' block.
+# This was the primary cause of the merging issue.
+
+with tab_market:
     render_market_historical_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
-    render_investment_compliance_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
-else:
-    # Render tabs with a warning if not authenticated, as the render functions handle the `None` case
-    st.info("Please connect your Kite account in the sidebar to use Market & Technical Analysis and Investment Compliance Pro tabs.")
-    # Still call the render functions so the UI loads, but they will display their own auth warnings.
-    render_market_historical_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
+
+with tab_compliance:
     render_investment_compliance_tab(k, KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
 
-# AI tab always renders, but its content depends on compliance_results_df
 with tab_ai:
     # AI Analysis tab implementation
     st.header("🤖 AI-Powered Compliance Analysis")
