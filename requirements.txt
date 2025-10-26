@@ -9,3 +9,4 @@ matplotlib
 resend
 PyMuPDF 
 google-generativeai
+psycopg2
