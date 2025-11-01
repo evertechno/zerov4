@@ -16,3 +16,4 @@
 
     # File Parsing
     PyMuPDF
+ta
