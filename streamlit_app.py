@@ -401,16 +401,15 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, rules_config
 
 
 def calculate_advanced_metrics(portfolio_df, api_key, access_token):
-    """Enhanced advanced metrics calculation"""
+    """Enhanced advanced metrics calculation with fix for dimension mismatch."""
     symbols = portfolio_df['Symbol'].tolist()
-    weights = (portfolio_df['Real-time Value (Rs)'] / portfolio_df['Real-time Value (Rs)'].sum()).values
     from_date = datetime.now().date() - timedelta(days=366)
     to_date = datetime.now().date()
     
     returns_df = pd.DataFrame()
     failed_symbols = []
     
-    progress_bar = st.progress(0, "Fetching historical data for metrics...")
+    progress_bar = st.progress(0, text="Fetching historical data for metrics...")
     
     for i, symbol in enumerate(symbols):
         hist_data = get_historical_data_cached(api_key, access_token, symbol, from_date, to_date, 'day')
@@ -418,20 +417,40 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
             returns_df[symbol] = hist_data['close'].pct_change()
         else:
             failed_symbols.append(symbol)
-        progress_bar.progress((i + 1) / len(symbols), f"Fetching data for {symbol}...")
+        progress_bar.progress((i + 1) / len(symbols), text=f"Fetching data for {symbol}...")
     
     if failed_symbols:
-        st.warning(f"Could not fetch historical data for: {', '.join(failed_symbols)}. They will be excluded.")
+        st.warning(f"Could not fetch historical data for: {', '.join(failed_symbols)}. They will be excluded from advanced metrics calculation.")
     
     returns_df.dropna(how='all', inplace=True)
     returns_df.fillna(0, inplace=True)
     
     if returns_df.empty:
         st.error("Not enough historical data to calculate advanced metrics.")
+        progress_bar.empty()
         return None
     
-    # Portfolio returns
+    # --- FIX STARTS HERE ---
+    
+    # 1. Get symbols with successful data fetch from returns_df columns
+    successful_symbols = returns_df.columns.tolist()
+    
+    # 2. Filter and reorder the original portfolio to match returns_df exactly
+    portfolio_df_success = portfolio_df.set_index('Symbol').reindex(successful_symbols).reset_index()
+
+    # 3. Recalculate weights based ONLY on the successful assets to ensure sum is 1
+    total_value_success = portfolio_df_success['Real-time Value (Rs)'].sum()
+    if total_value_success == 0:
+        st.error("The total value of assets with available historical data is zero. Cannot calculate metrics.")
+        progress_bar.empty()
+        return None
+        
+    weights = (portfolio_df_success['Real-time Value (Rs)'] / total_value_success).values
+    
+    # Now the order and length of `weights` matches the columns of `returns_df`
     portfolio_returns = returns_df.dot(weights)
+
+    # --- FIX ENDS HERE ---
     
     # VaR calculations
     var_95 = portfolio_returns.quantile(0.05)
@@ -441,46 +460,45 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
     # Benchmark data
     benchmark_data = get_historical_data_cached(api_key, access_token, BENCHMARK_SYMBOL, from_date, to_date, 'day')
     
-    if benchmark_data.empty or '_error' in benchmark_data.columns:
-        st.error(f"Could not fetch benchmark data. Beta cannot be calculated.")
-        portfolio_beta = None
-        alpha = None
-        tracking_error = None
-        information_ratio = None
-    else:
+    portfolio_beta = None
+    alpha = None
+    tracking_error = None
+    information_ratio = None
+    
+    if not benchmark_data.empty and '_error' not in benchmark_data.columns:
         benchmark_returns = benchmark_data['close'].pct_change()
+        # Align returns and drop NaNs from merging and pct_change
         aligned_returns = pd.concat([portfolio_returns, benchmark_returns], axis=1, join='inner').dropna()
         aligned_returns.columns = ['portfolio', 'benchmark']
         
-        # Beta
-        covariance = aligned_returns.cov().iloc[0, 1]
-        benchmark_variance = aligned_returns['benchmark'].var()
-        portfolio_beta = covariance / benchmark_variance if benchmark_variance > 0 else None
-        
-        # Alpha (annualized)
-        portfolio_annual_return = ((1 + aligned_returns['portfolio'].mean()) ** 252 - 1)
-        benchmark_annual_return = ((1 + aligned_returns['benchmark'].mean()) ** 252 - 1)
-        risk_free_rate = 0.06  # 6% assumed
-        
-        if portfolio_beta:
-            alpha = portfolio_annual_return - (risk_free_rate + portfolio_beta * (benchmark_annual_return - risk_free_rate))
-        else:
-            alpha = None
-        
-        # Tracking Error
-        tracking_diff = aligned_returns['portfolio'] - aligned_returns['benchmark']
-        tracking_error = tracking_diff.std() * np.sqrt(252)
-        
-        # Information Ratio
-        if tracking_error and tracking_error > 0:
-            information_ratio = (portfolio_annual_return - benchmark_annual_return) / tracking_error
-        else:
-            information_ratio = None
-    
+        if not aligned_returns.empty:
+            # Beta
+            covariance = aligned_returns.cov().iloc[0, 1]
+            benchmark_variance = aligned_returns['benchmark'].var()
+            portfolio_beta = covariance / benchmark_variance if benchmark_variance > 0 else None
+            
+            # Alpha (annualized)
+            portfolio_annual_return = ((1 + aligned_returns['portfolio'].mean()) ** TRADING_DAYS_PER_YEAR - 1)
+            benchmark_annual_return = ((1 + aligned_returns['benchmark'].mean()) ** TRADING_DAYS_PER_YEAR - 1)
+            risk_free_rate = 0.06  # 6% assumed
+            
+            if portfolio_beta is not None:
+                alpha = portfolio_annual_return - (risk_free_rate + portfolio_beta * (benchmark_annual_return - risk_free_rate))
+            
+            # Tracking Error
+            tracking_diff = aligned_returns['portfolio'] - aligned_returns['benchmark']
+            tracking_error = tracking_diff.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+            
+            # Information Ratio
+            if tracking_error is not None and tracking_error > 0:
+                information_ratio = (portfolio_annual_return - benchmark_annual_return) / tracking_error
+    else:
+        st.error(f"Could not fetch benchmark data for {BENCHMARK_SYMBOL}. Beta, Alpha, and related metrics cannot be calculated.")
+
     # Sortino Ratio
     downside_returns = portfolio_returns[portfolio_returns < 0]
-    downside_std = downside_returns.std() * np.sqrt(252) if len(downside_returns) > 0 else 0
-    portfolio_annual_return = ((1 + portfolio_returns.mean()) ** 252 - 1)
+    downside_std = downside_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) if len(downside_returns) > 0 else 0
+    portfolio_annual_return = ((1 + portfolio_returns.mean()) ** TRADING_DAYS_PER_YEAR - 1)
     sortino_ratio = (portfolio_annual_return - 0.06) / downside_std if downside_std > 0 else None
     
     # Correlation matrix
@@ -488,8 +506,8 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
     avg_correlation = correlation_matrix.values[np.triu_indices_from(correlation_matrix.values, k=1)].mean()
     
     # Diversification ratio
-    portfolio_vol = portfolio_returns.std() * np.sqrt(252)
-    weighted_vol = np.sum(weights * returns_df.std() * np.sqrt(252))
+    portfolio_vol = portfolio_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+    weighted_vol = np.sum(weights * returns_df.std() * np.sqrt(TRADING_DAYS_PER_YEAR))
     diversification_ratio = weighted_vol / portfolio_vol if portfolio_vol > 0 else None
     
     progress_bar.empty()
@@ -1088,7 +1106,7 @@ def render_investment_compliance_tab(kite_client, api_key, access_token):
                                    f"{metrics['cvar_95'] * 100:.2f}%",
                                    help="Expected loss beyond VaR threshold")
                 risk_cols[3].metric("Portfolio Volatility", 
-                                   f"{metrics['portfolio_volatility']:.2f}%",
+                                   f"{metrics['portfolio_volatility'] * 100:.2f}%" if metrics['portfolio_volatility'] is not None else "N/A",
                                    help="Annualized standard deviation")
                 
                 st.markdown("#### Performance Metrics")
@@ -1110,7 +1128,7 @@ def render_investment_compliance_tab(kite_client, api_key, access_token):
                 
                 if metrics['tracking_error'] is not None:
                     perf_cols[2].metric("Tracking Error", 
-                                       f"{metrics['tracking_error']:.2f}%",
+                                       f"{metrics['tracking_error'] * 100:.2f}%",
                                        help="Standard deviation of active returns")
                 else:
                     perf_cols[2].metric("Tracking Error", "N/A")
@@ -1567,8 +1585,8 @@ def render_investment_compliance_tab(kite_client, api_key, access_token):
                             from io import BytesIO
                             output = BytesIO()
                             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                                for sheet_name, df in report_data.items():
-                                    df.to_excel(writer, sheet_name=sheet_name[:31], index=True)
+                                for sheet_name, df_sheet in report_data.items():
+                                    df_sheet.to_excel(writer, sheet_name=sheet_name[:31], index=False)
                             
                             output.seek(0)
                             st.download_button(
@@ -1580,7 +1598,7 @@ def render_investment_compliance_tab(kite_client, api_key, access_token):
                             )
                         else:
                             # Combine all dataframes for CSV
-                            combined_df = pd.concat([df.assign(Section=name) for name, df in report_data.items()], 
+                            combined_df = pd.concat([df_sheet.assign(Section=name) for name, df_sheet in report_data.items()], 
                                                     ignore_index=True)
                             csv = combined_df.to_csv(index=False).encode('utf-8')
                             st.download_button(
@@ -1842,7 +1860,7 @@ Begin your analysis now:
 
                     # Call Gemini API
                     with st.spinner("🤖 AI is analyzing your portfolio... This may take 30-60 seconds."):
-                        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+                        model = genai.GenerativeModel('gemini-1.5-flash')
                         
                         safety_settings = [
                             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
