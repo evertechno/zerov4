@@ -1,746 +1,763 @@
-# app.py
-# Invsion Connect — Single-file Streamlit app
-# - Supabase Auth (login/signup) + per-user persistent saves
-# - KiteConnect login (to fetch holdings & prices)
-# - Compliance engine + advanced risk analytics
-# - Gemini AI (Google GenerativeAI) for SID/KIM-based analysis
-# - FULL payload save: portfolio, breaches, rules, security-level checks, risk metrics, treemap & concentration, AI output
-
-import os
-import re
-import json
-import base64
-from datetime import datetime, timedelta
-
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import json
+import re
+import time
+from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-import ta  # pip install ta
-import fitz  # PyMuPDF
+import numpy as np
+import ta  # Technical Analysis library
+import base64
+import fitz # PyMuPDF for reading PDFs
 
-# --- External SDKs (hard dependencies) ---
+# --- AI Imports ---
 try:
     import google.generativeai as genai
+    from google.generativeai import types
 except ImportError:
-    st.error("Missing dependency: google-generativeai. Install with: pip install google-generativeai")
+    st.error("Google Generative AI library not found. Please install it using `pip install google-generativeai`.")
     st.stop()
-
+    
+# --- KiteConnect Imports ---
 try:
     from kiteconnect import KiteConnect
 except ImportError:
-    st.error("Missing dependency: kiteconnect. Install with: pip install kiteconnect")
+    st.error("KiteConnect library not found. Please install it using `pip install kiteconnect`.")
     st.stop()
 
-try:
-    from supabase import create_client, Client
-except ImportError:
-    st.error("Missing dependency: supabase. Install with: pip install supabase")
-    st.stop()
 
-# --- Page ---
-st.set_page_config(
-    page_title="Invsion Connect - Compliance & AI Analysis",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# --- Streamlit Page Configuration ---
+st.set_page_config(page_title="Invsion Connect - Portfolio Analysis", layout="wide", initial_sidebar_state="expanded")
 st.title("Invsion Connect")
-st.caption("Professional Portfolio Compliance & Analysis Platform (Supabase + Kite + Gemini)")
+st.markdown("A comprehensive platform for fetching market data, validating investment compliance, and AI-powered analysis.")
 
-# --- Constants / Session Defaults ---
+# --- Global Constants & Session State Initialization ---
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_EXCHANGE = "NSE"
 BENCHMARK_SYMBOL = "NIFTY 50"
 
-_defaults = {
-    "kite_access_token": None,
-    "kite_login_response": None,
-    "holdings_data": None,
-    "compliance_results_df": pd.DataFrame(),
-    "security_level_compliance": pd.DataFrame(),
-    "advanced_metrics": None,
-    "ai_analysis_response": None,
-    "breach_alerts": [],
-    "cfg_thresholds": {},
-    "last_concentration": {},
-    "last_validation_results": [],
-    "sb_client": None,
-    "sb_user": None,
-    "sb_session": None,
-    "last_saved_run_id": None
-}
-for k, v in _defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+# Initialize session state variables
+if "kite_access_token" not in st.session_state: st.session_state["kite_access_token"] = None
+if "kite_login_response" not in st.session_state: st.session_state["kite_login_response"] = None
+if "instruments_df" not in st.session_state: st.session_state["instruments_df"] = pd.DataFrame()
+if "historical_data" not in st.session_state: st.session_state["historical_data"] = pd.DataFrame()
+if "last_fetched_symbol" not in st.session_state: st.session_state["last_fetched_symbol"] = None
+if "current_market_data" not in st.session_state: st.session_state["current_market_data"] = None
+if "holdings_data" not in st.session_state: st.session_state["holdings_data"] = None
+if "compliance_results_df" not in st.session_state: st.session_state["compliance_results_df"] = pd.DataFrame()
+if "advanced_metrics" not in st.session_state: st.session_state["advanced_metrics"] = None
+if "ai_analysis_response" not in st.session_state: st.session_state["ai_analysis_response"] = None
+if "security_level_compliance" not in st.session_state: st.session_state["security_level_compliance"] = pd.DataFrame()
+if "breach_alerts" not in st.session_state: st.session_state["breach_alerts"] = []
 
-# --- Credentials loader: supports Streamlit secrets or ENV ---
-def _get_conf():
-    # Prefer st.secrets, fallback to env
-    def gs(path, default=None):
-        try:
-            return st.secrets.get(path.split(":")[0], {}).get(path.split(":")[1], default)
-        except Exception:
-            return default
 
-    kite_api_key = gs("kite:api_key", os.getenv("KITE_API_KEY"))
-    kite_api_secret = gs("kite:api_secret", os.getenv("KITE_API_SECRET"))
-    kite_redirect = gs("kite:redirect_uri", os.getenv("KITE_REDIRECT_URI"))
+# --- Load Credentials from Streamlit Secrets ---
+def load_secrets():
+    secrets = st.secrets
+    kite_conf = secrets.get("kite", {})
+    gemini_conf = secrets.get("google_gemini", {})
+    
+    errors = []
+    if not kite_conf.get("api_key") or not kite_conf.get("api_secret") or not kite_conf.get("redirect_uri"):
+        errors.append("Kite credentials (api_key, api_secret, redirect_uri)")
+    if not gemini_conf.get("api_key"):
+        errors.append("Google Gemini API key")
 
-    gemini_key = gs("google_gemini:api_key", os.getenv("GEMINI_API_KEY"))
-
-    sb_url = gs("supabase:url", os.getenv("SUPABASE_URL"))
-    sb_anon = gs("supabase:anon_key", os.getenv("SUPABASE_ANON_KEY"))
-
-    missing = []
-    if not kite_api_key or not kite_api_secret or not kite_redirect:
-        missing.append("Kite (api_key, api_secret, redirect_uri)")
-    if not gemini_key:
-        missing.append("Gemini (api_key)")
-    if not sb_url or not sb_anon:
-        missing.append("Supabase (url, anon_key)")
-
-    if missing:
-        st.error("Missing credentials. Provide via `.streamlit/secrets.toml` or environment variables.\nMissing: " + ", ".join(missing))
+    if errors:
+        st.error(f"Missing required credentials in `.streamlit/secrets.toml`: {', '.join(errors)}.")
+        st.info("Ensure your `secrets.toml` includes both [kite] and [google_gemini] sections.")
         st.stop()
+    return kite_conf, gemini_conf
 
-    return {
-        "kite": {"api_key": kite_api_key, "api_secret": kite_api_secret, "redirect_uri": kite_redirect},
-        "gemini": {"api_key": gemini_key},
-        "supabase": {"url": sb_url, "anon_key": sb_anon}
-    }
+KITE_CREDENTIALS, GEMINI_CREDENTIALS = load_secrets()
+genai.configure(api_key=GEMINI_CREDENTIALS["api_key"])
 
-CONF = _get_conf()
-genai.configure(api_key=CONF["gemini"]["api_key"])
 
-# --- Supabase client ---
-@st.cache_resource(show_spinner=False)
-def _sb_client(url, anon) -> Client:
-    return create_client(url, anon)
-
-st.session_state["sb_client"] = _sb_client(CONF["supabase"]["url"], CONF["supabase"]["anon_key"])
-
-# --- Supabase auth helpers ---
-def sb_signup(email: str, password: str):
-    try:
-        return st.session_state["sb_client"].auth.sign_up({"email": email, "password": password})
-    except Exception as e:
-        st.error(f"Sign up failed: {e}")
-        return None
-
-def sb_login(email: str, password: str):
-    try:
-        res = st.session_state["sb_client"].auth.sign_in_with_password({"email": email, "password": password})
-        st.session_state["sb_session"] = res.session
-        st.session_state["sb_user"] = res.user
-        return res
-    except Exception as e:
-        st.error(f"Login failed: {e}")
-        return None
-
-def sb_logout():
-    try:
-        st.session_state["sb_client"].auth.sign_out()
-    except Exception as e:
-        st.warning(f"Sign out warning: {e}")
-    st.session_state["sb_session"] = None
-    st.session_state["sb_user"] = None
-
-def require_sb_user() -> bool:
-    if not st.session_state["sb_user"]:
-        st.warning("Please login to Supabase to save your runs.")
-        return False
-    return True
-
-def dictify_df(df):
-    if df is None or isinstance(df, bool):
-        return None
-    if isinstance(df, pd.DataFrame):
-        return df.to_dict(orient="records")
-    return None
-
-def save_full_payload_to_supabase(run_label: str | None, payload: dict):
-    if not require_sb_user():
-        return None
-    try:
-        data = {
-            "user_id": st.session_state["sb_user"].id,
-            "run_label": run_label,
-            "payload": payload
-        }
-        # Requires table: analysis_runs(id, user_id uuid, created_at timestamptz default now(), run_label text, payload jsonb)
-        res = st.session_state["sb_client"].table("analysis_runs").insert(data).execute()
-        if hasattr(res, "data") and res.data:
-            rid = res.data[0].get("id")
-            st.session_state["last_saved_run_id"] = rid
-            st.success(f"✅ Saved analysis run (ID: {rid})")
-            return rid
-        st.warning("Insert returned no data — check Supabase RLS/permissions.")
-        return None
-    except Exception as e:
-        st.error(f"Supabase save failed: {e}")
-        return None
-
-# --- KiteConnect ---
+# --- KiteConnect Client Initialization ---
 @st.cache_resource(ttl=3600)
-def _kc(api_key: str) -> KiteConnect:
+def init_kite_unauth_client(api_key: str) -> KiteConnect:
     return KiteConnect(api_key=api_key)
 
-kite_unauth = _kc(CONF["kite"]["api_key"])
-login_url = kite_unauth.login_url()
+kite_unauth_client = init_kite_unauth_client(KITE_CREDENTIALS["api_key"])
+login_url = kite_unauth_client.login_url()
 
-def get_kite_auth_client(api_key: str, access_token: str | None) -> KiteConnect | None:
-    if not access_token:
-        return None
-    kc = KiteConnect(api_key=api_key)
-    kc.set_access_token(access_token)
-    return kc
+# --- Utility Functions ---
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_instruments_cached(api_key: str, access_token: str, exchange: str | None = None) -> pd.DataFrame:
-    kc = get_kite_auth_client(api_key, access_token)
-    if not kc:
-        return pd.DataFrame({"_error": ["Kite not authenticated."]})
+def get_authenticated_kite_client(api_key: str | None, access_token: str | None) -> KiteConnect | None:
+    if api_key and access_token:
+        k_instance = KiteConnect(api_key=api_key)
+        k_instance.set_access_token(access_token)
+        return k_instance
+    return None
+
+@st.cache_data(ttl=86400, show_spinner="Loading instruments...")
+def load_instruments_cached(api_key: str, access_token: str, exchange: str = None) -> pd.DataFrame:
+    kite_instance = get_authenticated_kite_client(api_key, access_token)
+    if not kite_instance: return pd.DataFrame({"_error": ["Kite not authenticated."]})
     try:
-        data = kc.instruments(exchange) if exchange else kc.instruments()
-        df = pd.DataFrame(data)
-        if "instrument_token" in df.columns:
-            df["instrument_token"] = df["instrument_token"].astype("int64")
-        sel = ['instrument_token', 'tradingsymbol', 'name', 'exchange']
-        df = df[[c for c in sel if c in df.columns]]
+        instruments = kite_instance.instruments(exchange) if exchange else kite_instance.instruments()
+        df = pd.DataFrame(instruments)
+        if "instrument_token" in df.columns: df["instrument_token"] = df["instrument_token"].astype("int64")
+        if 'tradingsymbol' in df.columns and 'name' in df.columns: df = df[['instrument_token', 'tradingsymbol', 'name', 'exchange']]
         return df
-    except Exception as e:
-        return pd.DataFrame({"_error": [f"Failed to load instruments: {e}"]})
+    except Exception as e: return pd.DataFrame({"_error": [f"Failed to load instruments: {e}"]})
 
-def _find_instrument_token(df: pd.DataFrame, symbol: str, exchange: str = DEFAULT_EXCHANGE) -> int | None:
-    if df.empty:
-        return None
-    ex = df.get("exchange", pd.Series(dtype=str)).astype(str).str.upper()
-    ts = df.get("tradingsymbol", pd.Series(dtype=str)).astype(str).str.upper()
-    mask = (ex == exchange.upper()) & (ts == symbol.upper())
-    hits = df[mask]
-    if hits.empty:
-        return None
-    return int(hits.iloc[0]["instrument_token"])
+@st.cache_data(ttl=60)
+def get_ltp_price_cached(api_key: str, access_token: str, symbol: str, exchange: str = DEFAULT_EXCHANGE):
+    kite_instance = get_authenticated_kite_client(api_key, access_token)
+    if not kite_instance: return {"_error": "Kite not authenticated."}
+    try: return kite_instance.ltp([f"{exchange.upper()}:{symbol.upper()}"]).get(f"{exchange.upper()}:{symbol.upper()}")
+    except Exception as e: return {"_error": str(e)}
 
 @st.cache_data(ttl=3600)
-def get_historical_data_cached(api_key: str, access_token: str, symbol: str,
-                               from_date: datetime.date, to_date: datetime.date,
-                               interval: str, exchange: str = DEFAULT_EXCHANGE) -> pd.DataFrame:
-    kc = get_kite_auth_client(api_key, access_token)
-    if not kc:
-        return pd.DataFrame({"_error": ["Kite not authenticated."]})
+def get_historical_data_cached(api_key: str, access_token: str, symbol: str, from_date: datetime.date, to_date: datetime.date, interval: str, exchange: str = DEFAULT_EXCHANGE) -> pd.DataFrame:
+    kite_instance = get_authenticated_kite_client(api_key, access_token)
+    if not kite_instance: return pd.DataFrame({"_error": ["Kite not authenticated."]})
     instruments_df = load_instruments_cached(api_key, access_token)
-    token = _find_instrument_token(instruments_df, symbol, exchange)
+    token = find_instrument_token(instruments_df, symbol, exchange)
     if not token and symbol in ["NIFTY BANK", "NIFTYBANK", "BANKNIFTY", BENCHMARK_SYMBOL, "SENSEX"]:
-        index_exchange = "NSE" if symbol != "SENSEX" else "BSE"
+        index_exchange = "NSE" if symbol not in ["SENSEX"] else "BSE"
         instruments_secondary = load_instruments_cached(api_key, access_token, index_exchange)
-        token = _find_instrument_token(instruments_secondary, symbol, index_exchange)
-    if not token:
-        return pd.DataFrame({"_error": [f"Instrument token not found for {symbol}."]})
+        token = find_instrument_token(instruments_secondary, symbol, index_exchange)
+    if not token: return pd.DataFrame({"_error": [f"Instrument token not found for {symbol}."]})
     try:
-        data = kc.historical_data(
-            token,
-            from_date=datetime.combine(from_date, datetime.min.time()),
-            to_date=datetime.combine(to_date, datetime.max.time()),
-            interval=interval
-        )
+        data = kite_instance.historical_data(token, from_date=datetime.combine(from_date, datetime.min.time()), to_date=datetime.combine(to_date, datetime.max.time()), interval=interval)
         df = pd.DataFrame(data)
         if not df.empty:
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.set_index("date").sort_index()
-            cols = ['open', 'high', 'low', 'close', 'volume']
-            df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
-            df = df.dropna(subset=['close'])
+            df["date"] = pd.to_datetime(df["date"]); df.set_index("date", inplace=True); df.sort_index(inplace=True)
+            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric, errors='coerce'); df.dropna(subset=['close'], inplace=True)
         return df
-    except Exception as e:
-        return pd.DataFrame({"_error": [str(e)]})
+    except Exception as e: return pd.DataFrame({"_error": [str(e)]})
 
-# --- Performance metrics (basic) ---
+def find_instrument_token(df: pd.DataFrame, tradingsymbol: str, exchange: str = DEFAULT_EXCHANGE) -> int | None:
+    if df.empty: return None
+    mask = (df.get("exchange", "").str.upper() == exchange.upper()) & (df.get("tradingsymbol", "").str.upper() == tradingsymbol.upper())
+    hits = df[mask]
+    return int(hits.iloc[0]["instrument_token"]) if not hits.empty else None
+
+def add_technical_indicators(df: pd.DataFrame, sma_periods, ema_periods, rsi_window, macd_fast, macd_slow, macd_signal, bb_window, bb_std_dev) -> pd.DataFrame:
+    if df.empty or 'close' not in df.columns: return df.copy()
+    df_copy = df.copy()
+    for period in sma_periods:
+        if period > 0: df_copy[f'SMA_{period}'] = ta.trend.sma_indicator(df_copy['close'], window=period)
+    for period in ema_periods:
+        if period > 0: df_copy[f'EMA_{period}'] = ta.trend.ema_indicator(df_copy['close'], window=period)
+    df_copy['RSI'] = ta.momentum.rsi(df_copy['close'], window=rsi_window)
+    macd_obj = ta.trend.MACD(df_copy['close'], window_fast=macd_fast, window_slow=macd_slow, window_sign=macd_signal)
+    df_copy['MACD'], df_copy['MACD_signal'], df_copy['MACD_hist'] = macd_obj.macd(), macd_obj.macd_signal(), macd_obj.macd_diff()
+    bollinger = ta.volatility.BollingerBands(df_copy['close'], window=bb_window, window_dev=bb_std_dev)
+    df_copy['Bollinger_High'], df_copy['Bollinger_Low'], df_copy['Bollinger_Mid'], df_copy['Bollinger_Width'] = bollinger.bollinger_hband(), bollinger.bollinger_lband(), bollinger.bollinger_mavg(), bollinger.bollinger_wband()
+    df_copy['Daily_Return'] = df_copy['close'].pct_change() * 100
+    df_copy.fillna(method='bfill', inplace=True); df_copy.fillna(method='ffill', inplace=True)
+    return df_copy.dropna()
+
 def calculate_performance_metrics(returns_series: pd.Series, risk_free_rate: float = 0.0) -> dict:
-    if returns_series.empty or len(returns_series) < 2:
-        return {}
-    daily = returns_series.replace([np.inf, -np.inf], np.nan).dropna()
-    if daily.empty:
-        return {}
-    cumret = (1 + daily).cumprod() - 1
-    total_return = float((cumret.iloc[-1] * 100) if not cumret.empty else 0)
-    ann_return = float(((1 + daily.mean()) ** TRADING_DAYS_PER_YEAR - 1) * 100)
-    ann_vol = float(daily.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100)
-    sharpe = float((ann_return - risk_free_rate) / ann_vol) if ann_vol > 0 else np.nan
-    if not cumret.empty:
-        mdd = float((((1 + cumret).cummax() - (1 + cumret)) / (1 + cumret).cummax()).max() * 100)
-    else:
-        mdd = np.nan
-    def _r(x):
-        if isinstance(x, float) and np.isnan(x): return np.nan
-        return round(x, 4)
-    return {
-        "Total Return (%)": _r(total_return),
-        "Annualized Return (%)": _r(ann_return),
-        "Annualized Volatility (%)": _r(ann_vol),
-        "Sharpe Ratio": _r(sharpe),
-        "Max Drawdown (%)": _r(mdd)
-    }
+    if returns_series.empty or len(returns_series) < 2: return {}
+    daily_returns_decimal = returns_series.replace([np.inf, -np.inf], np.nan).dropna()
+    if daily_returns_decimal.empty: return {}
+    cumulative_returns = (1 + daily_returns_decimal).cumprod() - 1
+    total_return = cumulative_returns.iloc[-1] * 100 if not cumulative_returns.empty else 0
+    annualized_return = ((1 + daily_returns_decimal.mean()) ** TRADING_DAYS_PER_YEAR - 1) * 100
+    annualized_volatility = daily_returns_decimal.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100
+    risk_free_rate_decimal = risk_free_rate / 100.0
+    sharpe_ratio = (annualized_return - risk_free_rate) / annualized_volatility if annualized_volatility > 0 else np.nan
+    if not cumulative_returns.empty: max_drawdown = (((1 + cumulative_returns).cummax() - (1 + cumulative_returns)) / (1 + cumulative_returns).cummax()).max() * 100
+    else: max_drawdown = np.nan
+    def round_if_float(x): return round(x, 4) if isinstance(x, (int, float)) and not np.isnan(x) else np.nan
+    return {"Total Return (%)": round_if_float(total_return), "Annualized Return (%)": round_if_float(annualized_return), "Annualized Volatility (%)": round_if_float(annualized_volatility), "Sharpe Ratio": round_if_float(sharpe_ratio), "Max Drawdown (%)": round_if_float(max_drawdown)}
 
-# --- Compliance engine ---
+
+# --- ENHANCED COMPLIANCE FUNCTIONS ---
+
 def parse_and_validate_rules_enhanced(rules_text: str, portfolio_df: pd.DataFrame):
+    """Enhanced rule parser with comprehensive validation capabilities"""
     results = []
-    if not rules_text or portfolio_df.empty:
-        return results
-
-    sector_wt = portfolio_df.groupby('Industry')['Weight %'].sum()
-    stock_wt = portfolio_df.set_index('Symbol')['Weight %']
-    rating_wt = portfolio_df.groupby('Rating')['Weight %'].sum() if 'Rating' in portfolio_df.columns else pd.Series(dtype=float)
-    asset_wt = portfolio_df.groupby('Asset Class')['Weight %'].sum() if 'Asset Class' in portfolio_df.columns else pd.Series(dtype=float)
-    mcap_wt = portfolio_df.groupby('Market Cap')['Weight %'].sum() if 'Market Cap' in portfolio_df.columns else pd.Series(dtype=float)
-
-    def chk(actual, op, thr):
-        if op == '>': return actual > thr
-        if op == '<': return actual < thr
-        if op == '>=': return actual >= thr
-        if op == '<=': return actual <= thr
-        if op == '=': return actual == thr
+    if not rules_text.strip() or portfolio_df.empty: return results
+    
+    # Prepare aggregations
+    sector_weights = portfolio_df.groupby('Industry')['Weight %'].sum()
+    stock_weights = portfolio_df.set_index('Symbol')['Weight %']
+    rating_weights = portfolio_df.groupby('Rating')['Weight %'].sum() if 'Rating' in portfolio_df.columns else pd.Series()
+    asset_class_weights = portfolio_df.groupby('Asset Class')['Weight %'].sum() if 'Asset Class' in portfolio_df.columns else pd.Series()
+    market_cap_weights = portfolio_df.groupby('Market Cap')['Weight %'].sum() if 'Market Cap' in portfolio_df.columns else pd.Series()
+    
+    def check_pass(actual, op, threshold):
+        if op == '>': return actual > threshold
+        if op == '<': return actual < threshold
+        if op == '>=': return actual >= threshold
+        if op == '<=': return actual <= threshold
+        if op == '=': return actual == threshold
         return False
-
-    for line in rules_text.strip().split('\n'):
-        rule = line.strip()
-        if not rule or rule.startswith('#'):
-            continue
+    
+    for rule in rules_text.strip().split('\n'):
+        rule = rule.strip()
+        if not rule or rule.startswith('#'): continue
         parts = re.split(r'\s+', rule)
-        rtype = parts[0].upper()
+        rule_type = parts[0].upper()
+        
         try:
+            actual_value = None
+            details = ""
+            
             if len(parts) < 3:
                 results.append({'rule': rule, 'status': 'Error', 'details': 'Invalid format.', 'severity': 'N/A'})
                 continue
+            
             op = parts[-2]
             if op not in ['>', '<', '>=', '<=', '=']:
                 results.append({'rule': rule, 'status': 'Error', 'details': f"Invalid operator '{op}'.", 'severity': 'N/A'})
                 continue
-            thr = float(parts[-1].replace('%', ''))
-            actual = None
-            details = ""
-
-            if rtype == 'STOCK' and len(parts) == 4:
-                sym = parts[1].upper()
-                if sym in stock_wt.index:
-                    actual = float(stock_wt.get(sym, 0.0))
-                    details = f"Actual {sym}: {actual:.2f}%"
+            
+            threshold = float(parts[-1].replace('%', ''))
+            
+            # STOCK level rules
+            if rule_type == 'STOCK' and len(parts) == 4:
+                symbol = parts[1].upper()
+                if symbol in stock_weights.index:
+                    actual_value = stock_weights.get(symbol, 0.0)
+                    details = f"Actual for {symbol}: {actual_value:.2f}%"
                 else:
-                    results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': f"Symbol '{sym}' not found.", 'severity': 'N/A'})
+                    results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': f"Symbol '{symbol}' not found.", 'severity': 'N/A'})
                     continue
-
-            elif rtype == 'SECTOR':
-                sec_name = ' '.join(parts[1:-2]).upper()
-                match = next((s for s in sector_wt.index if str(s).upper() == sec_name), None)
-                if match:
-                    actual = float(sector_wt.get(match, 0.0))
-                    details = f"Actual {match}: {actual:.2f}%"
+            
+            # SECTOR level rules
+            elif rule_type == 'SECTOR':
+                sector_name = ' '.join(parts[1:-2]).upper()
+                matching_sector = next((s for s in sector_weights.index if s.upper() == sector_name), None)
+                if matching_sector:
+                    actual_value = sector_weights.get(matching_sector, 0.0)
+                    details = f"Actual for {matching_sector}: {actual_value:.2f}%"
                 else:
-                    results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': f"Sector '{sec_name}' not found.", 'severity': 'N/A'})
+                    results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': f"Sector '{sector_name}' not found.", 'severity': 'N/A'})
                     continue
-
-            elif rtype == 'RATING':
-                r = ' '.join(parts[1:-2]).upper()
-                actual = float(rating_wt.get(r, 0.0))
-                details = f"Actual {r}: {actual:.2f}%"
-
-            elif rtype == 'ASSET_CLASS':
-                c = ' '.join(parts[1:-2]).upper()
-                actual = float(asset_wt.get(c, 0.0))
-                details = f"Actual {c}: {actual:.2f}%"
-
-            elif rtype == 'MARKET_CAP':
-                c = ' '.join(parts[1:-2]).upper()
-                actual = float(mcap_wt.get(c, 0.0))
-                details = f"Actual {c}: {actual:.2f}%"
-
-            elif rtype == 'TOP_N_STOCKS' and len(parts) == 4:
+            
+            # RATING level rules
+            elif rule_type == 'RATING':
+                rating_name = ' '.join(parts[1:-2]).upper()
+                actual_value = rating_weights.get(rating_name, 0.0)
+                details = f"Actual for {rating_name}: {actual_value:.2f}%"
+            
+            # ASSET_CLASS rules
+            elif rule_type == 'ASSET_CLASS':
+                class_name = ' '.join(parts[1:-2]).upper()
+                actual_value = asset_class_weights.get(class_name, 0.0)
+                details = f"Actual for {class_name}: {actual_value:.2f}%"
+            
+            # MARKET_CAP rules
+            elif rule_type == 'MARKET_CAP':
+                cap_name = ' '.join(parts[1:-2]).upper()
+                actual_value = market_cap_weights.get(cap_name, 0.0)
+                details = f"Actual for {cap_name}: {actual_value:.2f}%"
+            
+            # TOP_N_STOCKS rules
+            elif rule_type == 'TOP_N_STOCKS' and len(parts) == 4:
                 n = int(parts[1])
-                actual = float(portfolio_df.nlargest(n, 'Weight %')['Weight %'].sum())
-                details = f"Top {n} stocks: {actual:.2f}%"
-
-            elif rtype == 'TOP_N_SECTORS' and len(parts) == 4:
+                actual_value = portfolio_df.nlargest(n, 'Weight %')['Weight %'].sum()
+                details = f"Actual weight of top {n} stocks: {actual_value:.2f}%"
+            
+            # TOP_N_SECTORS rules
+            elif rule_type == 'TOP_N_SECTORS' and len(parts) == 4:
                 n = int(parts[1])
-                actual = float(sector_wt.nlargest(n).sum())
-                details = f"Top {n} sectors: {actual:.2f}%"
-
-            elif rtype == 'COUNT_STOCKS' and len(parts) == 3:
-                actual = float(len(portfolio_df))
-                details = f"Actual count: {int(actual)}"
-
-            elif rtype == 'COUNT_SECTORS' and len(parts) == 3:
-                actual = float(portfolio_df['Industry'].nunique())
-                details = f"Actual count: {int(actual)}"
-
-            elif rtype == 'ISSUER_GROUP':
-                g = ' '.join(parts[1:-2]).upper()
+                actual_value = sector_weights.nlargest(n).sum()
+                details = f"Actual weight of top {n} sectors: {actual_value:.2f}%"
+            
+            # COUNT_STOCKS rules
+            elif rule_type == 'COUNT_STOCKS' and len(parts) == 3:
+                actual_value = len(portfolio_df)
+                details = f"Actual count: {actual_value}"
+            
+            # COUNT_SECTORS rules
+            elif rule_type == 'COUNT_SECTORS' and len(parts) == 3:
+                actual_value = portfolio_df['Industry'].nunique()
+                details = f"Actual count: {actual_value}"
+            
+            # SINGLE_ISSUER_GROUP rules (group exposure)
+            elif rule_type == 'ISSUER_GROUP':
+                group_name = ' '.join(parts[1:-2]).upper()
                 if 'Issuer Group' in portfolio_df.columns:
-                    actual = float(portfolio_df[portfolio_df['Issuer Group'].str.upper() == g]['Weight %'].sum())
-                    details = f"Actual {g}: {actual:.2f}%"
+                    actual_value = portfolio_df[portfolio_df['Issuer Group'].str.upper() == group_name]['Weight %'].sum()
+                    details = f"Actual for {group_name}: {actual_value:.2f}%"
                 else:
                     results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': "Column 'Issuer Group' not found.", 'severity': 'N/A'})
                     continue
-
-            elif rtype == 'MIN_LIQUIDITY' and len(parts) == 4:
-                sym = parts[1].upper()
+            
+            # LIQUIDITY rules (based on avg volume)
+            elif rule_type == 'MIN_LIQUIDITY' and len(parts) == 4:
+                symbol = parts[1].upper()
                 if 'Avg Volume (90d)' in portfolio_df.columns:
-                    row = portfolio_df[portfolio_df['Symbol'] == sym]
-                    if not row.empty:
-                        actual = float(row['Avg Volume (90d)'].values[0])
-                        details = f"Volume {sym}: {actual:,.0f}"
+                    stock_row = portfolio_df[portfolio_df['Symbol'] == symbol]
+                    if not stock_row.empty:
+                        actual_value = stock_row['Avg Volume (90d)'].values[0]
+                        details = f"Actual volume for {symbol}: {actual_value:,.0f}"
                     else:
-                        results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': f"Symbol '{sym}' not found.", 'severity': 'N/A'})
+                        results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': f"Symbol '{symbol}' not found.", 'severity': 'N/A'})
                         continue
                 else:
                     results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': "Column 'Avg Volume (90d)' not found.", 'severity': 'N/A'})
                     continue
-
-            elif rtype == 'UNRATED_EXPOSURE' and len(parts) == 3:
+            
+            # UNRATED_EXPOSURE rules
+            elif rule_type == 'UNRATED_EXPOSURE' and len(parts) == 3:
                 if 'Rating' in portfolio_df.columns:
-                    unr = portfolio_df['Rating'].isin(['UNRATED', 'NR', 'NOT RATED', ''])
-                    actual = float(portfolio_df[unr]['Weight %'].sum())
-                    details = f"Unrated: {actual:.2f}%"
+                    unrated_mask = portfolio_df['Rating'].isin(['UNRATED', 'NR', 'NOT RATED', ''])
+                    actual_value = portfolio_df[unrated_mask]['Weight %'].sum()
+                    details = f"Actual unrated exposure: {actual_value:.2f}%"
                 else:
                     results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': "Column 'Rating' not found.", 'severity': 'N/A'})
                     continue
-
-            elif rtype == 'FOREIGN_EXPOSURE' and len(parts) == 3:
+            
+            # FOREIGN_EXPOSURE rules
+            elif rule_type == 'FOREIGN_EXPOSURE' and len(parts) == 3:
                 if 'Country' in portfolio_df.columns:
-                    foreign = portfolio_df['Country'].str.upper() != 'INDIA'
-                    actual = float(portfolio_df[foreign]['Weight %'].sum())
-                    details = f"Foreign: {actual:.2f}%"
+                    foreign_mask = portfolio_df['Country'].str.upper() != 'INDIA'
+                    actual_value = portfolio_df[foreign_mask]['Weight %'].sum()
+                    details = f"Actual foreign exposure: {actual_value:.2f}%"
                 else:
                     results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': "Column 'Country' not found.", 'severity': 'N/A'})
                     continue
-
-            elif rtype == 'DERIVATIVES_EXPOSURE' and len(parts) == 3:
+            
+            # DERIVATIVES_EXPOSURE rules
+            elif rule_type == 'DERIVATIVES_EXPOSURE' and len(parts) == 3:
                 if 'Instrument Type' in portfolio_df.columns:
-                    dd = portfolio_df['Instrument Type'].str.upper().isin(['FUTURES', 'OPTIONS', 'SWAPS'])
-                    actual = float(portfolio_df[dd]['Weight %'].sum())
-                    details = f"Derivatives: {actual:.2f}%"
+                    deriv_mask = portfolio_df['Instrument Type'].str.upper().isin(['FUTURES', 'OPTIONS', 'SWAPS'])
+                    actual_value = portfolio_df[deriv_mask]['Weight %'].sum()
+                    details = f"Actual derivatives exposure: {actual_value:.2f}%"
                 else:
                     results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': "Column 'Instrument Type' not found.", 'severity': 'N/A'})
                     continue
-
+            
             else:
                 results.append({'rule': rule, 'status': 'Error', 'details': 'Unrecognized rule format.', 'severity': 'N/A'})
                 continue
-
-            passed = chk(actual, op, thr)
-            status = "✅ PASS" if passed else "❌ FAIL"
-            if not passed:
-                diff = abs(actual - thr)
-                if diff > thr * 0.2: sev = "🔴 Critical"
-                elif diff > thr * 0.1: sev = "🟠 High"
-                else: sev = "🟡 Medium"
-            else:
-                sev = "✅ Compliant"
-
-            results.append({
-                "rule": rule,
-                "status": status,
-                "details": f"{details} | Rule: {op} {thr}",
-                "severity": sev,
-                "actual_value": actual,
-                "threshold": thr,
-                "breach_amount": (actual - thr) if not passed else 0
-            })
-
+            
+            if actual_value is not None:
+                passed = check_pass(actual_value, op, threshold)
+                status = "✅ PASS" if passed else "❌ FAIL"
+                
+                # Determine severity
+                if not passed:
+                    breach_magnitude = abs(actual_value - threshold)
+                    if breach_magnitude > threshold * 0.2:  # >20% breach
+                        severity = "🔴 Critical"
+                    elif breach_magnitude > threshold * 0.1:  # >10% breach
+                        severity = "🟠 High"
+                    else:
+                        severity = "🟡 Medium"
+                else:
+                    severity = "✅ Compliant"
+                
+                results.append({
+                    'rule': rule,
+                    'status': status,
+                    'details': f"{details} | Rule: {op} {threshold}",
+                    'severity': severity,
+                    'actual_value': actual_value,
+                    'threshold': threshold,
+                    'breach_amount': actual_value - threshold if not passed else 0
+                })
+        
         except (ValueError, IndexError) as e:
             results.append({'rule': rule, 'status': 'Error', 'details': f"Parse error: {e}", 'severity': 'N/A'})
-
+    
     return results
 
+
 def calculate_security_level_compliance(portfolio_df: pd.DataFrame, rules_config: dict):
+    """Calculate compliance metrics at individual security level"""
     if portfolio_df.empty:
         return pd.DataFrame()
-    out = portfolio_df.copy()
-    single_lim = float(rules_config.get('single_stock_limit', 10.0))
-    out['Stock Limit Breach'] = out['Weight %'].apply(lambda x: '❌ Breach' if x > single_lim else '✅ Compliant')
-    out['Stock Limit Gap (%)'] = single_lim - out['Weight %']
+    
+    security_compliance = portfolio_df.copy()
+    
+    # Single stock limit check
+    single_stock_limit = rules_config.get('single_stock_limit', 10.0)
+    security_compliance['Stock Limit Breach'] = security_compliance['Weight %'].apply(
+        lambda x: '❌ Breach' if x > single_stock_limit else '✅ Compliant'
+    )
+    security_compliance['Stock Limit Gap (%)'] = single_stock_limit - security_compliance['Weight %']
+    
+    # Liquidity check (if data available)
+    if 'Avg Volume (90d)' in security_compliance.columns:
+        min_liquidity = rules_config.get('min_liquidity', 100000)
+        security_compliance['Liquidity Status'] = security_compliance['Avg Volume (90d)'].apply(
+            lambda x: '✅ Adequate' if x >= min_liquidity else '⚠️ Low'
+        )
+    
+    # Rating check (if data available)
+    if 'Rating' in security_compliance.columns:
+        min_rating = rules_config.get('min_rating', ['AAA', 'AA+', 'AA', 'AA-', 'A+'])
+        security_compliance['Rating Compliance'] = security_compliance['Rating'].apply(
+            lambda x: '✅ Compliant' if x in min_rating else '⚠️ Below Threshold'
+        )
+    
+    # Concentration risk flag
+    security_compliance['Concentration Risk'] = security_compliance['Weight %'].apply(
+        lambda x: '🔴 High' if x > 8 else '🟡 Medium' if x > 5 else '🟢 Low'
+    )
+    
+    return security_compliance
 
-    if 'Avg Volume (90d)' in out.columns:
-        minliq = float(rules_config.get('min_liquidity', 100000))
-        out['Liquidity Status'] = out['Avg Volume (90d)'].apply(lambda x: '✅ Adequate' if float(x) >= minliq else '⚠️ Low')
 
-    if 'Rating' in out.columns:
-        ok = rules_config.get('min_rating', ['AAA', 'AA+', 'AA', 'AA-', 'A+'])
-        out['Rating Compliance'] = out['Rating'].apply(lambda x: '✅ Compliant' if str(x).upper() in ok else '⚠️ Below Threshold')
-
-    out['Concentration Risk'] = out['Weight %'].apply(lambda x: '🔴 High' if x > 8 else ('🟡 Medium' if x > 5 else '🟢 Low'))
-    return out
-
-def calculate_advanced_metrics(portfolio_df: pd.DataFrame, api_key: str, access_token: str):
+def calculate_advanced_metrics(portfolio_df, api_key, access_token):
+    """Enhanced advanced metrics calculation with fix for dimension mismatch."""
     symbols = portfolio_df['Symbol'].tolist()
     from_date = datetime.now().date() - timedelta(days=366)
     to_date = datetime.now().date()
-
-    rets = pd.DataFrame()
-    failed = []
-    prog = st.progress(0, text="Fetching historical data...")
-
-    for i, sym in enumerate(symbols):
-        df = get_historical_data_cached(api_key, access_token, sym, from_date, to_date, 'day')
-        if not df.empty and '_error' not in df.columns:
-            rets[sym] = df['close'].pct_change()
+    
+    returns_df = pd.DataFrame()
+    failed_symbols = []
+    
+    progress_bar = st.progress(0, text="Fetching historical data for metrics...")
+    
+    for i, symbol in enumerate(symbols):
+        hist_data = get_historical_data_cached(api_key, access_token, symbol, from_date, to_date, 'day')
+        if not hist_data.empty and '_error' not in hist_data.columns:
+            returns_df[symbol] = hist_data['close'].pct_change()
         else:
-            failed.append(sym)
-        prog.progress((i + 1) / max(1, len(symbols)), text=f"Fetched: {sym}")
-
-    if failed:
-        st.warning("No history for: " + ", ".join(failed))
-
-    rets.dropna(how='all', inplace=True)
-    rets.fillna(0, inplace=True)
-    if rets.empty:
-        prog.empty()
-        st.error("Insufficient data for metrics.")
+            failed_symbols.append(symbol)
+        progress_bar.progress((i + 1) / len(symbols), text=f"Fetching data for {symbol}...")
+    
+    if failed_symbols:
+        st.warning(f"Could not fetch historical data for: {', '.join(failed_symbols)}. They will be excluded from advanced metrics calculation.")
+    
+    returns_df.dropna(how='all', inplace=True)
+    returns_df.fillna(0, inplace=True)
+    
+    if returns_df.empty:
+        st.error("Not enough historical data to calculate advanced metrics.")
+        progress_bar.empty()
         return None
+    
+    # --- FIX STARTS HERE ---
+    
+    # 1. Get symbols with successful data fetch from returns_df columns
+    successful_symbols = returns_df.columns.tolist()
+    
+    # 2. Filter and reorder the original portfolio to match returns_df exactly
+    portfolio_df_success = portfolio_df.set_index('Symbol').reindex(successful_symbols).reset_index()
 
-    succ_syms = rets.columns.tolist()
-    port_ok = portfolio_df.set_index('Symbol').reindex(succ_syms).reset_index()
-    tot_val = port_ok['Real-time Value (Rs)'].sum()
-    if tot_val == 0:
-        prog.empty()
-        st.error("Zero total value for successful symbols.")
+    # 3. Recalculate weights based ONLY on the successful assets to ensure sum is 1
+    total_value_success = portfolio_df_success['Real-time Value (Rs)'].sum()
+    if total_value_success == 0:
+        st.error("The total value of assets with available historical data is zero. Cannot calculate metrics.")
+        progress_bar.empty()
         return None
+        
+    weights = (portfolio_df_success['Real-time Value (Rs)'] / total_value_success).values
+    
+    # Now the order and length of `weights` matches the columns of `returns_df`
+    portfolio_returns = returns_df.dot(weights)
 
-    weights = (port_ok['Real-time Value (Rs)'] / tot_val).values
-    port_rets = rets.dot(weights)
-
-    var_95 = float(port_rets.quantile(0.05))
-    var_99 = float(port_rets.quantile(0.01))
-    cvar_95 = float(port_rets[port_rets <= var_95].mean())
-
-    bench = get_historical_data_cached(api_key, access_token, BENCHMARK_SYMBOL, from_date, to_date, 'day')
-    beta = alpha = te = ir = None
-    if not bench.empty and '_error' not in bench.columns:
-        b = bench['close'].pct_change()
-        aligned = pd.concat([port_rets, b], axis=1, join='inner').dropna()
-        aligned.columns = ['port', 'bench']
-        if not aligned.empty:
-            cov = aligned.cov().iloc[0, 1]
-            varb = aligned['bench'].var()
-            beta = float(cov / varb) if varb > 0 else None
-            pr = ((1 + aligned['port'].mean()) ** TRADING_DAYS_PER_YEAR - 1)
-            br = ((1 + aligned['bench'].mean()) ** TRADING_DAYS_PER_YEAR - 1)
-            rf = 0.06
-            if beta is not None:
-                alpha = float(pr - (rf + beta * (br - rf)))
-            diff = aligned['port'] - aligned['bench']
-            te_val = diff.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
-            te = float(te_val)
-            if te > 0:
-                ir = float((pr - br) / te_val)
+    # --- FIX ENDS HERE ---
+    
+    # VaR calculations
+    var_95 = portfolio_returns.quantile(0.05)
+    var_99 = portfolio_returns.quantile(0.01)
+    cvar_95 = portfolio_returns[portfolio_returns <= var_95].mean()
+    
+    # Benchmark data
+    benchmark_data = get_historical_data_cached(api_key, access_token, BENCHMARK_SYMBOL, from_date, to_date, 'day')
+    
+    portfolio_beta = None
+    alpha = None
+    tracking_error = None
+    information_ratio = None
+    
+    if not benchmark_data.empty and '_error' not in benchmark_data.columns:
+        benchmark_returns = benchmark_data['close'].pct_change()
+        # Align returns and drop NaNs from merging and pct_change
+        aligned_returns = pd.concat([portfolio_returns, benchmark_returns], axis=1, join='inner').dropna()
+        aligned_returns.columns = ['portfolio', 'benchmark']
+        
+        if not aligned_returns.empty:
+            # Beta
+            covariance = aligned_returns.cov().iloc[0, 1]
+            benchmark_variance = aligned_returns['benchmark'].var()
+            portfolio_beta = covariance / benchmark_variance if benchmark_variance > 0 else None
+            
+            # Alpha (annualized)
+            portfolio_annual_return = ((1 + aligned_returns['portfolio'].mean()) ** TRADING_DAYS_PER_YEAR - 1)
+            benchmark_annual_return = ((1 + aligned_returns['benchmark'].mean()) ** TRADING_DAYS_PER_YEAR - 1)
+            risk_free_rate = 0.06  # 6% assumed
+            
+            if portfolio_beta is not None:
+                alpha = portfolio_annual_return - (risk_free_rate + portfolio_beta * (benchmark_annual_return - risk_free_rate))
+            
+            # Tracking Error
+            tracking_diff = aligned_returns['portfolio'] - aligned_returns['benchmark']
+            tracking_error = tracking_diff.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+            
+            # Information Ratio
+            if tracking_error is not None and tracking_error > 0:
+                information_ratio = (portfolio_annual_return - benchmark_annual_return) / tracking_error
     else:
-        st.error(f"Benchmark {BENCHMARK_SYMBOL} unavailable — Beta/Alpha skipped.")
+        st.error(f"Could not fetch benchmark data for {BENCHMARK_SYMBOL}. Beta, Alpha, and related metrics cannot be calculated.")
 
-    ddown = port_rets[port_rets < 0]
-    dstd = ddown.std() * np.sqrt(TRADING_DAYS_PER_YEAR) if len(ddown) > 0 else 0
-    pr_ann = ((1 + port_rets.mean()) ** TRADING_DAYS_PER_YEAR - 1)
-    sortino = float((pr_ann - 0.06) / dstd) if dstd > 0 else None
-
-    corr = rets.corr()
-    avg_corr = corr.values[np.triu_indices_from(corr.values, k=1)].mean()
-    avg_corr = None if np.isnan(avg_corr) else float(avg_corr)
-
-    pvol = float(port_rets.std() * np.sqrt(TRADING_DAYS_PER_YEAR))
-    wvol = float(np.sum(weights * rets.std() * np.sqrt(TRADING_DAYS_PER_YEAR)))
-    div_ratio = float(wvol / pvol) if pvol > 0 else None
-
-    prog.empty()
+    # Sortino Ratio
+    downside_returns = portfolio_returns[portfolio_returns < 0]
+    downside_std = downside_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) if len(downside_returns) > 0 else 0
+    portfolio_annual_return = ((1 + portfolio_returns.mean()) ** TRADING_DAYS_PER_YEAR - 1)
+    sortino_ratio = (portfolio_annual_return - 0.06) / downside_std if downside_std > 0 else None
+    
+    # Correlation matrix
+    correlation_matrix = returns_df.corr()
+    avg_correlation = correlation_matrix.values[np.triu_indices_from(correlation_matrix.values, k=1)].mean()
+    
+    # Diversification ratio
+    portfolio_vol = portfolio_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+    weighted_vol = np.sum(weights * returns_df.std() * np.sqrt(TRADING_DAYS_PER_YEAR))
+    diversification_ratio = weighted_vol / portfolio_vol if portfolio_vol > 0 else None
+    
+    progress_bar.empty()
+    
     return {
         "var_95": var_95,
         "var_99": var_99,
         "cvar_95": cvar_95,
-        "beta": beta,
+        "beta": portfolio_beta,
         "alpha": alpha,
-        "tracking_error": te,
-        "information_ratio": ir,
-        "sortino_ratio": sortino,
-        "avg_correlation": avg_corr,
-        "diversification_ratio": div_ratio,
-        "portfolio_volatility": pvol
+        "tracking_error": tracking_error,
+        "information_ratio": information_ratio,
+        "sortino_ratio": sortino_ratio,
+        "avg_correlation": avg_correlation,
+        "diversification_ratio": diversification_ratio,
+        "portfolio_volatility": portfolio_vol
     }
 
-# --- Sidebar: Supabase + Kite ---
-with st.sidebar:
-    st.subheader("🔐 Supabase")
-    if not st.session_state["sb_user"]:
-        with st.form("sb_auth", clear_on_submit=False):
-            e = st.text_input("Email")
-            p = st.text_input("Password", type="password")
-            c1, c2 = st.columns(2)
-            do_login = c1.form_submit_button("Login", use_container_width=True)
-            do_signup = c2.form_submit_button("Sign Up", use_container_width=True)
-        if do_signup and e and p:
-            r = sb_signup(e, p)
-            if r and getattr(r, "user", None):
-                st.success("Signup successful. Login now.")
-        if do_login and e and p:
-            r = sb_login(e, p)
-            if r and getattr(r, "user", None):
-                st.success(f"Welcome, {e}!")
-    else:
-        st.success(f"Logged in: {st.session_state['sb_user'].email}")
-        if st.button("Logout", use_container_width=True):
-            sb_logout()
-            st.rerun()
 
-    st.divider()
-    st.subheader("Kite Connect")
+# --- Sidebar: Kite Login ---
+with st.sidebar:
+    st.markdown("### 1. Login to Kite Connect")
     if not st.session_state["kite_access_token"]:
+        st.markdown(f"Click the link, authorize, and you'll be redirected back.")
         st.link_button("🔗 Open Kite login", login_url, use_container_width=True)
-    req_tok = st.query_params.get("request_token")
-    if req_tok and not st.session_state["kite_access_token"]:
-        with st.spinner("Authenticating with Kite..."):
+    request_token_param = st.query_params.get("request_token")
+    if request_token_param and not st.session_state["kite_access_token"]:
+        with st.spinner("Authenticating..."):
             try:
-                data = kite_unauth.generate_session(req_tok, api_secret=CONF["kite"]["api_secret"])
+                data = kite_unauth_client.generate_session(request_token_param, api_secret=KITE_CREDENTIALS["api_secret"])
                 st.session_state["kite_access_token"] = data.get("access_token")
                 st.session_state["kite_login_response"] = data
-                st.success("Kite auth successful.")
+                st.sidebar.success("Kite authentication successful.")
                 st.query_params.clear()
                 st.rerun()
             except Exception as e:
-                st.error(f"Kite auth failed: {e}")
+                st.sidebar.error(f"Authentication failed: {e}")
     if st.session_state["kite_access_token"]:
-        st.success("Kite ✅")
-        if st.button("Logout Kite", use_container_width=True):
-            st.session_state["kite_access_token"] = None
-            st.session_state["kite_login_response"] = None
+        st.success("Kite Authenticated ✅")
+        if st.sidebar.button("Logout from Kite", use_container_width=True):
+            st.session_state.clear()
+            st.success("Logged out from Kite.")
             st.rerun()
     else:
-        st.info("Not authenticated with Kite.")
-
-    st.divider()
+        st.info("Not authenticated with Kite yet.")
+    st.markdown("---")
+    st.markdown("### 2. Quick Data Access")
     if st.session_state["kite_access_token"]:
-        if st.button("Fetch Current Holdings", use_container_width=True):
-            kc = get_kite_auth_client(CONF["kite"]["api_key"], st.session_state["kite_access_token"])
+        if st.button("Fetch Current Holdings", key="sidebar_fetch_holdings_btn", use_container_width=True):
+            current_k_client_for_sidebar = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
             try:
-                holds = kc.holdings()
-                st.session_state["holdings_data"] = pd.DataFrame(holds)
-                st.success(f"Fetched {len(holds)} holdings.")
+                holdings = current_k_client_for_sidebar.holdings()
+                st.session_state["holdings_data"] = pd.DataFrame(holdings)
+                st.success(f"Fetched {len(holdings)} holdings.")
             except Exception as e:
                 st.error(f"Error fetching holdings: {e}")
-        if st.session_state["holdings_data"] is not None and not st.session_state["holdings_data"].empty:
+        if st.session_state.get("holdings_data") is not None and not st.session_state["holdings_data"].empty:
             with st.expander("Show Holdings"):
                 st.dataframe(st.session_state["holdings_data"])
-                st.download_button(
-                    "Download Holdings (CSV)",
-                    st.session_state["holdings_data"].to_csv(index=False).encode('utf-8'),
-                    file_name="kite_holdings.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+                st.download_button("Download Holdings (CSV)", st.session_state["holdings_data"].to_csv(index=False).encode('utf-8'), "kite_holdings.csv", "text/csv", key="download_holdings_sidebar_csv", use_container_width=True)
+    else:
+        st.info("Login to Kite to access quick data.")
 
-# --- Main Tabs (NO Market/Historical tab) ---
-tabs = st.tabs([
-    "💼 Investment Compliance",
-    "🤖 AI-Powered Analysis",
-])
+# --- Authenticated KiteConnect client (used by main tabs) ---
+k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
 
-tab_compliance, tab_ai = tabs
+# --- Main UI - Tabs for modules ---
+tabs = st.tabs(["📈 Market & Historical", "💼 Investment Compliance", "🤖 AI-Powered Analysis"])
+tab_market, tab_compliance, tab_ai = tabs
 
-# --- Helpers for AI tab ---
-def extract_text_from_files(uploaded_files) -> str:
-    txt = ""
-    for f in uploaded_files:
-        txt += f"\n\n--- DOCUMENT: {f.name} ---\n\n"
-        if f.type == "application/pdf":
-            with fitz.open(stream=f.getvalue(), filetype="pdf") as doc:
-                for page in doc:
-                    txt += page.get_text()
+
+# --- Tab Logic Functions ---
+
+def render_market_historical_tab(kite_client, api_key, access_token):
+    st.header("📈 Market Data & Historical Candles with TA")
+    if not kite_client:
+        st.info("Login first to fetch market data.")
+        return
+    st.subheader("Current Market Data Snapshot")
+    col_market_quote1, col_market_quote2 = st.columns([1, 2])
+    with col_market_quote1:
+        q_exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO"], key="market_exchange_tab")
+        q_symbol = st.text_input("Tradingsymbol", value="RELIANCE", key="market_symbol_tab")
+        if st.button("Get Market Data", key="get_market_data_btn"):
+            ltp_data = get_ltp_price_cached(api_key, access_token, q_symbol, q_exchange)
+            if ltp_data and "_error" not in ltp_data:
+                st.session_state["current_market_data"] = ltp_data
+            else:
+                st.error(f"Failed: {ltp_data.get('_error', 'Unknown error')}")
+    with col_market_quote2:
+        if st.session_state.get("current_market_data"):
+            st.json(st.session_state["current_market_data"])
         else:
-            try:
-                txt += f.getvalue().decode("utf-8", errors="ignore")
-            except Exception:
-                txt += ""
-    return txt
+            st.info("Market data will appear here.")
+    st.markdown("---")
+    st.subheader("Historical Price Data & Technical Analysis")
+    hist_symbol = st.text_input("Tradingsymbol", value="INFY", key="hist_sym_tab_input_ta")
+    col_fetch, col_interval, col_dates = st.columns(3)
+    with col_dates:
+        from_date = st.date_input("From Date", value=datetime.now().date() - timedelta(days=365), key="from_dt_tab_input")
+        to_date = st.date_input("To Date", value=datetime.now().date(), key="to_dt_tab_input")
+    with col_interval:
+        interval = st.selectbox("Interval", ["day", "week", "minute", "5minute", "30minute", "month"], index=0, key="hist_interval_selector_ta")
+    with col_fetch:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Fetch & Prepare Data", key="fetch_historical_data_ta_btn", type="primary"):
+            with st.spinner(f"Fetching data..."):
+                df_hist = get_historical_data_cached(api_key, access_token, hist_symbol, from_date, to_date, interval, DEFAULT_EXCHANGE)
+                if isinstance(df_hist, pd.DataFrame) and "_error" not in df_hist.columns:
+                    st.session_state["historical_data"] = df_hist
+                    st.session_state["last_fetched_symbol"] = hist_symbol
+                else:
+                    st.error(f"Fetch failed: {df_hist.get('_error', 'Unknown error')}")
+    if not st.session_state.get("historical_data", pd.DataFrame()).empty:
+        df = st.session_state["historical_data"]
+        with st.expander("Technical Indicator & Plotting Options"):
+            ta_c1, ta_c2, ta_c3 = st.columns(3)
+            with ta_c1:
+                sma_periods_str = st.text_input("SMA Periods", "20,50")
+                ema_periods_str = st.text_input("EMA Periods", "12,26")
+                rsi_window = st.number_input("RSI Window", 5, 50, 14)
+            with ta_c2:
+                macd_fast = st.number_input("MACD Fast", 5, 50, 12)
+                macd_slow = st.number_input("MACD Slow", 10, 100, 26)
+                macd_signal = st.number_input("MACD Signal", 5, 50, 9)
+            with ta_c3:
+                bb_window = st.number_input("Bollinger Window", 5, 50, 20)
+                bb_std_dev = st.number_input("Bollinger Std Dev", 1.0, 4.0, 2.0, 0.5)
+                chart_type = st.selectbox("Chart Style", ["Candlestick", "Line"])
+                indicators_to_plot = st.multiselect("Plot on Price Chart", ["SMA", "EMA", "Bollinger Bands"])
+            sma_periods = [int(p.strip()) for p in sma_periods_str.split(',') if p.strip().isdigit()]
+            ema_periods = [int(p.strip()) for p in ema_periods_str.split(',') if p.strip().isdigit()]
+            df_with_ta = add_technical_indicators(df, sma_periods, ema_periods, rsi_window, macd_fast, macd_slow, macd_signal, bb_window, bb_std_dev)
+        st.subheader(f"Technical Analysis for {st.session_state['last_fetched_symbol']} ({interval})")
+        fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.5, 0.1, 0.2, 0.2])
+        if chart_type == "Candlestick":
+            fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
+        else:
+            fig.add_trace(go.Scatter(x=df.index, y=df['close'], mode='lines', name='Price'), row=1, col=1)
+        if "SMA" in indicators_to_plot:
+            for p in sma_periods:
+                fig.add_trace(go.Scatter(x=df_with_ta.index, y=df_with_ta.get(f'SMA_{p}'), mode='lines', name=f'SMA {p}'), row=1, col=1)
+        if "EMA" in indicators_to_plot:
+            for p in ema_periods:
+                fig.add_trace(go.Scatter(x=df_with_ta.index, y=df_with_ta.get(f'EMA_{p}'), mode='lines', name=f'EMA {p}'), row=1, col=1)
+        if "Bollinger Bands" in indicators_to_plot:
+            fig.add_trace(go.Scatter(x=df_with_ta.index, y=df_with_ta['Bollinger_High'], mode='lines', line=dict(width=0.5, color='gray'), name='BB High'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df_with_ta.index, y=df_with_ta['Bollinger_Low'], mode='lines', line=dict(width=0.5, color='gray'), fill='tonexty', fillcolor='rgba(128,128,128,0.2)', name='BB Low'), row=1, col=1)
+        fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='Volume'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df_with_ta.index, y=df_with_ta['RSI'], mode='lines', name='RSI'), row=3, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1, opacity=0.5)
+        fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1, opacity=0.5)
+        fig.add_trace(go.Bar(x=df_with_ta.index, y=df_with_ta['MACD_hist'], name='MACD Hist', marker_color='orange'), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df_with_ta.index, y=df_with_ta['MACD'], mode='lines', name='MACD Line', line=dict(color='blue')), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df_with_ta.index, y=df_with_ta['MACD_signal'], mode='lines', name='MACD Signal', line=dict(color='red')), row=4, col=1)
+        fig.update_layout(height=1000, xaxis_rangeslider_visible=False, title_text=f"{st.session_state['last_fetched_symbol']} Technical Analysis", template="plotly_white")
+        st.plotly_chart(fig, use_container_width=True)
+        st.subheader("Performance Snapshot")
+        metrics = calculate_performance_metrics(df['close'].pct_change(), risk_free_rate=6.0)
+        st.dataframe(pd.DataFrame([metrics]).T.rename(columns={0: "Value"}).style.format("{:.4f}"))
 
-def portfolio_summary(df: pd.DataFrame) -> str:
-    if df.empty:
-        return "No portfolio data available."
-    total_value = df['Real-time Value (Rs)'].sum()
-    top10 = df.nlargest(10, 'Weight %')[['Name', 'Weight %']]
-    sector_top = df.groupby('Industry')['Weight %'].sum().nlargest(10)
-    s = [
-        f"**Portfolio Snapshot (as of {datetime.now().strftime('%Y-%m-%d')})**",
-        f"- **Total Value:** ₹ {total_value:,.2f}",
-        f"- **Number of Holdings:** {len(df)}",
-        f"- **Top Stock Weight:** {df['Weight %'].max():.2f}%",
-        f"- **Top 10 Combined Weight:** {df.nlargest(10, 'Weight %')['Weight %'].sum():.2f}%",
-        "",
-        "**Top 10 Holdings:**"
-    ]
-    for _, r in top10.iterrows():
-        s.append(f"- {r['Name']}: {r['Weight %']:.2f}%")
-    s.append("")
-    s.append("**Top 10 Sector Exposures:**")
-    for sector, wt in sector_top.items():
-        s.append(f"- {sector}: {wt:.2f}%")
-    return "\n".join(s)
 
-# --- COMPLIANCE TAB ---
-with tab_compliance:
+def render_investment_compliance_tab(kite_client, api_key, access_token):
     st.header("💼 Enhanced Investment Compliance & Portfolio Analysis")
-    st.write("Upload portfolio, run validations, compute risk analytics, and save the entire run to Supabase per-user.")
-
-    if not st.session_state["kite_access_token"]:
-        st.info("Login to Kite Connect for live prices.")
-    kc = get_kite_auth_client(CONF["kite"]["api_key"], st.session_state["kite_access_token"])
-
-    c1, c2 = st.columns([2, 3])
-    with c1:
-        st.subheader("1) Upload Portfolio CSV")
-        up = st.file_uploader("CSV with Symbol, Industry, Quantity, etc.", type="csv")
-
-        st.markdown("##### Compliance Thresholds")
-        with st.expander("⚙️ Configure", expanded=True):
-            single_stock_limit = st.number_input("Single Stock Limit (%)", 1.0, 25.0, 10.0, 0.5)
-            single_sector_limit = st.number_input("Single Sector Limit (%)", 5.0, 50.0, 25.0, 1.0)
-            top_10_limit = st.number_input("Top 10 Holdings Limit (%)", 20.0, 80.0, 50.0, 5.0)
-            min_holdings = st.number_input("Minimum Holdings Count", 10, 200, 30, 5)
-            unrated_limit = st.number_input("Unrated Securities Limit (%)", 0.0, 30.0, 10.0, 1.0)
-
-    with c2:
-        st.subheader("2) Custom Rules")
-        rules_text = st.text_area(
-            "One rule per line",
-            height=200,
-            value=(
-                "# Examples\n"
-                "# STOCK RELIANCE < 10\n"
-                "# SECTOR BANKING < 25\n"
-                "# TOP_N_STOCKS 10 <= 50\n"
-                "# RATING AAA >= 30\n"
-                "# UNRATED_EXPOSURE <= 10\n"
-            )
-        )
-        with st.expander("📖 Syntax Guide"):
-            st.markdown(
-                "- STOCK [Symbol] <op> [Value]%\n"
-                "- SECTOR [Name] <op> [Value]%\n"
-                "- TOP_N_STOCKS [N] <op> [Value]%\n"
-                "- TOP_N_SECTORS [N] <op> [Value]%\n"
-                "- COUNT_STOCKS <op> [Value]\n"
-                "- COUNT_SECTORS <op> [Value]\n"
-                "- RATING [Rating] <op> [Value]%\n"
-                "- UNRATED_EXPOSURE <op> [Value]%\n"
-                "- ASSET_CLASS [Class] <op> [Value]%\n"
-                "- MARKET_CAP [Cap] <op> [Value]%\n"
-                "- ISSUER_GROUP [Group] <op> [Value]%\n"
-                "- MIN_LIQUIDITY [Symbol] >= [Volume]\n"
-                "- FOREIGN_EXPOSURE <op> [Value]%\n"
-                "- DERIVATIVES_EXPOSURE <op> [Value]%"
-            )
-
-    if up is not None and kc is not None:
+    st.markdown("Comprehensive compliance validation at portfolio and security level with regulatory oversight.")
+    
+    if not kite_client:
+        st.info("Please login to Kite Connect to fetch live prices.")
+        return
+    
+    col1, col2 = st.columns([2, 3])
+    
+    with col1:
+        st.subheader("1. Upload Portfolio")
+        uploaded_file = st.file_uploader("Choose a CSV file", type="csv", help="Required: 'Symbol', 'Industry', 'Quantity', 'Market/Fair Value(Rs. in Lacs)'.")
+        
+        st.markdown("##### Compliance Configuration")
+        with st.expander("⚙️ Set Compliance Thresholds"):
+            single_stock_limit = st.number_input("Single Stock Limit (%)", 1.0, 25.0, 10.0, 0.5, help="Maximum weight for any single stock")
+            single_sector_limit = st.number_input("Single Sector Limit (%)", 5.0, 50.0, 25.0, 1.0, help="Maximum weight for any single sector")
+            top_10_limit = st.number_input("Top 10 Holdings Limit (%)", 20.0, 80.0, 50.0, 5.0, help="Maximum combined weight of top 10 holdings")
+            min_holdings = st.number_input("Minimum Holdings Count", 10, 200, 30, 5, help="Minimum number of securities")
+            unrated_limit = st.number_input("Unrated Securities Limit (%)", 0.0, 30.0, 10.0, 1.0, help="Maximum weight in unrated securities")
+    
+    with col2:
+        st.subheader("2. Define Custom Compliance Rules")
+        rules_text = st.text_area("Enter one rule per line.", height=200, key="compliance_rules_input", 
+                                   help="Define custom rules for validation", 
+                                   value="""# Example Rules (remove/modify as needed)
+# STOCK RELIANCE < 10
+# SECTOR BANKING < 25
+# TOP_N_STOCKS 10 <= 50
+# RATING AAA >= 30
+# UNRATED_EXPOSURE <= 10""")
+        
+        with st.expander("📖 Comprehensive Rule Syntax Guide"):
+            st.markdown("""
+            **Available Rule Types:**
+            
+            **1. Stock Level:**
+            - `STOCK [Symbol] <op> [Value]%` - Single stock weight limit
+            - Example: `STOCK RELIANCE < 10`
+            
+            **2. Sector Level:**
+            - `SECTOR [Name] <op> [Value]%` - Sector exposure limit
+            - Example: `SECTOR BANKING < 25`
+            
+            **3. Concentration Rules:**
+            - `TOP_N_STOCKS [N] <op> [Value]%` - Top N stocks combined weight
+            - `TOP_N_SECTORS [N] <op> [Value]%` - Top N sectors combined weight
+            - Example: `TOP_N_STOCKS 5 <= 35`
+            
+            **4. Count Rules:**
+            - `COUNT_STOCKS <op> [Value]` - Total number of holdings
+            - `COUNT_SECTORS <op> [Value]` - Number of sectors
+            - Example: `COUNT_STOCKS >= 30`
+            
+            **5. Rating & Quality:**
+            - `RATING [Rating] <op> [Value]%` - Specific rating exposure
+            - `UNRATED_EXPOSURE <op> [Value]%` - Unrated securities limit
+            - Example: `RATING AAA >= 40`
+            
+            **6. Asset Class:**
+            - `ASSET_CLASS [Class] <op> [Value]%` - Asset class allocation
+            - Example: `ASSET_CLASS EQUITY >= 80`
+            
+            **7. Market Cap:**
+            - `MARKET_CAP [Cap] <op> [Value]%` - Market cap exposure
+            - Example: `MARKET_CAP LARGE >= 70`
+            
+            **8. Issuer Group:**
+            - `ISSUER_GROUP [Group] <op> [Value]%` - Group company exposure
+            - Example: `ISSUER_GROUP TATA < 15`
+            
+            **9. Liquidity:**
+            - `MIN_LIQUIDITY [Symbol] >= [Volume]` - Minimum trading volume
+            - Example: `MIN_LIQUIDITY INFY >= 100000`
+            
+            **10. Foreign & Derivatives:**
+            - `FOREIGN_EXPOSURE <op> [Value]%` - International holdings
+            - `DERIVATIVES_EXPOSURE <op> [Value]%` - Derivatives position
+            
+            **Operators:** `>`, `<`, `>=`, `<=`, `=`
+            """)
+    
+    if uploaded_file is not None:
         try:
-            df = pd.read_csv(up)
-            # normalize headers
-            df.columns = [str(c).strip().lower().replace(' ', '_').replace('.', '').replace('/', '_') for c in df.columns]
+            df = pd.read_csv(uploaded_file)
+            df.columns = [str(col).strip().lower().replace(' ', '_').replace('.', '').replace('/', '_') for col in df.columns]
+            
             header_map = {
                 'isin': 'ISIN',
                 'name_of_the_instrument': 'Name',
@@ -754,499 +771,1262 @@ with tab_compliance:
                 'country': 'Country',
                 'instrument_type': 'Instrument Type',
                 'avg_volume_(90d)': 'Avg Volume (90d)',
-                'market_fair_value(rs_in_lacs)': 'Uploaded Value (Lacs)',
+                'market_fair_value(rs_in_lacs)': 'Uploaded Value (Lacs)'
             }
             df = df.rename(columns=header_map)
+            
+            # Normalize categorical columns
             for col in ['Rating', 'Asset Class', 'Industry', 'Market Cap', 'Issuer Group', 'Country', 'Instrument Type']:
                 if col in df.columns:
-                    df[col] = df[col].fillna('UNKNOWN').astype(str).str.strip().str.upper()
-
-            if st.button("🔍 Analyze & Validate", type="primary"):
-                with st.spinner("Fetching prices and computing analytics..."):
-                    symbols = df['Symbol'].astype(str).str.upper().unique().tolist()
-                    try:
-                        ltp = kc.ltp([f"{DEFAULT_EXCHANGE}:{s}" for s in symbols])
-                    except Exception as e:
-                        st.error(f"LTP fetch failed: {e}")
-                        ltp = {}
-
-                    price_map = {s: ltp.get(f"{DEFAULT_EXCHANGE}:{s}", {}).get('last_price') for s in symbols}
-                    res = df.copy()
-                    res['Symbol'] = res['Symbol'].astype(str).str.upper()
-                    res['LTP'] = res['Symbol'].map(price_map)
-                    res['Quantity'] = pd.to_numeric(res.get('Quantity', 0), errors='coerce').fillna(0)
-                    res['Real-time Value (Rs)'] = (res['LTP'] * res['Quantity']).fillna(0)
-                    tot = float(res['Real-time Value (Rs)'].sum())
-                    res['Weight %'] = (res['Real-time Value (Rs)'] / tot * 100) if tot > 0 else 0.0
-
-                    st.session_state["cfg_thresholds"] = {
-                        "single_stock_limit": float(single_stock_limit),
-                        "single_sector_limit": float(single_sector_limit),
-                        "top_10_limit": float(top_10_limit),
-                        "min_holdings": int(min_holdings),
-                        "unrated_limit": float(unrated_limit),
-                    }
-
-                    sec_comp = calculate_security_level_compliance(res, {
+                    df[col] = df[col].fillna('UNKNOWN').str.strip().str.upper()
+            
+            if st.button("🔍 Analyze & Validate Portfolio", type="primary", use_container_width=True):
+                with st.spinner("Fetching live prices and performing comprehensive analysis..."):
+                    symbols = df['Symbol'].unique().tolist()
+                    ltp_data = kite_client.ltp([f"{DEFAULT_EXCHANGE}:{s}" for s in symbols])
+                    prices = {sym: ltp_data.get(f"{DEFAULT_EXCHANGE}:{sym}", {}).get('last_price') for sym in symbols}
+                    
+                    df_results = df.copy()
+                    df_results['LTP'] = df_results['Symbol'].map(prices)
+                    df_results['Real-time Value (Rs)'] = (df_results['LTP'] * pd.to_numeric(df_results['Quantity'], errors='coerce')).fillna(0)
+                    total_value = df_results['Real-time Value (Rs)'].sum()
+                    df_results['Weight %'] = (df_results['Real-time Value (Rs)'] / total_value * 100) if total_value > 0 else 0
+                    
+                    # Calculate security-level compliance
+                    rules_config = {
                         'single_stock_limit': single_stock_limit,
                         'single_sector_limit': single_sector_limit,
-                        'min_liquidity': 100000
-                    })
-
-                    st.session_state["compliance_results_df"] = res
-                    st.session_state["security_level_compliance"] = sec_comp
-                    st.session_state["advanced_metrics"] = None
-
+                        'min_liquidity': 100000  # Default
+                    }
+                    
+                    security_compliance = calculate_security_level_compliance(df_results, rules_config)
+                    
+                    st.session_state.compliance_results_df = df_results
+                    st.session_state.security_level_compliance = security_compliance
+                    st.session_state.advanced_metrics = None
+                    
+                    # Generate breach alerts
                     breaches = []
-                    if (res['Weight %'] > single_stock_limit).any():
-                        for _, r in res[res['Weight %'] > single_stock_limit].iterrows():
+                    if (df_results['Weight %'] > single_stock_limit).any():
+                        breach_stocks = df_results[df_results['Weight %'] > single_stock_limit]
+                        for _, stock in breach_stocks.iterrows():
                             breaches.append({
-                                "type": "Single Stock Limit",
-                                "severity": "🔴 Critical",
-                                "details": f"{r['Symbol']} at {r['Weight %']:.2f}% (Limit: {single_stock_limit}%)"
+                                'type': 'Single Stock Limit',
+                                'severity': '🔴 Critical',
+                                'details': f"{stock['Symbol']} at {stock['Weight %']:.2f}% (Limit: {single_stock_limit}%)"
                             })
-                    sec_w = res.groupby('Industry')['Weight %'].sum()
-                    if (sec_w > single_sector_limit).any():
-                        for sec, wt in sec_w[sec_w > single_sector_limit].items():
+                    
+                    sector_weights = df_results.groupby('Industry')['Weight %'].sum()
+                    if (sector_weights > single_sector_limit).any():
+                        breach_sectors = sector_weights[sector_weights > single_sector_limit]
+                        for sector, weight in breach_sectors.items():
                             breaches.append({
-                                "type": "Sector Limit",
-                                "severity": "🟠 High",
-                                "details": f"{sec} at {wt:.2f}% (Limit: {single_sector_limit}%)"
+                                'type': 'Sector Limit',
+                                'severity': '🟠 High',
+                                'details': f"{sector} at {weight:.2f}% (Limit: {single_sector_limit}%)"
                             })
-                    st.session_state["breach_alerts"] = breaches
-
-                    st.success("✅ Analysis complete.")
+                    
+                    st.session_state.breach_alerts = breaches
+                    
+                    st.success("✅ Analysis Complete!")
                     if breaches:
-                        st.warning(f"⚠️ {len(breaches)} breach(es) detected.")
-
+                        st.warning(f"⚠️ {len(breaches)} compliance breach(es) detected!")
+        
         except Exception as e:
-            st.error(f"CSV parse/analysis error: {e}")
+            st.error(f"Failed to process CSV file. Error: {e}")
             st.exception(e)
-
-    results_df = st.session_state["compliance_results_df"]
-
+    
+    results_df = st.session_state.get("compliance_results_df", pd.DataFrame())
+    
     if not results_df.empty and 'Weight %' in results_df.columns:
-        st.divider()
-        if st.session_state["breach_alerts"]:
-            st.error("🚨 Compliance Breaches")
-            st.dataframe(pd.DataFrame(st.session_state["breach_alerts"]), hide_index=True, use_container_width=True)
-
-        subtabs = st.tabs([
-            "📊 Executive Dashboard",
-            "🔍 Detailed Breakdowns",
+        st.markdown("---")
+        
+        # Display breach alerts
+        if st.session_state.get("breach_alerts"):
+            st.error("🚨 **Compliance Breach Alert**")
+            breach_df = pd.DataFrame(st.session_state["breach_alerts"])
+            st.dataframe(breach_df, use_container_width=True, hide_index=True)
+        
+        analysis_tabs = st.tabs([
+            "📊 Executive Dashboard", 
+            "🔍 Detailed Breakdowns", 
             "📈 Advanced Risk Analytics",
             "⚖️ Rule Validation",
             "🔐 Security-Level Compliance",
             "📊 Concentration Analysis",
-            "📄 Full Report",
-            "💾 Save / Export",
+            "📄 Full Report"
         ])
-
-        # Executive
-        with subtabs[0]:
-            st.subheader("Executive Dashboard")
+        
+        # TAB 1: Executive Dashboard
+        with analysis_tabs[0]:
+            st.subheader("Portfolio Executive Dashboard")
             total_value = results_df['Real-time Value (Rs)'].sum()
-            k1, k2, k3, k4, k5 = st.columns(5)
-            k1.metric("Portfolio Value", f"₹ {total_value:,.2f}")
-            k2.metric("Holdings", f"{len(results_df)}")
-            k3.metric("Sectors", f"{results_df['Industry'].nunique()}")
+            
+            kpi_cols = st.columns(5)
+            kpi_cols[0].metric("Portfolio Value", f"₹ {total_value:,.2f}")
+            kpi_cols[1].metric("Holdings Count", f"{len(results_df)}")
+            kpi_cols[2].metric("Unique Sectors", f"{results_df['Industry'].nunique()}")
             if 'Rating' in results_df.columns:
-                k4.metric("Ratings", f"{results_df['Rating'].nunique()}")
-            stat = "✅ Pass" if not st.session_state["breach_alerts"] else f"❌ {len(st.session_state['breach_alerts'])} Breaches"
-            k5.metric("Compliance", stat)
-
-            st.markdown("#### Concentration")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Top Stock", f"{results_df['Weight %'].max():.2f}%")
-            c1.metric("Top 5", f"{results_df.nlargest(5, 'Weight %')['Weight %'].sum():.2f}%")
-            c2.metric("Top 10", f"{results_df.nlargest(10, 'Weight %')['Weight %'].sum():.2f}%")
-            c2.metric("Top 3 Sectors", f"{results_df.groupby('Industry')['Weight %'].sum().nlargest(3).sum():.2f}%")
-            stock_hhi = float((results_df['Weight %'] ** 2).sum())
-            sector_hhi = float((results_df.groupby('Industry')['Weight %'].sum() ** 2).sum())
-            def _hhi_b(x): return "🟢 Low" if x < 1500 else ("🟡 Moderate" if x <= 2500 else "🔴 High")
-            c3.metric("Stock HHI", f"{stock_hhi:,.0f}", help=_hhi_b(stock_hhi))
-            c3.metric("Sector HHI", f"{sector_hhi:,.0f}", help=_hhi_b(sector_hhi))
-            effN = 1 / ((results_df['Weight %'] / 100) ** 2).sum()
-            secW = results_df.groupby('Industry')['Weight %'].sum() / 100
-            effN_sec = 1 / (secW ** 2).sum()
-            c4.metric("Effective N (Stocks)", f"{effN:.1f}")
-            c4.metric("Effective N (Sectors)", f"{effN_sec:.1f}")
-
-            st.markdown("#### Composition")
-            cc = st.columns(2)
-            with cc[0]:
-                top15 = results_df.nlargest(15, 'Weight %')
-                others = results_df.nsmallest(max(len(results_df) - 15, 0), 'Weight %')['Weight %'].sum()
-                pie_df = pd.concat([top15[['Name', 'Weight %']], pd.DataFrame([{'Name': 'Others', 'Weight %': others}])])
-                st.plotly_chart(px.pie(pie_df, values='Weight %', names='Name', title='Top 15 + Others', hole=0.4), use_container_width=True)
-            with cc[1]:
-                sec_df = results_df.groupby('Industry')['Weight %'].sum().reset_index().sort_values('Weight %', ascending=False)
-                fig = px.bar(sec_df.head(10), x='Weight %', y='Industry', orientation='h', title='Top Sectors', color='Weight %', color_continuous_scale='Blues')
-                fig.update_layout(yaxis={'categoryorder': 'total ascending'})
-                st.plotly_chart(fig, use_container_width=True)
-
-        # Detailed
-        with subtabs[1]:
-            st.subheader("Detailed Breakdowns")
-            btabs = st.tabs(["Holdings", "Sectors", "Ratings", "Market Cap", "Asset Class"])
-            with btabs[0]:
-                top20 = results_df.nlargest(20, 'Weight %')[['Name', 'Symbol', 'Industry', 'Weight %', 'Real-time Value (Rs)', 'LTP']]
-                fig = px.bar(top20, x='Weight %', y='Name', orientation='h', color='Industry', title='Top 20 by Weight', hover_data=['Symbol', 'Real-time Value (Rs)'])
-                fig.update_layout(yaxis={'categoryorder': 'total ascending'}, height=600)
-                st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(top20.style.format({'Weight %': '{:.2f}%', 'Real-time Value (Rs)': '₹{:,.2f}', 'LTP': '₹{:,.2f}'}), use_container_width=True)
-
-            with btabs[1]:
-                sec_agg = results_df.groupby('Industry').agg({'Weight %': 'sum', 'Real-time Value (Rs)': 'sum', 'Symbol': 'count'}).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
-                c = st.columns(2)
-                c[0].plotly_chart(px.bar(sec_agg.reset_index().head(15), x='Weight %', y='Industry', orientation='h', title='Top Sectors by Weight'), use_container_width=True)
-                c[1].plotly_chart(px.bar(sec_agg.reset_index().head(15), x='Count', y='Industry', orientation='h', title='Sectors by Count', color='Count', color_continuous_scale='Greens'), use_container_width=True)
-                st.dataframe(sec_agg.style.format({'Weight %': '{:.2f}%', 'Real-time Value (Rs)': '₹{:,.2f}'}), use_container_width=True)
-
-            with btabs[2]:
+                kpi_cols[3].metric("Unique Ratings", f"{results_df['Rating'].nunique()}")
+            kpi_cols[4].metric("Compliance Status", "✅ Pass" if not st.session_state.get("breach_alerts") else f"❌ {len(st.session_state['breach_alerts'])} Breaches")
+            
+            st.markdown("#### Key Concentration Metrics")
+            conc_cols = st.columns(4)
+            
+            with conc_cols[0]:
+                st.metric("Top Stock Weight", f"{results_df['Weight %'].max():.2f}%")
+                st.metric("Top 5 Stocks", f"{results_df.nlargest(5, 'Weight %')['Weight %'].sum():.2f}%")
+            
+            with conc_cols[1]:
+                st.metric("Top 10 Stocks", f"{results_df.nlargest(10, 'Weight %')['Weight %'].sum():.2f}%")
+                st.metric("Top 3 Sectors", f"{results_df.groupby('Industry')['Weight %'].sum().nlargest(3).sum():.2f}%")
+            
+            with conc_cols[2]:
+                stock_hhi = (results_df['Weight %'] ** 2).sum()
+                def get_hhi_category(score):
+                    return "🟢 Low" if score < 1500 else "🟡 Moderate" if score <= 2500 else "🔴 High"
+                st.metric("Stock HHI", f"{stock_hhi:,.0f}", help=get_hhi_category(stock_hhi))
+                sector_hhi = (results_df.groupby('Industry')['Weight %'].sum() ** 2).sum()
+                st.metric("Sector HHI", f"{sector_hhi:,.0f}", help=get_hhi_category(sector_hhi))
+            
+            with conc_cols[3]:
+                # Effective N
+                effective_n_stocks = 1 / ((results_df['Weight %'] / 100) ** 2).sum()
+                st.metric("Effective N (Stocks)", f"{effective_n_stocks:.1f}", help="Portfolio acts like this many equal-weighted stocks")
+                sector_weights_pct = results_df.groupby('Industry')['Weight %'].sum() / 100
+                effective_n_sectors = 1 / (sector_weights_pct ** 2).sum()
+                st.metric("Effective N (Sectors)", f"{effective_n_sectors:.1f}")
+            
+            # Visual dashboard
+            st.markdown("#### Portfolio Composition Overview")
+            dash_cols = st.columns(2)
+            
+            with dash_cols[0]:
+                # Top 15 holdings pie chart
+                top_15 = results_df.nlargest(15, 'Weight %')
+                others_weight = results_df.nsmallest(len(results_df) - 15, 'Weight %')['Weight %'].sum()
+                
+                plot_data = pd.concat([
+                    top_15[['Name', 'Weight %']],
+                    pd.DataFrame([{'Name': 'Others', 'Weight %': others_weight}])
+                ])
+                
+                fig_pie = px.pie(plot_data, values='Weight %', names='Name', 
+                                title='Portfolio Composition (Top 15 + Others)',
+                                hole=0.4)
+                st.plotly_chart(fig_pie, use_container_width=True)
+            
+            with dash_cols[1]:
+                # Sector allocation
+                sector_data = results_df.groupby('Industry')['Weight %'].sum().reset_index().sort_values('Weight %', ascending=False)
+                fig_sector = px.bar(sector_data.head(10), x='Weight %', y='Industry', orientation='h',
+                                   title='Top 10 Sector Allocations',
+                                   color='Weight %', color_continuous_scale='Blues')
+                fig_sector.update_layout(yaxis={'categoryorder': 'total ascending'})
+                st.plotly_chart(fig_sector, use_container_width=True)
+        
+        # TAB 2: Detailed Breakdowns
+        with analysis_tabs[1]:
+            st.subheader("Comprehensive Portfolio Breakdowns")
+            
+            breakdown_subtabs = st.tabs(["Holdings", "Sectors", "Ratings", "Market Cap", "Asset Class"])
+            
+            with breakdown_subtabs[0]:
+                st.markdown("##### Top 20 Holdings Analysis")
+                top_20 = results_df.nlargest(20, 'Weight %')[['Name', 'Symbol', 'Industry', 'Weight %', 'Real-time Value (Rs)', 'LTP']]
+                
+                fig_holdings = px.bar(top_20, x='Weight %', y='Name', orientation='h',
+                                    title='Top 20 Holdings by Weight',
+                                    color='Industry',
+                                    hover_data=['Symbol', 'Real-time Value (Rs)'])
+                fig_holdings.update_layout(yaxis={'categoryorder': 'total ascending'}, height=600)
+                st.plotly_chart(fig_holdings, use_container_width=True)
+                
+                st.dataframe(top_20.style.format({
+                    'Weight %': '{:.2f}%',
+                    'Real-time Value (Rs)': '₹{:,.2f}',
+                    'LTP': '₹{:,.2f}'
+                }), use_container_width=True)
+            
+            with breakdown_subtabs[1]:
+                st.markdown("##### Sector-wise Analysis")
+                sector_analysis = results_df.groupby('Industry').agg({
+                    'Weight %': 'sum',
+                    'Real-time Value (Rs)': 'sum',
+                    'Symbol': 'count'
+                }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    fig_sector_bar = px.bar(sector_analysis.reset_index().head(15), 
+                                          x='Weight %', y='Industry', orientation='h',
+                                          title='Top 15 Sectors by Weight')
+                    fig_sector_bar.update_layout(yaxis={'categoryorder': 'total ascending'})
+                    st.plotly_chart(fig_sector_bar, use_container_width=True)
+                
+                with col2:
+                    fig_sector_count = px.bar(sector_analysis.reset_index().head(15),
+                                            x='Count', y='Industry', orientation='h',
+                                            title='Top 15 Sectors by Holdings Count',
+                                            color='Count', color_continuous_scale='Greens')
+                    fig_sector_count.update_layout(yaxis={'categoryorder': 'total ascending'})
+                    st.plotly_chart(fig_sector_count, use_container_width=True)
+                
+                st.dataframe(sector_analysis.style.format({
+                    'Weight %': '{:.2f}%',
+                    'Real-time Value (Rs)': '₹{:,.2f}'
+                }), use_container_width=True)
+            
+            with breakdown_subtabs[2]:
                 if 'Rating' in results_df.columns:
-                    rat = results_df.groupby('Rating').agg({'Weight %': 'sum', 'Symbol': 'count'}).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
-                    c = st.columns(2)
-                    c[0].plotly_chart(px.pie(rat.reset_index(), values='Weight %', names='Rating', title='Rating by Weight', hole=0.3), use_container_width=True)
-                    c[1].plotly_chart(px.bar(rat.reset_index(), x='Weight %', y='Rating', orientation='h', title='Rating Exposure', color='Weight %', color_continuous_scale='RdYlGn_r'), use_container_width=True)
-                    st.dataframe(rat.style.format({'Weight %': '{:.2f}%'}), use_container_width=True)
+                    st.markdown("##### Credit Rating Distribution")
+                    rating_analysis = results_df.groupby('Rating').agg({
+                        'Weight %': 'sum',
+                        'Symbol': 'count'
+                    }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        fig_rating = px.pie(rating_analysis.reset_index(), values='Weight %', names='Rating',
+                                          title='Rating Distribution by Weight', hole=0.3)
+                        st.plotly_chart(fig_rating, use_container_width=True)
+                    
+                    with col2:
+                        fig_rating_bar = px.bar(rating_analysis.reset_index(), x='Weight %', y='Rating',
+                                              orientation='h', title='Rating Exposure by Weight',
+                                              color='Weight %', color_continuous_scale='RdYlGn_r')
+                        fig_rating_bar.update_layout(yaxis={'categoryorder': 'total ascending'})
+                        st.plotly_chart(fig_rating_bar, use_container_width=True)
+                    
+                    st.dataframe(rating_analysis.style.format({'Weight %': '{:.2f}%'}), use_container_width=True)
                 else:
-                    st.info("No Rating column")
-
-            with btabs[3]:
+                    st.info("Rating information not available in portfolio data.")
+            
+            with breakdown_subtabs[3]:
                 if 'Market Cap' in results_df.columns:
-                    mc = results_df.groupby('Market Cap').agg({'Weight %': 'sum', 'Symbol': 'count'}).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
-                    c = st.columns(2)
-                    c[0].plotly_chart(px.pie(mc.reset_index(), values='Weight %', names='Market Cap', title='Market Cap Mix', hole=0.3), use_container_width=True)
-                    st.dataframe(mc.style.format({'Weight %': '{:.2f}%'}), use_container_width=True)
+                    st.markdown("##### Market Capitalization Analysis")
+                    mcap_analysis = results_df.groupby('Market Cap').agg({
+                        'Weight %': 'sum',
+                        'Symbol': 'count'
+                    }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        fig_mcap = px.pie(mcap_analysis.reset_index(), values='Weight %', names='Market Cap',
+                                        title='Market Cap Distribution', hole=0.3)
+                        st.plotly_chart(fig_mcap, use_container_width=True)
+                    
+                    with col2:
+                        st.markdown("**Market Cap Statistics**")
+                        st.dataframe(mcap_analysis.style.format({'Weight %': '{:.2f}%'}), use_container_width=True)
                 else:
-                    st.info("No Market Cap column")
-
-            with btabs[4]:
+                    st.info("Market Cap information not available in portfolio data.")
+            
+            with breakdown_subtabs[4]:
                 if 'Asset Class' in results_df.columns:
-                    ac = results_df.groupby('Asset Class').agg({'Weight %': 'sum', 'Symbol': 'count'}).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
-                    c = st.columns(2)
-                    c[0].plotly_chart(px.pie(ac.reset_index(), values='Weight %', names='Asset Class', title='Asset Class Mix', hole=0.3), use_container_width=True)
-                    st.dataframe(ac.style.format({'Weight %': '{:.2f}%'}), use_container_width=True)
+                    st.markdown("##### Asset Class Allocation")
+                    asset_analysis = results_df.groupby('Asset Class').agg({
+                        'Weight %': 'sum',
+                        'Symbol': 'count'
+                    }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        fig_asset = px.pie(asset_analysis.reset_index(), values='Weight %', names='Asset Class',
+                                         title='Asset Class Distribution', hole=0.3)
+                        st.plotly_chart(fig_asset, use_container_width=True)
+                    
+                    with col2:
+                        st.markdown("**Asset Class Statistics**")
+                        st.dataframe(asset_analysis.style.format({'Weight %': '{:.2f}%'}), use_container_width=True)
                 else:
-                    st.info("No Asset Class column")
-
+                    st.info("Asset Class information not available in portfolio data.")
+            
+            # Interactive Treemap
             st.markdown("---")
-            st.markdown("##### Treemap")
-            tcols = st.columns([3, 1])
-            with tcols[1]:
-                depth = st.radio("Hierarchy", ["Industry → Stock", "Industry → Rating → Stock"])
-            with tcols[0]:
-                if depth == "Industry → Stock":
-                    fig = px.treemap(results_df, path=[px.Constant("Portfolio"), 'Industry', 'Name'], values='Real-time Value (Rs)', hover_data={'Weight %': ':.2f'})
+            st.markdown("##### 🗺️ Interactive Portfolio Treemap")
+            treemap_cols = st.columns([3, 1])
+            
+            with treemap_cols[1]:
+                treemap_depth = st.radio("Hierarchy Depth", ["Industry → Stock", "Industry → Rating → Stock"], key="treemap_depth")
+            
+            with treemap_cols[0]:
+                if treemap_depth == "Industry → Stock":
+                    fig_treemap = px.treemap(results_df, path=[px.Constant("Portfolio"), 'Industry', 'Name'],
+                                           values='Real-time Value (Rs)',
+                                           hover_data={'Weight %': ':.2f'},
+                                           title='Portfolio Treemap: Industry → Stock')
                 else:
                     if 'Rating' in results_df.columns:
-                        fig = px.treemap(results_df, path=[px.Constant("Portfolio"), 'Industry', 'Rating', 'Name'], values='Real-time Value (Rs)', hover_data={'Weight %': ':.2f'})
+                        fig_treemap = px.treemap(results_df, path=[px.Constant("Portfolio"), 'Industry', 'Rating', 'Name'],
+                                               values='Real-time Value (Rs)',
+                                               hover_data={'Weight %': ':.2f'},
+                                               title='Portfolio Treemap: Industry → Rating → Stock')
                     else:
-                        st.warning("Rating not available; using Industry → Stock")
-                        fig = px.treemap(results_df, path=[px.Constant("Portfolio"), 'Industry', 'Name'], values='Real-time Value (Rs)', hover_data={'Weight %': ':.2f'})
-                fig.update_layout(margin=dict(t=40, l=25, r=25, b=25), height=600)
-                st.plotly_chart(fig, use_container_width=True)
-
-        # Risk
-        with subtabs[2]:
-            st.subheader("Advanced Risk Analytics")
-            lc = st.columns([2, 1])
-            with lc[1]:
-                if st.button("🔄 Calculate Advanced Metrics", type="primary", use_container_width=True):
-                    with st.spinner("Computing..."):
-                        st.session_state["advanced_metrics"] = calculate_advanced_metrics(
-                            results_df, CONF["kite"]["api_key"], st.session_state["kite_access_token"]
+                        st.warning("Rating column not found. Showing default hierarchy.")
+                        fig_treemap = px.treemap(results_df, path=[px.Constant("Portfolio"), 'Industry', 'Name'],
+                                               values='Real-time Value (Rs)',
+                                               hover_data={'Weight %': ':.2f'},
+                                               title='Portfolio Treemap: Industry → Stock')
+                
+                fig_treemap.update_layout(margin=dict(t=50, l=25, r=25, b=25), height=600)
+                st.plotly_chart(fig_treemap, use_container_width=True)
+        
+        # TAB 3: Advanced Risk Analytics
+        with analysis_tabs[2]:
+            st.subheader("Advanced Risk & Return Analytics")
+            
+            col1, col2 = st.columns([2, 1])
+            
+            with col2:
+                if st.button("🔄 Calculate Advanced Metrics", key="calc_adv_metrics", use_container_width=True, type="primary"):
+                    with st.spinner("Calculating advanced metrics... This may take 1-2 minutes."):
+                        st.session_state.advanced_metrics = calculate_advanced_metrics(results_df, api_key, access_token)
+            
+            with col1:
+                st.info("💡 Advanced metrics require historical data for all holdings. Click button to calculate.")
+            
+            if st.session_state.advanced_metrics:
+                metrics = st.session_state.advanced_metrics
+                
+                st.markdown("#### Risk Metrics Dashboard")
+                risk_cols = st.columns(4)
+                
+                risk_cols[0].metric("Daily VaR (95%)", 
+                                   f"{metrics['var_95'] * 100:.2f}%",
+                                   help="Maximum expected daily loss with 95% confidence")
+                risk_cols[1].metric("Daily VaR (99%)", 
+                                   f"{metrics['var_99'] * 100:.2f}%",
+                                   help="Maximum expected daily loss with 99% confidence")
+                risk_cols[2].metric("CVaR (95%)", 
+                                   f"{metrics['cvar_95'] * 100:.2f}%",
+                                   help="Expected loss beyond VaR threshold")
+                risk_cols[3].metric("Portfolio Volatility", 
+                                   f"{metrics['portfolio_volatility'] * 100:.2f}%" if metrics['portfolio_volatility'] is not None else "N/A",
+                                   help="Annualized standard deviation")
+                
+                st.markdown("#### Performance Metrics")
+                perf_cols = st.columns(4)
+                
+                if metrics['beta'] is not None:
+                    perf_cols[0].metric(f"Beta (vs {BENCHMARK_SYMBOL})", 
+                                       f"{metrics['beta']:.3f}",
+                                       help="Systematic risk relative to market")
+                else:
+                    perf_cols[0].metric("Beta", "N/A", help="Benchmark data unavailable")
+                
+                if metrics['alpha'] is not None:
+                    perf_cols[1].metric("Alpha (Annualized)", 
+                                       f"{metrics['alpha'] * 100:.2f}%",
+                                       help="Excess return vs expected return")
+                else:
+                    perf_cols[1].metric("Alpha", "N/A")
+                
+                if metrics['tracking_error'] is not None:
+                    perf_cols[2].metric("Tracking Error", 
+                                       f"{metrics['tracking_error'] * 100:.2f}%",
+                                       help="Standard deviation of active returns")
+                else:
+                    perf_cols[2].metric("Tracking Error", "N/A")
+                
+                if metrics['information_ratio'] is not None:
+                    perf_cols[3].metric("Information Ratio", 
+                                       f"{metrics['information_ratio']:.3f}",
+                                       help="Active return per unit of tracking error")
+                else:
+                    perf_cols[3].metric("Information Ratio", "N/A")
+                
+                st.markdown("#### Diversification Metrics")
+                div_cols = st.columns(3)
+                
+                if metrics['sortino_ratio'] is not None:
+                    div_cols[0].metric("Sortino Ratio", 
+                                      f"{metrics['sortino_ratio']:.3f}",
+                                      help="Risk-adjusted return using downside deviation")
+                else:
+                    div_cols[0].metric("Sortino Ratio", "N/A")
+                
+                div_cols[1].metric("Avg Correlation", 
+                                  f"{metrics['avg_correlation']:.3f}",
+                                  help="Average pairwise correlation between holdings")
+                
+                if metrics['diversification_ratio'] is not None:
+                    div_cols[2].metric("Diversification Ratio", 
+                                      f"{metrics['diversification_ratio']:.3f}",
+                                      help="Weighted volatility / portfolio volatility (>1 is better)")
+                else:
+                    div_cols[2].metric("Diversification Ratio", "N/A")
+                
+                # Risk visualization
+                st.markdown("---")
+                st.markdown("#### Risk Analysis Interpretation")
+                
+                interp_cols = st.columns(2)
+                
+                with interp_cols[0]:
+                    st.markdown("**🎯 Risk Assessment:**")
+                    
+                    if abs(metrics['var_95'] * 100) < 2:
+                        st.success("✅ Low daily risk exposure")
+                    elif abs(metrics['var_95'] * 100) < 4:
+                        st.warning("⚠️ Moderate daily risk exposure")
+                    else:
+                        st.error("🔴 High daily risk exposure")
+                    
+                    if metrics['beta'] is not None:
+                        if metrics['beta'] < 0.8:
+                            st.info("📉 Portfolio is less volatile than market (defensive)")
+                        elif metrics['beta'] < 1.2:
+                            st.info("📊 Portfolio volatility aligned with market")
+                        else:
+                            st.warning("📈 Portfolio is more volatile than market (aggressive)")
+                
+                with interp_cols[1]:
+                    st.markdown("**📊 Performance Assessment:**")
+                    
+                    if metrics['alpha'] is not None:
+                        if metrics['alpha'] > 0.02:
+                            st.success("✅ Strong positive alpha - outperforming expectations")
+                        elif metrics['alpha'] > -0.02:
+                            st.info("➡️ Neutral alpha - performing as expected")
+                        else:
+                            st.error("🔴 Negative alpha - underperforming expectations")
+                    
+                    if metrics['information_ratio'] is not None:
+                        if metrics['information_ratio'] > 0.5:
+                            st.success("✅ Good active management efficiency")
+                        elif metrics['information_ratio'] > 0:
+                            st.info("➡️ Moderate active management efficiency")
+                        else:
+                            st.warning("⚠️ Poor active management efficiency")
+            
+            else:
+                st.info("Click 'Calculate Advanced Metrics' to view risk analytics based on 1-year historical data.")
+        
+        # TAB 4: Rule Validation
+        with analysis_tabs[3]:
+            st.subheader("⚖️ Compliance Rule Validation")
+            
+            st.markdown("**Custom Rules Validation Results:**")
+            
+            validation_results = parse_and_validate_rules_enhanced(rules_text, results_df)
+            
+            if not validation_results:
+                st.info("Define rules in the sidebar to see validation results.")
+            else:
+                # Summary metrics
+                total_rules = len(validation_results)
+                passed = sum(1 for r in validation_results if r['status'] == "✅ PASS")
+                failed = sum(1 for r in validation_results if r['status'] == "❌ FAIL")
+                errors = sum(1 for r in validation_results if 'Error' in r['status'] or 'Invalid' in r['status'])
+                
+                summary_cols = st.columns(4)
+                summary_cols[0].metric("Total Rules", total_rules)
+                summary_cols[1].metric("✅ Passed", passed)
+                summary_cols[2].metric("❌ Failed", failed)
+                summary_cols[3].metric("⚠️ Errors", errors)
+                
+                # Filter options
+                filter_cols = st.columns([2, 1])
+                with filter_cols[0]:
+                    status_filter = st.multiselect(
+                        "Filter by Status",
+                        ["✅ PASS", "❌ FAIL", "⚠️ Invalid", "Error"],
+                        default=["✅ PASS", "❌ FAIL", "⚠️ Invalid", "Error"]
+                    )
+                
+                with filter_cols[1]:
+                    severity_filter = st.multiselect(
+                        "Filter by Severity",
+                        ["🔴 Critical", "🟠 High", "🟡 Medium", "✅ Compliant"],
+                        default=["🔴 Critical", "🟠 High", "🟡 Medium", "✅ Compliant"]
+                    )
+                
+                # Display results
+                st.markdown("---")
+                
+                for res in validation_results:
+                    if res['status'] not in status_filter:
+                        continue
+                    if 'severity' in res and res['severity'] not in severity_filter and res['severity'] != 'N/A':
+                        continue
+                    
+                    severity_label = res.get('severity', 'N/A')
+                    
+                    if res['status'] == "✅ PASS":
+                        with st.expander(f"{res['status']} {severity_label} | `{res['rule']}`", expanded=False):
+                            st.success(f"**Status:** {res['status']}")
+                            st.write(f"**Details:** {res['details']}")
+                    
+                    elif res['status'] == "❌ FAIL":
+                        with st.expander(f"{res['status']} {severity_label} | `{res['rule']}`", expanded=True):
+                            st.error(f"**Status:** {res['status']} - {severity_label}")
+                            st.write(f"**Details:** {res['details']}")
+                            
+                            if 'actual_value' in res and 'threshold' in res:
+                                st.metric("Actual Value", f"{res['actual_value']:.2f}%")
+                                st.metric("Threshold", f"{res['threshold']:.2f}%")
+                                st.metric("Breach Amount", f"{res['breach_amount']:.2f}%", 
+                                         delta=f"{res['breach_amount']:.2f}%", delta_color="inverse")
+                    
+                    else:
+                        with st.expander(f"{res['status']} | `{res['rule']}`", expanded=False):
+                            st.warning(f"**Status:** {res['status']}")
+                            st.write(f"**Details:** {res['details']}")
+                
+                # Export validation report
+                st.markdown("---")
+                if st.button("📥 Export Validation Report", use_container_width=True):
+                    validation_df = pd.DataFrame(validation_results)
+                    csv = validation_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        "Download Validation Report (CSV)",
+                        csv,
+                        f"validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        "text/csv",
+                        use_container_width=True
+                    )
+        
+        # TAB 5: Security-Level Compliance
+        with analysis_tabs[4]:
+            st.subheader("🔐 Security-Level Compliance Analysis")
+            
+            security_df = st.session_state.get("security_level_compliance", pd.DataFrame())
+            
+            if security_df.empty:
+                st.info("Security-level compliance data not available. Please analyze portfolio first.")
+            else:
+                st.markdown("**Individual Security Compliance Status:**")
+                
+                # Summary statistics
+                breach_count = (security_df['Stock Limit Breach'] == '❌ Breach').sum()
+                compliant_count = (security_df['Stock Limit Breach'] == '✅ Compliant').sum()
+                
+                summary_cols = st.columns(4)
+                summary_cols[0].metric("Total Securities", len(security_df))
+                summary_cols[1].metric("✅ Compliant", compliant_count)
+                summary_cols[2].metric("❌ Breaches", breach_count)
+                summary_cols[3].metric("Breach Rate", f"{(breach_count/len(security_df)*100):.1f}%")
+                
+                # Filters
+                st.markdown("---")
+                filter_cols = st.columns(3)
+                
+                with filter_cols[0]:
+                    compliance_filter = st.multiselect(
+                        "Stock Limit Status",
+                        security_df['Stock Limit Breach'].unique(),
+                        default=security_df['Stock Limit Breach'].unique()
+                    )
+                
+                with filter_cols[1]:
+                    if 'Concentration Risk' in security_df.columns:
+                        risk_filter = st.multiselect(
+                            "Concentration Risk",
+                            security_df['Concentration Risk'].unique(),
+                            default=security_df['Concentration Risk'].unique()
                         )
-            with lc[0]:
-                st.info("Uses 1-year daily data per holding and NIFTY 50 as benchmark.")
-            m = st.session_state["advanced_metrics"]
-            if m:
-                rc = st.columns(4)
-                rc[0].metric("VaR (95%) Daily", f"{m['var_95'] * 100:.2f}%")
-                rc[1].metric("VaR (99%) Daily", f"{m['var_99'] * 100:.2f}%")
-                rc[2].metric("CVaR (95%)", f"{m['cvar_95'] * 100:.2f}%")
-                rc[3].metric("Volatility (Ann.)", f"{m['portfolio_volatility'] * 100:.2f}%" if m['portfolio_volatility'] is not None else "N/A")
-
-                pc = st.columns(4)
-                pc[0].metric(f"Beta vs {BENCHMARK_SYMBOL}", f"{m['beta']:.3f}" if m['beta'] is not None else "N/A")
-                pc[1].metric("Alpha (Ann.)", f"{m['alpha'] * 100:.2f}%" if m['alpha'] is not None else "N/A")
-                pc[2].metric("Tracking Error", f"{m['tracking_error'] * 100:.2f}%" if m['tracking_error'] is not None else "N/A")
-                pc[3].metric("Information Ratio", f"{m['information_ratio']:.3f}" if m['information_ratio'] is not None else "N/A")
-
-                dc = st.columns(3)
-                dc[0].metric("Sortino", f"{m['sortino_ratio']:.3f}" if m['sortino_ratio'] is not None else "N/A")
-                dc[1].metric("Avg Correlation", f"{m['avg_correlation']:.3f}" if m['avg_correlation'] is not None else "N/A")
-                dc[2].metric("Diversification Ratio", f"{m['diversification_ratio']:.3f}" if m['diversification_ratio'] is not None else "N/A")
-
-        # Rule validation
-        with subtabs[3]:
-            st.subheader("Rule Validation")
-            st.write("Results based on your custom rules.")
-            vals = parse_and_validate_rules_enhanced(rules_text, results_df)
-            st.session_state["last_validation_results"] = vals
-
-            if not vals:
-                st.info("Add rules to see results.")
-            else:
-                total = len(vals)
-                passed = sum(1 for r in vals if r['status'] == "✅ PASS")
-                failed = sum(1 for r in vals if r['status'] == "❌ FAIL")
-                errors = sum(1 for r in vals if 'Error' in r['status'] or 'Invalid' in r['status'])
-                mc = st.columns(4)
-                mc[0].metric("Total Rules", total)
-                mc[1].metric("✅ Passed", passed)
-                mc[2].metric("❌ Failed", failed)
-                mc[3].metric("⚠️ Errors", errors)
-
-                fc = st.columns([2, 1])
-                with fc[0]:
-                    sf = st.multiselect("Status filter", ["✅ PASS", "❌ FAIL", "⚠️ Invalid", "Error"], default=["✅ PASS", "❌ FAIL", "⚠️ Invalid", "Error"])
-                with fc[1]:
-                    svf = st.multiselect("Severity", ["🔴 Critical", "🟠 High", "🟡 Medium", "✅ Compliant"], default=["🔴 Critical", "🟠 High", "🟡 Medium", "✅ Compliant"])
-
-                st.markdown("---")
-                for r in vals:
-                    if r['status'] not in sf:
-                        continue
-                    if r.get('severity') not in svf and r.get('severity') != 'N/A':
-                        continue
-                    sev = r.get('severity', 'N/A')
-                    if r['status'] == "✅ PASS":
-                        with st.expander(f"{r['status']} {sev} | `{r['rule']}`", expanded=False):
-                            st.success(r['details'])
-                    elif r['status'] == "❌ FAIL":
-                        with st.expander(f"{r['status']} {sev} | `{r['rule']}`", expanded=True):
-                            st.error(r['details'])
-                            if 'actual_value' in r:
-                                st.metric("Actual", f"{r['actual_value']:.2f}%")
-                                st.metric("Threshold", f"{r['threshold']:.2f}%")
-                                st.metric("Breach", f"{r['breach_amount']:.2f}%", delta=f"{r['breach_amount']:.2f}%", delta_color="inverse")
-                    else:
-                        with st.expander(f"{r['status']} | `{r['rule']}`"):
-                            st.warning(r['details'])
-
-                st.markdown("---")
-                if st.button("📥 Download Validation CSV", use_container_width=True):
-                    csv = pd.DataFrame(vals).to_csv(index=False).encode('utf-8')
-                    st.download_button("Save CSV", csv, file_name=f"rule_validation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv", use_container_width=True)
-
-        # Security-level
-        with subtabs[4]:
-            st.subheader("Security-Level Compliance")
-            sdf = st.session_state["security_level_compliance"]
-            if sdf.empty:
-                st.info("No data — run analysis first.")
-            else:
-                b = (sdf['Stock Limit Breach'] == '❌ Breach').sum()
-                g = (sdf['Stock Limit Breach'] == '✅ Compliant').sum()
-                mc = st.columns(4)
-                mc[0].metric("Total", len(sdf))
-                mc[1].metric("✅ Compliant", g)
-                mc[2].metric("❌ Breach", b)
-                mc[3].metric("Breach Rate", f"{(b/len(sdf)*100):.1f}%")
-
-                st.markdown("---")
-                fc = st.columns(3)
-                with fc[0]:
-                    cf = st.multiselect("Stock Limit Status", sdf['Stock Limit Breach'].unique(), default=list(sdf['Stock Limit Breach'].unique()))
-                with fc[1]:
-                    rf = st.multiselect("Concentration Risk", sdf['Concentration Risk'].unique(), default=list(sdf['Concentration Risk'].unique()))
-                with fc[2]:
-                    rcf = st.multiselect("Rating Compliance" if 'Rating Compliance' in sdf.columns else "—", list(sdf.get('Rating Compliance', pd.Series(dtype=str)).unique()) if 'Rating Compliance' in sdf.columns else [], default=list(sdf.get('Rating Compliance', pd.Series(dtype=str)).unique()) if 'Rating Compliance' in sdf.columns else [])
-
-                f = sdf[sdf['Stock Limit Breach'].isin(cf)]
-                if 'Concentration Risk' in f.columns:
-                    f = f[f['Concentration Risk'].isin(rf)]
-                if 'Rating Compliance' in f.columns and len(rcf) > 0:
-                    f = f[f['Rating Compliance'].isin(rcf)]
-
-                show_cols = ['Name', 'Symbol', 'Industry', 'Weight %', 'Stock Limit Breach', 'Stock Limit Gap (%)', 'Concentration Risk']
-                for extra in ['Liquidity Status', 'Rating Compliance', 'Rating', 'Real-time Value (Rs)']:
-                    if extra in f.columns and extra not in show_cols:
-                        show_cols.append(extra)
-
-                def _hl(row):
+                
+                with filter_cols[2]:
+                    if 'Rating Compliance' in security_df.columns:
+                        rating_filter = st.multiselect(
+                            "Rating Compliance",
+                            security_df['Rating Compliance'].unique(),
+                            default=security_df['Rating Compliance'].unique()
+                        )
+                
+                # Apply filters
+                filtered_df = security_df[security_df['Stock Limit Breach'].isin(compliance_filter)]
+                
+                if 'Concentration Risk' in security_df.columns and 'risk_filter' in locals():
+                    filtered_df = filtered_df[filtered_df['Concentration Risk'].isin(risk_filter)]
+                
+                if 'Rating Compliance' in security_df.columns and 'rating_filter' in locals():
+                    filtered_df = filtered_df[filtered_df['Rating Compliance'].isin(rating_filter)]
+                
+                # Display table
+                st.markdown(f"**Showing {len(filtered_df)} of {len(security_df)} securities**")
+                
+                display_columns = ['Name', 'Symbol', 'Industry', 'Weight %', 'Stock Limit Breach', 
+                                  'Stock Limit Gap (%)', 'Concentration Risk']
+                
+                if 'Liquidity Status' in filtered_df.columns:
+                    display_columns.append('Liquidity Status')
+                if 'Rating Compliance' in filtered_df.columns:
+                    display_columns.append('Rating Compliance')
+                if 'Rating' in filtered_df.columns:
+                    display_columns.append('Rating')
+                
+                available_columns = [col for col in display_columns if col in filtered_df.columns]
+                
+                # Color code the dataframe
+                def highlight_compliance(row):
                     if row['Stock Limit Breach'] == '❌ Breach':
                         return ['background-color: #ffcccc'] * len(row)
                     return [''] * len(row)
-                st.dataframe(f[show_cols].style.apply(_hl, axis=1).format({'Weight %': '{:.2f}%', 'Stock Limit Gap (%)': '{:.2f}%', 'Real-time Value (Rs)': '₹{:,.2f}'}), use_container_width=True, height=520)
-
-                if b > 0:
+                
+                styled_df = filtered_df[available_columns].style.apply(highlight_compliance, axis=1).format({
+                    'Weight %': '{:.2f}%',
+                    'Stock Limit Gap (%)': '{:.2f}%'
+                })
+                
+                st.dataframe(styled_df, use_container_width=True, height=500)
+                
+                # Breach details
+                if breach_count > 0:
                     st.markdown("---")
-                    st.markdown("#### Breach Details")
-                    limit_val = st.session_state["cfg_thresholds"].get("single_stock_limit", 10.0)
-                    for _, row in sdf[sdf['Stock Limit Breach'] == '❌ Breach'].sort_values('Weight %', ascending=False).iterrows():
-                        with st.expander(f"🔴 {row['Symbol']} - {row['Name']} ({row['Weight %']:.2f}%)"):
+                    st.markdown("#### 🚨 Detailed Breach Analysis")
+                    
+                    breach_df = security_df[security_df['Stock Limit Breach'] == '❌ Breach'].sort_values('Weight %', ascending=False)
+                    
+                    for idx, row in breach_df.iterrows():
+                        with st.expander(f"🔴 {row['Symbol']} - {row['Name']} ({row['Weight %']:.2f}%)", expanded=False):
                             cols = st.columns(3)
-                            cols[0].metric("Current", f"{row['Weight %']:.2f}%")
-                            cols[1].metric("Limit", f"{limit_val:.2f}%")
-                            cols[2].metric("Excess", f"{row['Weight %'] - float(limit_val):.2f}%", delta=f"{row['Weight %'] - float(limit_val):.2f}%", delta_color="inverse")
-                            st.write(f"Industry: {row['Industry']}")
-                            st.write(f"Value: ₹{row['Real-time Value (Rs)']:,.2f}" if 'Real-time Value (Rs)' in row else "")
-
+                            cols[0].metric("Current Weight", f"{row['Weight %']:.2f}%")
+                            cols[1].metric("Limit", f"{single_stock_limit:.2f}%")
+                            cols[2].metric("Excess", f"{row['Weight %'] - single_stock_limit:.2f}%",
+                                         delta=f"{row['Weight %'] - single_stock_limit:.2f}%", delta_color="inverse")
+                            
+                            st.write(f"**Industry:** {row['Industry']}")
+                            st.write(f"**Value:** ₹{row['Real-time Value (Rs)']:,.2f}")
+                            
+                            if 'Rating' in row:
+                                st.write(f"**Rating:** {row['Rating']}")
+                
+                # Export security compliance
                 st.markdown("---")
+                csv = security_df.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    "📥 Export Security Compliance CSV",
-                    sdf.to_csv(index=False).encode('utf-8'),
-                    file_name=f"security_compliance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
+                    "📥 Export Security-Level Compliance Report",
+                    csv,
+                    f"security_compliance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    "text/csv",
                     use_container_width=True
                 )
-
-        # Concentration
-        with subtabs[5]:
-            st.subheader("Concentration Analysis")
-            srt = results_df.sort_values('Weight %', ascending=False).reset_index(drop=True)
-            srt['Cumulative Weight %'] = srt['Weight %'].cumsum()
-            srt['Rank'] = range(1, len(srt) + 1)
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=srt['Rank'], y=srt['Cumulative Weight %'], mode='lines+markers', name='Portfolio', line=dict(width=2)))
-            fig.add_trace(go.Scatter(x=[0, len(srt)], y=[0, 100], mode='lines', name='Equality', line=dict(dash='dash')))
-            fig.update_layout(title="Lorenz Curve", xaxis_title="Holdings (ranked)", yaxis_title="Cumulative Weight %", height=500)
-            st.plotly_chart(fig, use_container_width=True)
-
-            bc = st.columns(5)
-            top_1 = float(srt.iloc[0]['Weight %'])
-            top_3 = float(srt.head(3)['Weight %'].sum())
-            top_5 = float(srt.head(5)['Weight %'].sum())
-            top_10 = float(srt.head(10)['Weight %'].sum())
-            top_20 = float(srt.head(20)['Weight %'].sum() if len(srt) >= 20 else srt['Weight %'].sum())
-            bc[0].metric("Top 1", f"{top_1:.2f}%"); bc[1].metric("Top 3", f"{top_3:.2f}%")
-            bc[2].metric("Top 5", f"{top_5:.2f}%"); bc[3].metric("Top 10", f"{top_10:.2f}%")
-            bc[4].metric("Top 20", f"{top_20:.2f}%")
-
+        
+        # TAB 6: Concentration Analysis
+        with analysis_tabs[5]:
+            st.subheader("📊 Deep Dive Concentration Analysis")
+            
+            st.markdown("#### Cumulative Weight Distribution")
+            
+            # Calculate cumulative weights
+            sorted_df = results_df.sort_values('Weight %', ascending=False).reset_index(drop=True)
+            sorted_df['Cumulative Weight %'] = sorted_df['Weight %'].cumsum()
+            sorted_df['Rank'] = range(1, len(sorted_df) + 1)
+            
+            # Lorenz curve
+            fig_lorenz = go.Figure()
+            
+            fig_lorenz.add_trace(go.Scatter(
+                x=sorted_df['Rank'],
+                y=sorted_df['Cumulative Weight %'],
+                mode='lines+markers',
+                name='Actual Portfolio',
+                line=dict(color='blue', width=2)
+            ))
+            
+            # Perfect equality line
+            fig_lorenz.add_trace(go.Scatter(
+                x=[0, len(sorted_df)],
+                y=[0, 100],
+                mode='lines',
+                name='Perfect Equality',
+                line=dict(color='red', dash='dash')
+            ))
+            
+            fig_lorenz.update_layout(
+                title='Portfolio Concentration Curve (Lorenz)',
+                xaxis_title='Number of Holdings (Ranked by Weight)',
+                yaxis_title='Cumulative Weight %',
+                hovermode='x unified',
+                height=500
+            )
+            
+            st.plotly_chart(fig_lorenz, use_container_width=True)
+            
+            # Concentration benchmarks
+            st.markdown("#### Concentration Benchmarks")
+            
+            bench_cols = st.columns(5)
+            
+            top_1_weight = sorted_df.iloc[0]['Weight %']
+            top_3_weight = sorted_df.head(3)['Weight %'].sum()
+            top_5_weight = sorted_df.head(5)['Weight %'].sum()
+            top_10_weight = sorted_df.head(10)['Weight %'].sum()
+            top_20_weight = sorted_df.head(20)['Weight %'].sum() if len(sorted_df) >= 20 else sorted_df['Weight %'].sum()
+            
+            bench_cols[0].metric("Top 1", f"{top_1_weight:.2f}%")
+            bench_cols[1].metric("Top 3", f"{top_3_weight:.2f}%")
+            bench_cols[2].metric("Top 5", f"{top_5_weight:.2f}%")
+            bench_cols[3].metric("Top 10", f"{top_10_weight:.2f}%")
+            bench_cols[4].metric("Top 20", f"{top_20_weight:.2f}%")
+            
+            # Sector concentration
+            st.markdown("---")
+            st.markdown("#### Sector Concentration Matrix")
+            
+            sector_concentration = results_df.groupby('Industry').agg({
+                'Weight %': ['sum', 'count', 'max'],
+                'Symbol': lambda x: ', '.join(x.head(3))
+            }).round(2)
+            
+            sector_concentration.columns = ['Total Weight %', 'Count', 'Max Single Stock %', 'Top 3 Stocks']
+            sector_concentration = sector_concentration.sort_values('Total Weight %', ascending=False)
+            sector_concentration['Concentration Level'] = sector_concentration['Total Weight %'].apply(
+                lambda x: '🔴 High' if x > 25 else '🟡 Medium' if x > 15 else '🟢 Low'
+            )
+            
+            st.dataframe(sector_concentration.style.format({
+                'Total Weight %': '{:.2f}%',
+                'Max Single Stock %': '{:.2f}%'
+            }), use_container_width=True)
+            
+            # Heat map
             st.markdown("---")
             st.markdown("#### Sector vs Market Cap Heatmap")
+            
             if 'Market Cap' in results_df.columns:
-                pivot = results_df.pivot_table(values='Weight %', index='Industry', columns='Market Cap', aggfunc='sum', fill_value=0)
-                h = px.imshow(pivot, labels=dict(x="Market Cap", y="Industry", color="Weight %"), title="Allocation Heatmap", color_continuous_scale='RdYlGn_r')
-                h.update_layout(height=max(400, len(pivot) * 30))
-                st.plotly_chart(h, use_container_width=True)
+                pivot_data = results_df.pivot_table(
+                    values='Weight %',
+                    index='Industry',
+                    columns='Market Cap',
+                    aggfunc='sum',
+                    fill_value=0
+                )
+                
+                fig_heatmap = px.imshow(
+                    pivot_data,
+                    labels=dict(x="Market Cap", y="Industry", color="Weight %"),
+                    title="Portfolio Allocation: Sector vs Market Cap",
+                    color_continuous_scale='RdYlGn_r',
+                    aspect="auto"
+                )
+                
+                fig_heatmap.update_layout(height=max(400, len(pivot_data) * 30))
+                st.plotly_chart(fig_heatmap, use_container_width=True)
             else:
-                st.info("No Market Cap column for heatmap.")
-            st.session_state["last_concentration"] = {
-                "sorted": dictify_df(srt),
-                "benchmarks": {"top_1": top_1, "top_3": top_3, "top_5": top_5, "top_10": top_10, "top_20": top_20},
-                "heatmap": pivot.to_dict() if 'Market Cap' in results_df.columns else {}
-            }
-
-        # Full report
-        with subtabs[6]:
-            st.subheader("Full Report (Download)")
-            opt = st.multiselect(
-                "Sections",
-                ["Executive Summary", "Holdings Detail", "Sector Analysis", "Risk Metrics", "Compliance Validation", "Security-Level Compliance"],
-                default=["Executive Summary", "Holdings Detail", "Sector Analysis", "Compliance Validation"]
-            )
-            fmt = st.radio("Format", ["Excel", "CSV"], horizontal=True)
-            if st.button("📊 Generate Report", type="primary"):
-                with st.spinner("Building report..."):
-                    data_map = {}
-                    total_value = results_df['Real-time Value (Rs)'].sum()
-                    if "Executive Summary" in opt:
-                        data_map['Executive Summary'] = pd.DataFrame({
-                            "Metric": ["Total Value", "Holdings", "Sectors", "Top Stock", "Top 10", "Stock HHI", "Sector HHI"],
-                            "Value": [
-                                f"₹{total_value:,.2f}", len(results_df), results_df['Industry'].nunique(),
-                                f"{results_df['Weight %'].max():.2f}%",
-                                f"{results_df.nlargest(10, 'Weight %')['Weight %'].sum():.2f}%",
-                                f"{(results_df['Weight %'] ** 2).sum():.0f}",
-                                f"{(results_df.groupby('Industry')['Weight %'].sum() ** 2).sum():.0f}"
-                            ]
-                        })
-                    if "Holdings Detail" in opt:
-                        data_map["Holdings Detail"] = results_df[['Name', 'Symbol', 'Industry', 'Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %']]
-                    if "Sector Analysis" in opt:
-                        sa = results_df.groupby('Industry').agg({'Weight %': 'sum', 'Real-time Value (Rs)': 'sum', 'Symbol': 'count'}).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
-                        data_map["Sector Analysis"] = sa
-                    if "Risk Metrics" in opt and st.session_state["advanced_metrics"]:
-                        m = st.session_state["advanced_metrics"]
-                        data_map["Risk Metrics"] = pd.DataFrame([{"Metric": k.replace('_', ' ').title(), "Value": ("N/A" if v is None else f"{v:.6f}")} for k, v in m.items()])
-                    if "Compliance Validation" in opt and st.session_state["last_validation_results"]:
-                        data_map["Compliance Validation"] = pd.DataFrame(st.session_state["last_validation_results"])
-                    if "Security-Level Compliance" in opt and not st.session_state["security_level_compliance"].empty:
-                        data_map["Security Compliance"] = st.session_state["security_level_compliance"]
-
-                    if fmt == "Excel":
-                        from io import BytesIO
-                        out = BytesIO()
-                        with pd.ExcelWriter(out, engine="openpyxl") as w:
-                            for name, df_s in data_map.items():
-                                df_s.to_excel(w, sheet_name=name[:31], index=False)
-                        out.seek(0)
-                        st.download_button("📥 Download Excel", out, file_name=f"portfolio_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-                    else:
-                        comb = pd.concat([df.assign(Section=name) for name, df in data_map.items()], ignore_index=True)
-                        st.download_button("📥 Download CSV", comb.to_csv(index=False).encode('utf-8'), file_name=f"portfolio_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv", use_container_width=True)
-                    st.success("✅ Report ready.")
-
-        # Save / Export
-        with subtabs[7]:
-            st.subheader("💾 Save Everything (Supabase per-user)")
-            run_label = st.text_input("Run label (optional)", value=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-            payload = {
-                "created_at": datetime.utcnow().isoformat(),
-                "user_email": st.session_state["sb_user"].email if st.session_state["sb_user"] else None,
-                "thresholds": st.session_state["cfg_thresholds"],
-                "portfolio": dictify_df(results_df),
-                "breaches": st.session_state["breach_alerts"],
-                "security_level_compliance": dictify_df(st.session_state["security_level_compliance"]),
-                "rule_validations": st.session_state["last_validation_results"],
-                "advanced_metrics": st.session_state["advanced_metrics"],
-                "concentration": st.session_state["last_concentration"],
-                "ai_analysis": st.session_state["ai_analysis_response"],
-                "meta": {
-                    "kite_authenticated": bool(st.session_state["kite_access_token"]),
-                    "benchmark": BENCHMARK_SYMBOL
-                }
-            }
-            c = st.columns(2)
-            with c[0]:
-                if st.button("🟩 Save to Supabase (analysis_runs)", type="primary", use_container_width=True):
-                    _ = save_full_payload_to_supabase(run_label.strip() or None, payload)
-            with c[1]:
-                b = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
-                st.download_button("📥 Download Full JSON", b, file_name=f"analysis_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", mime="application/json", use_container_width=True)
-
-# --- AI-Powered Analysis (Gemini) ---
-with tab_ai:
-    st.header("🤖 AI-Powered Compliance Analysis (Gemini)")
-    dfp = st.session_state["compliance_results_df"]
-    if dfp is None or dfp.empty:
-        st.warning("Upload & analyze a portfolio first in the Investment Compliance tab.")
-    else:
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            files = st.file_uploader("Upload SID / KIM / Policy (PDF or TXT — multiple allowed)", type=["pdf", "txt"], accept_multiple_files=True)
-        with c2:
-            depth = st.select_slider("Analysis Depth", options=["Quick", "Standard", "Comprehensive"], value="Standard")
-            incl_reco = st.checkbox("Include Recommendations", value=True)
-            incl_risk = st.checkbox("Include Risk Assessment", value=True)
-
-        if files:
-            st.success(f"Uploaded {len(files)} document(s).")
-            if st.button("🚀 Run AI Analysis", type="primary"):
-                with st.spinner("Reading documents & generating analysis..."):
-                    try:
-                        docs_text = extract_text_from_files(files)
-                        psum = portfolio_summary(dfp)
-                        breaches = st.session_state["breach_alerts"]
-                        breach_summary = "\n".join([f"- {b['type']}: {b['details']}" for b in breaches]) if breaches else "No immediate breaches detected."
-
-                        if depth == "Quick":
-                            depth_msg = "Provide a concise analysis focusing on critical compliance issues only."
-                        elif depth == "Standard":
-                            depth_msg = "Provide a balanced analysis covering key compliance areas and major risks."
+                st.info("Market Cap data not available for heatmap visualization.")
+        
+        # TAB 7: Full Report
+        with analysis_tabs[6]:
+            st.subheader("📄 Comprehensive Portfolio Report")
+            
+            # Report generation options
+            report_cols = st.columns([2, 1])
+            
+            with report_cols[0]:
+                st.markdown("**Generate a comprehensive report with all analysis**")
+                include_sections = st.multiselect(
+                    "Select Sections to Include",
+                    ["Executive Summary", "Holdings Detail", "Sector Analysis", "Risk Metrics", 
+                     "Compliance Validation", "Security-Level Compliance"],
+                    default=["Executive Summary", "Holdings Detail", "Sector Analysis", "Compliance Validation"]
+                )
+            
+            with report_cols[1]:
+                report_format = st.radio("Format", ["Excel", "CSV"], key="report_format")
+                
+                if st.button("📊 Generate Full Report", type="primary", use_container_width=True):
+                    with st.spinner("Generating comprehensive report..."):
+                        # Prepare data
+                        report_data = {}
+                        
+                        if "Executive Summary" in include_sections:
+                            summary_data = {
+                                'Metric': ['Total Value', 'Holdings Count', 'Unique Sectors', 
+                                          'Top Stock Weight', 'Top 10 Weight', 'Stock HHI', 'Sector HHI'],
+                                'Value': [
+                                    f"₹{total_value:,.2f}",
+                                    len(results_df),
+                                    results_df['Industry'].nunique(),
+                                    f"{results_df['Weight %'].max():.2f}%",
+                                    f"{results_df.nlargest(10, 'Weight %')['Weight %'].sum():.2f}%",
+                                    f"{(results_df['Weight %'] ** 2).sum():.0f}",
+                                    f"{(results_df.groupby('Industry')['Weight %'].sum() ** 2).sum():.0f}"
+                                ]
+                            }
+                            report_data['Executive Summary'] = pd.DataFrame(summary_data)
+                        
+                        if "Holdings Detail" in include_sections:
+                            report_data['Holdings Detail'] = results_df[['Name', 'Symbol', 'Industry', 'Quantity', 
+                                                                         'LTP', 'Real-time Value (Rs)', 'Weight %']]
+                        
+                        if "Sector Analysis" in include_sections:
+                            sector_analysis = results_df.groupby('Industry').agg({
+                                'Weight %': 'sum',
+                                'Real-time Value (Rs)': 'sum',
+                                'Symbol': 'count'
+                            }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
+                            report_data['Sector Analysis'] = sector_analysis
+                        
+                        if "Risk Metrics" in include_sections and st.session_state.advanced_metrics:
+                            metrics = st.session_state.advanced_metrics
+                            risk_data = pd.DataFrame([{
+                                'Metric': k.replace('_', ' ').title(),
+                                'Value': f"{v:.4f}" if v is not None else "N/A"
+                            } for k, v in metrics.items()])
+                            report_data['Risk Metrics'] = risk_data
+                        
+                        if "Compliance Validation" in include_sections:
+                            validation_results = parse_and_validate_rules_enhanced(rules_text, results_df)
+                            if validation_results:
+                                report_data['Compliance Validation'] = pd.DataFrame(validation_results)
+                        
+                        if "Security-Level Compliance" in include_sections and not st.session_state.get("security_level_compliance", pd.DataFrame()).empty:
+                            report_data['Security Compliance'] = st.session_state["security_level_compliance"]
+                        
+                        # Create download
+                        if report_format == "Excel":
+                            from io import BytesIO
+                            output = BytesIO()
+                            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                                for sheet_name, df_sheet in report_data.items():
+                                    df_sheet.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+                            
+                            output.seek(0)
+                            st.download_button(
+                                "📥 Download Excel Report",
+                                output,
+                                f"portfolio_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True
+                            )
                         else:
-                            depth_msg = "Provide an exhaustive, detailed analysis covering all aspects of compliance, risk, and regulatory requirements."
+                            # Combine all dataframes for CSV
+                            combined_df = pd.concat([df_sheet.assign(Section=name) for name, df_sheet in report_data.items()], 
+                                                    ignore_index=True)
+                            csv = combined_df.to_csv(index=False).encode('utf-8')
+                            st.download_button(
+                                "📥 Download CSV Report",
+                                csv,
+                                f"portfolio_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                "text/csv",
+                                use_container_width=True
+                            )
+                        
+                        st.success("✅ Report generated successfully!")
+            
+            # Display current holdings table
+            st.markdown("---")
+            st.markdown("**Current Holdings Summary**")
+            
+            display_df = results_df.copy()
+            format_dict = {
+                'Real-time Value (Rs)': '₹{:,.2f}',
+                'LTP': '₹{:,.2f}',
+                'Weight %': '{:.2f}%'
+            }
+            
+            column_order = ['Name', 'Symbol', 'Industry', 'Real-time Value (Rs)', 'Weight %', 'Quantity', 'LTP']
+            
+            if 'Asset Class' in display_df.columns:
+                column_order.insert(3, 'Asset Class')
+            if 'Rating' in display_df.columns:
+                column_order.insert(3, 'Rating')
+            if 'Market Cap' in display_df.columns:
+                column_order.insert(3, 'Market Cap')
+            
+            display_columns = [col for col in column_order if col in display_df.columns]
+            
+            st.dataframe(
+                display_df[display_columns].style.format(format_dict),
+                use_container_width=True,
+                height=500
+            )
 
-prompt = f"""
-You are an expert investment compliance analyst for an Indian AMC with deep knowledge of SEBI regulations, MF guidelines, and portfolio best practices.
 
-YOUR TASK:
-Perform a comprehensive compliance analysis of the given investment portfolio against the provided scheme documents (SID/KIM/policy) and SEBI/AMFI regulations.
+# --- AI ANALYSIS TAB FUNCTIONS ---
+def extract_text_from_files(uploaded_files):
+    full_text = ""
+    for file in uploaded_files:
+        full_text += f"\n\n--- DOCUMENT: {file.name} ---\n\n"
+        if file.type == "application/pdf":
+            with fitz.open(stream=file.getvalue(), filetype="pdf") as doc:
+                for page in doc:
+                    full_text += page.get_text()
+        else:
+            full_text += file.getvalue().decode("utf-8")
+    return full_text
 
-{depth_msg}
 
-PORTFOLIO DATA:
+def get_portfolio_summary(df):
+    if df.empty:
+        return "No portfolio data available."
+    
+    total_value = df['Real-time Value (Rs)'].sum()
+    top_10_stocks = df.nlargest(10, 'Weight %')[['Name', 'Weight %']]
+    sector_weights = df.groupby('Industry')['Weight %'].sum().nlargest(10)
+    
+    summary = f"""**Portfolio Snapshot (as of {datetime.now().strftime('%Y-%m-%d')})**
+    
+- **Total Value:** ₹ {total_value:,.2f}
+- **Number of Holdings:** {len(df)}
+- **Top Stock Weight:** {df['Weight %'].max():.2f}%
+- **Top 10 Combined Weight:** {df.nlargest(10, 'Weight %')['Weight %'].sum():.2f}%
+
+**Top 10 Holdings:**
+"""
+    for _, row in top_10_stocks.iterrows():
+        summary += f"- {row['Name']}: {row['Weight %']:.2f}%\n"
+    
+    summary += "\n**Top 10 Sector Exposures:**\n"
+    for sector, weight in sector_weights.items():
+        summary += f"- {sector}: {weight:.2f}%\n"
+    
+    return summary
+
+
+def render_ai_analysis_tab(kite_client):
+    st.header("🤖 AI-Powered Compliance Analysis (with Google Gemini)")
+    st.markdown("Analyze your portfolio against scheme documents (SID/KIM) and general regulatory guidelines using advanced AI.")
+    
+    portfolio_df = st.session_state.get("compliance_results_df")
+    
+    if portfolio_df is None or portfolio_df.empty:
+        st.warning("⚠️ Please upload and analyze a portfolio in the 'Investment Compliance' tab first.")
+        return
+    
+    st.info("💡 This tool uses AI for analysis. The output is for informational purposes and is not financial or legal advice. Always verify all findings independently.", icon="ℹ️")
+    
+    # Document upload
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        uploaded_files = st.file_uploader(
+            "📄 Upload Scheme Documents (SID, KIM, Investment Policy, etc.)",
+            type=["pdf", "txt"],
+            accept_multiple_files=True,
+            help="Upload regulatory documents for AI-powered compliance analysis"
+        )
+    
+    with col2:
+        st.markdown("**Analysis Options**")
+        analysis_depth = st.select_slider(
+            "Analysis Depth",
+            options=["Quick", "Standard", "Comprehensive"],
+            value="Standard"
+        )
+        
+        include_recommendations = st.checkbox("Include Recommendations", value=True)
+        include_risk_assessment = st.checkbox("Include Risk Assessment", value=True)
+    
+    if uploaded_files:
+        st.success(f"✅ {len(uploaded_files)} document(s) uploaded successfully")
+        
+        with st.expander("📋 Uploaded Documents"):
+            for file in uploaded_files:
+                st.write(f"- {file.name} ({file.size / 1024:.2f} KB)")
+        
+        if st.button("🚀 Run AI Compliance Analysis", type="primary", use_container_width=True):
+            with st.spinner("🔄 Reading documents and preparing for AI analysis..."):
+                try:
+                    # Extract document text
+                    docs_text = extract_text_from_files(uploaded_files)
+                    portfolio_summary = get_portfolio_summary(portfolio_df)
+                    
+                    # Calculate additional context
+                    breach_alerts = st.session_state.get("breach_alerts", [])
+                    breach_summary = "\n".join([f"- {b['type']}: {b['details']}" for b in breach_alerts]) if breach_alerts else "No immediate breaches detected."
+                    
+                    # Build comprehensive prompt
+                    if analysis_depth == "Quick":
+                        depth_instruction = "Provide a concise analysis focusing on critical compliance issues only."
+                    elif analysis_depth == "Standard":
+                        depth_instruction = "Provide a balanced analysis covering key compliance areas and major risks."
+                    else:
+                        depth_instruction = "Provide an exhaustive, detailed analysis covering all aspects of compliance, risk, and regulatory requirements."
+                    
+                    prompt = f"""You are an expert investment compliance analyst for an Indian Asset Management Company with deep knowledge of SEBI regulations, mutual fund guidelines, and portfolio management best practices.
+
+**YOUR TASK:**
+Perform a comprehensive compliance analysis of the given investment portfolio against the provided scheme documents and SEBI/AMFI regulations.
+
+{depth_instruction}
+
+**PORTFOLIO DATA:**
+```
+{portfolio_summary}
+```
+
+**DETECTED ISSUES (Automated Checks):**
+```
+{breach_summary}
+```
+
+**SCHEME DOCUMENT(S) TEXT:**
+```
+{docs_text[:120000]}
+```
+(Note: Document text may be truncated due to length constraints)
+
+**ANALYSIS FRAMEWORK:**
+
+Please structure your response in clear markdown format with the following sections:
+
+## 1. Executive Summary
+- Overall compliance status (Compliant / Partially Compliant / Non-Compliant)
+- Critical findings count
+- Key action items (if any)
+
+## 2. Investment Objective & Strategy Alignment
+- Compare portfolio composition with stated investment philosophy
+- Analyze if top holdings align with fund's stated objectives
+- Identify any style drift or strategy deviation
+- Specific holdings or sectors that enhance or detract from stated goals
+
+## 3. Regulatory Compliance Assessment
+
+### 3.1 SEBI Mutual Fund Regulations
+Check against standard SEBI norms:
+- **Single Issuer Limit:** Maximum 10% in any single stock (relaxed to 12% under certain conditions)
+- **Sectoral Concentration:** Maximum 25% in any single sector (excluding financial services)
+- **Group Company Exposure:** Maximum 25% in any single group
+- **Cash & Cash Equivalents:** Minimum liquid assets requirement
+- **Derivatives Usage:** Within prescribed limits (if applicable)
+
+### 3.2 Scheme-Specific Restrictions
+Based on the uploaded documents, verify:
+- Minimum/maximum equity exposure limits
+- Debt quality requirements
+- Market cap allocation mandates (large/mid/small cap)
+- Foreign securities limits
+- Unrated securities exposure
+- Any other fund-specific constraints
+
+## 4. Portfolio Quality & Risk Assessment
+{("Include this section:" if include_risk_assessment else "Skip this section.")}
+
+### 4.1 Concentration Risk
+- Top 10 holdings analysis
+- Sector concentration assessment
+- Single stock risks
+- HHI (Herfindahl-Hirschman Index) interpretation
+
+### 4.2 Credit Risk (if applicable)
+- Rating distribution analysis
+- Unrated exposure evaluation
+- Credit quality assessment
+
+### 4.3 Liquidity Risk
+- Assessment of liquid vs illiquid holdings
+- Average daily volume considerations
+- Market impact risk
+
+### 4.4 Market Risk
+- Volatility considerations
+- Beta analysis (if mentioned in documents)
+- Market cap exposure risks
+
+## 5. Specific Violations & Concerns
+List any identified violations with:
+- **Severity Level** (Critical / High / Medium / Low)
+- **Description** of the violation
+- **Regulatory Reference** (quote relevant clause)
+- **Current Status** vs **Required Status**
+- **Potential Impact**
+
+## 6. Best Practices & Industry Benchmarks
+- How does this portfolio compare to industry standards?
+- Are there any emerging concerns?
+- Compliance with ESG considerations (if mentioned)
+
+{("## 7. Recommendations & Action Items" if include_recommendations else "")}
+{("Provide specific, actionable recommendations:" if include_recommendations else "")}
+{("- Immediate actions to address critical violations" if include_recommendations else "")}
+{("- Portfolio rebalancing suggestions" if include_recommendations else "")}
+{("- Risk mitigation strategies" if include_recommendations else "")}
+{("- Process improvements for ongoing compliance" if include_recommendations else "")}
+
+## 8. Disclaimers & Limitations
+- Note any missing information that limits the analysis
+- Areas requiring further investigation
+- Assumptions made during analysis
+
+**IMPORTANT GUIDELINES:**
+1. Be specific - cite actual holdings, percentages, and document clauses
+2. Use bullet points and tables where appropriate
+3. Highlight critical issues with ⚠️ or 🔴 emoji
+4. Be objective and professional
+5. If documents don't specify certain limits, state "Not specified in documents" and use SEBI default norms
+6. For any ambiguous situations, provide multiple interpretations
+
+Begin your analysis now:
+"""
+
+                    # Call Gemini API
+                    with st.spinner("🤖 AI is analyzing your portfolio... This may take 30-60 seconds."):
+                        model = genai.GenerativeModel('gemini-1.5-flash')
+                        
+                        safety_settings = [
+                            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+                        ]
+                        
+                        response = model.generate_content(
+                            prompt,
+                            safety_settings=safety_settings,
+                            generation_config={
+                                'temperature': 0.3,
+                                'top_p': 0.8,
+                                'top_k': 40,
+                                'max_output_tokens': 8192,
+                            }
+                        )
+                        
+                        st.session_state.ai_analysis_response = response.text
+                        st.success("✅ AI Analysis Complete!")
+                
+                except Exception as e:
+                    st.error(f"❌ An error occurred during AI analysis: {e}")
+                    st.exception(e)
+                    st.session_state.ai_analysis_response = None
+    
+    # Display AI analysis results
+    if st.session_state.get("ai_analysis_response"):
+        st.markdown("---")
+        st.markdown("## 📊 AI Compliance Analysis Report")
+        st.markdown("---")
+        
+        # Display the analysis
+        st.markdown(st.session_state.ai_analysis_response)
+        
+        # Export options
+        st.markdown("---")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            # Download as text
+            txt_data = st.session_state.ai_analysis_response.encode('utf-8')
+            st.download_button(
+                "📄 Download as Text",
+                txt_data,
+                f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                "text/plain",
+                use_container_width=True
+            )
+        
+        with col2:
+            # Download as markdown
+            md_data = st.session_state.ai_analysis_response.encode('utf-8')
+            st.download_button(
+                "📝 Download as Markdown",
+                md_data,
+                f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                "text/markdown",
+                use_container_width=True
+            )
+        
+        with col3:
+            # Clear analysis
+            if st.button("🗑️ Clear Analysis", use_container_width=True):
+                st.session_state.ai_analysis_response = None
+                st.rerun()
+        
+        # Feedback section
+        st.markdown("---")
+        st.markdown("### 📝 Analysis Feedback")
+        
+        feedback_cols = st.columns([3, 1])
+        
+        with feedback_cols[0]:
+            feedback = st.text_area(
+                "How useful was this analysis? Any suggestions for improvement?",
+                height=100,
+                placeholder="Your feedback helps us improve the AI analysis..."
+            )
+        
+        with feedback_cols[1]:
+            st.markdown("<br>", unsafe_allow_html=True)
+            usefulness = st.radio(
+                "Usefulness",
+                ["⭐ Poor", "⭐⭐ Fair", "⭐⭐⭐ Good", "⭐⭐⭐⭐ Very Good", "⭐⭐⭐⭐⭐ Excellent"],
+                index=2
+            )
+        
+        if st.button("Submit Feedback"):
+            st.success("✅ Thank you for your feedback!")
+    
+    else:
+        # Show example/guide when no analysis is available
+        st.markdown("---")
+        st.markdown("### 📚 How to Use AI Compliance Analysis")
+        
+        with st.expander("📖 Step-by-Step Guide", expanded=True):
+            st.markdown("""
+            **Step 1: Prepare Your Documents**
+            - Gather scheme information documents (SID)
+            - Collect Key Information Memorandums (KIM)
+            - Include investment policy statements
+            - Add any fund-specific compliance documents
+            
+            **Step 2: Upload Documents**
+            - Use the file uploader above
+            - Supports PDF and TXT formats
+            - Multiple files can be uploaded simultaneously
+            
+            **Step 3: Configure Analysis**
+            - Choose analysis depth based on your needs
+            - Enable recommendations for actionable insights
+            - Enable risk assessment for comprehensive coverage
+            
+            **Step 4: Run Analysis**
+            - Click "Run AI Compliance Analysis"
+            - Wait 30-60 seconds for processing
+            - Review comprehensive report
+            
+            **Step 5: Act on Findings**
+            - Address critical violations immediately
+            - Plan for medium/low priority items
+            - Export report for documentation
+            """)
+        
+        with st.expander("✨ Features of AI Analysis"):
+            st.markdown("""
+            - **Regulatory Compliance:** Checks against SEBI and AMFI guidelines
+            - **Scheme-Specific Rules:** Validates fund-specific restrictions
+            - **Risk Assessment:** Comprehensive risk analysis across multiple dimensions
+            - **Actionable Insights:** Specific recommendations for compliance
+            - **Document Citations:** References actual clauses from uploaded documents
+            - **Severity Classification:** Prioritizes issues by criticality
+            """)
+        
+        with st.expander("⚠️ Important Notes"):
+            st.markdown("""
+            - AI analysis is for informational purposes only
+            - Always verify findings with compliance experts
+            - Not a substitute for professional legal advice
+            - Document quality affects analysis accuracy
+            - Regular human oversight is essential
+            - Keep documents updated for best results
+            """)
+
+
+# --- Main Application Logic (Tab Rendering) ---
+api_key = KITE_CREDENTIALS["api_key"]
+access_token = st.session_state["kite_access_token"]
+
+with tab_market:
+    render_market_historical_tab(k, api_key, access_token)
+
+with tab_compliance:
+    render_investment_compliance_tab(k, api_key, access_token)
+
+with tab_ai:
+    render_ai_analysis_tab(k)
+
+# --- Footer ---
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: gray; padding: 20px;'>
+    <p><strong>Invsion Connect</strong> - Professional Portfolio Compliance & Analysis Platform</p>
+    <p style='font-size: 0.9em;'>⚠️ This tool is for informational purposes only. Always consult with qualified professionals for investment decisions.</p>
+    <p style='font-size: 0.8em;'>Powered by KiteConnect API & Google Gemini AI | © 2025</p>
+</div>
+""", unsafe_allow_html=True)
