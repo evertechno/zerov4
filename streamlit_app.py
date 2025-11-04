@@ -1241,7 +1241,7 @@ with tab_ai:
                         else:
                             depth_msg = "Provide an exhaustive, detailed analysis covering all aspects of compliance, risk, and regulatory requirements."
 
-                        prompt = f"""
+prompt = f"""
 You are an expert investment compliance analyst for an Indian AMC with deep knowledge of SEBI regulations, MF guidelines, and portfolio best practices.
 
 YOUR TASK:
