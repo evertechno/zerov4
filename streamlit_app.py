@@ -1063,14 +1063,14 @@ Missing information and assumptions
 Begin analysis:
 """
                         
-                        model = genai.GenerativeModel('gemini-1.5-flash')
+                        model = genai.GenerativeModel('gemini-2.5-flash')
                         
                         response = model.generate_content(
                             prompt,
                             generation_config={
                                 'temperature': 0.3,
                                 'top_p': 0.8,
-                                'max_output_tokens': 8192,
+                                'max_output_tokens': 25192,
                             }
                         )
                         
