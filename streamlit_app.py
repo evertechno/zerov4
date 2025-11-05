@@ -87,93 +87,160 @@ supabase = init_supabase()
 
 
 # --- Authentication Functions ---
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def register_user(email: str, password: str, full_name: str = None):
+def register_user(email: str, password: str):
     try:
-        existing = supabase.table('users').select('*').eq('email', email).execute()
-        if existing.data:
-            return False, "User already exists."
+        # Use Supabase Auth instead of custom table
+        response = supabase.auth.sign_up({
+            "email": email,
+            "password": password
+        })
         
-        user_data = {
-            'email': email,
-            'password_hash': hash_password(password),
-            'full_name': full_name,
-            'created_at': datetime.now().isoformat()
-        }
-        
-        result = supabase.table('users').insert(user_data).execute()
-        if result.data:
-            return True, "Registration successful!"
+        if response.user:
+            return True, "Registration successful! Please check your email to verify your account."
         return False, "Registration failed."
     except Exception as e:
-        return False, f"Error: {str(e)}"
+        error_message = str(e)
+        if "already registered" in error_message.lower():
+            return False, "User already exists with this email."
+        return False, f"Error: {error_message}"
 
 def login_user(email: str, password: str):
     try:
-        result = supabase.table('users').select('*').eq('email', email).eq('password_hash', hash_password(password)).execute()
+        # Use Supabase Auth
+        response = supabase.auth.sign_in_with_password({
+            "email": email,
+            "password": password
+        })
         
-        if result.data and len(result.data) > 0:
-            user = result.data[0]
+        if response.user:
             st.session_state["user_authenticated"] = True
-            st.session_state["user_id"] = user['id']
-            st.session_state["user_email"] = user['email']
-            supabase.table('users').update({'last_login': datetime.now().isoformat()}).eq('id', user['id']).execute()
+            st.session_state["user_id"] = response.user.id
+            st.session_state["user_email"] = response.user.email
+            st.session_state["supabase_session"] = response.session
             return True, "Login successful!"
         return False, "Invalid credentials."
     except Exception as e:
-        return False, f"Error: {str(e)}"
+        error_message = str(e)
+        if "Invalid login credentials" in error_message:
+            return False, "Invalid email or password."
+        return False, f"Error: {error_message}"
 
 def logout_user():
+    try:
+        supabase.auth.sign_out()
+    except:
+        pass
     st.session_state.clear()
 
 
 # --- Data Persistence Functions ---
 def save_analysis_to_supabase(analysis_data: dict):
+    """Save complete analysis using your existing schema"""
     try:
-        analysis_record = {
-            'user_id': st.session_state["user_id"],
-            'analysis_date': datetime.now().isoformat(),
-            'portfolio_data': analysis_data.get('portfolio_data'),
-            'compliance_results': analysis_data.get('compliance_results'),
-            'compliance_rules': analysis_data.get('compliance_rules'),
-            'breach_alerts': analysis_data.get('breach_alerts'),
-            'security_compliance': analysis_data.get('security_compliance'),
-            'advanced_metrics': analysis_data.get('advanced_metrics'),
-            'ai_analysis': analysis_data.get('ai_analysis'),
+        user_id = st.session_state["user_id"]
+        
+        # First, save or get portfolio
+        portfolio_record = {
+            'user_id': user_id,
+            'portfolio_name': f"Portfolio_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            'holdings_data': analysis_data.get('portfolio_data'),
+            'total_value': float(analysis_data.get('metadata', {}).get('total_value', 0)),
+            'holdings_count': analysis_data.get('metadata', {}).get('holdings_count', 0),
             'metadata': analysis_data.get('metadata', {})
         }
         
-        result = supabase.table('portfolio_analyses').insert(analysis_record).execute()
-        if result.data:
-            return True, result.data[0]['id']
+        portfolio_result = supabase.table('portfolios').insert(portfolio_record).execute()
+        
+        if not portfolio_result.data:
+            return False, None
+        
+        portfolio_id = portfolio_result.data[0]['id']
+        
+        # Save compliance config
+        config_record = {
+            'user_id': user_id,
+            'portfolio_id': portfolio_id,
+            'single_stock_limit': float(analysis_data.get('metadata', {}).get('single_stock_limit', 10.0)),
+            'single_sector_limit': float(analysis_data.get('metadata', {}).get('single_sector_limit', 25.0)),
+            'custom_rules': analysis_data.get('compliance_rules', '')
+        }
+        
+        config_result = supabase.table('compliance_configs').insert(config_record).execute()
+        
+        if not config_result.data:
+            return False, None
+        
+        config_id = config_result.data[0]['id']
+        
+        # Save analysis results
+        analysis_record = {
+            'user_id': user_id,
+            'portfolio_id': portfolio_id,
+            'config_id': config_id,
+            'compliance_results': json.loads(analysis_data.get('compliance_results', '[]')) if isinstance(analysis_data.get('compliance_results'), str) else analysis_data.get('compliance_results'),
+            'security_compliance': analysis_data.get('security_compliance'),
+            'breach_alerts': json.loads(analysis_data.get('breach_alerts', '[]')) if isinstance(analysis_data.get('breach_alerts'), str) else analysis_data.get('breach_alerts')
+        }
+        
+        analysis_result = supabase.table('analysis_results').insert(analysis_record).execute()
+        
+        if analysis_result.data:
+            return True, portfolio_id
         return False, None
     except Exception as e:
         st.error(f"Error saving: {str(e)}")
         return False, None
 
 def get_user_analyses(user_id: str, limit: int = 10):
+    """Retrieve user's saved analyses from existing schema"""
     try:
-        result = supabase.table('portfolio_analyses').select('*').eq('user_id', user_id).order('analysis_date', desc=True).limit(limit).execute()
+        result = supabase.table('portfolios').select(
+            '*, analysis_results(*), compliance_configs(*)'
+        ).eq('user_id', user_id).order('created_at', desc=True).limit(limit).execute()
         return result.data if result.data else []
     except Exception as e:
         st.error(f"Error fetching: {str(e)}")
         return []
 
-def load_analysis_from_supabase(analysis_id: str):
+def load_analysis_from_supabase(portfolio_id: str):
+    """Load a specific analysis from existing schema"""
     try:
-        result = supabase.table('portfolio_analyses').select('*').eq('id', analysis_id).execute()
-        if result.data and len(result.data) > 0:
-            return result.data[0]
-        return None
+        # Get portfolio
+        portfolio_result = supabase.table('portfolios').select('*').eq('id', portfolio_id).execute()
+        if not portfolio_result.data:
+            return None
+        
+        portfolio = portfolio_result.data[0]
+        
+        # Get compliance config
+        config_result = supabase.table('compliance_configs').select('*').eq('portfolio_id', portfolio_id).execute()
+        
+        # Get analysis results
+        analysis_result = supabase.table('analysis_results').select('*').eq('portfolio_id', portfolio_id).execute()
+        
+        # Combine data in expected format
+        combined = {
+            'id': portfolio_id,
+            'analysis_date': portfolio.get('created_at'),
+            'portfolio_data': portfolio.get('holdings_data'),
+            'compliance_rules': config_result.data[0].get('custom_rules') if config_result.data else None,
+            'compliance_results': analysis_result.data[0].get('compliance_results') if analysis_result.data else None,
+            'security_compliance': analysis_result.data[0].get('security_compliance') if analysis_result.data else None,
+            'breach_alerts': analysis_result.data[0].get('breach_alerts') if analysis_result.data else None,
+            'metadata': portfolio.get('metadata', {}),
+            'advanced_metrics': None,
+            'ai_analysis': None
+        }
+        
+        return combined
     except Exception as e:
         st.error(f"Error loading: {str(e)}")
         return None
 
-def delete_analysis(analysis_id: str):
+def delete_analysis(portfolio_id: str):
+    """Delete an analysis (cascade will handle related records)"""
     try:
-        supabase.table('portfolio_analyses').delete().eq('id', analysis_id).execute()
+        supabase.table('portfolios').delete().eq('id', portfolio_id).execute()
         return True
     except Exception as e:
         st.error(f"Error deleting: {str(e)}")
@@ -494,7 +561,6 @@ def render_auth_page():
         
         with auth_tab2:
             with st.form("register_form"):
-                reg_name = st.text_input("Full Name")
                 reg_email = st.text_input("Email", key="reg_email")
                 reg_password = st.text_input("Password", type="password", key="reg_password")
                 reg_password_confirm = st.text_input("Confirm Password", type="password")
@@ -507,7 +573,7 @@ def render_auth_page():
                         elif len(reg_password) < 6:
                             st.error("Password must be at least 6 characters.")
                         else:
-                            success, message = register_user(reg_email, reg_password, reg_name)
+                            success, message = register_user(reg_email, reg_password)
                             if success:
                                 st.success(message)
                             else:
@@ -572,19 +638,25 @@ with st.sidebar:
         st.markdown(f"**{len(st.session_state['saved_analyses'])} saved**")
         
         for analysis in st.session_state["saved_analyses"][:5]:
-            analysis_date = datetime.fromisoformat(analysis['analysis_date']).strftime('%Y-%m-%d %H:%M')
+            analysis_date = datetime.fromisoformat(analysis['created_at']).strftime('%Y-%m-%d %H:%M')
             with st.expander(f"📅 {analysis_date}"):
                 if st.button(f"Load", key=f"load_{analysis['id']}", use_container_width=True):
                     loaded = load_analysis_from_supabase(analysis['id'])
                     if loaded:
                         if loaded.get('portfolio_data'):
-                            st.session_state["compliance_results_df"] = pd.read_json(loaded['portfolio_data'])
+                            if isinstance(loaded['portfolio_data'], str):
+                                st.session_state["compliance_results_df"] = pd.read_json(loaded['portfolio_data'])
+                            else:
+                                st.session_state["compliance_results_df"] = pd.DataFrame(loaded['portfolio_data'])
                         if loaded.get('security_compliance'):
-                            st.session_state["security_level_compliance"] = pd.read_json(loaded['security_compliance'])
+                            if isinstance(loaded['security_compliance'], str):
+                                st.session_state["security_level_compliance"] = pd.read_json(loaded['security_compliance'])
+                            else:
+                                st.session_state["security_level_compliance"] = pd.DataFrame(loaded['security_compliance'])
                         if loaded.get('breach_alerts'):
-                            st.session_state["breach_alerts"] = json.loads(loaded['breach_alerts'])
+                            st.session_state["breach_alerts"] = loaded['breach_alerts'] if isinstance(loaded['breach_alerts'], list) else json.loads(loaded['breach_alerts'])
                         if loaded.get('advanced_metrics'):
-                            st.session_state["advanced_metrics"] = json.loads(loaded['advanced_metrics'])
+                            st.session_state["advanced_metrics"] = loaded['advanced_metrics'] if isinstance(loaded['advanced_metrics'], dict) else json.loads(loaded['advanced_metrics'])
                         if loaded.get('ai_analysis'):
                             st.session_state["ai_analysis_response"] = loaded['ai_analysis']
                         
@@ -1074,7 +1146,7 @@ with tabs[2]:
         st.markdown("---")
         
         for idx, analysis in enumerate(st.session_state["saved_analyses"][:20]):
-            analysis_date = datetime.fromisoformat(analysis['analysis_date'])
+            analysis_date = datetime.fromisoformat(analysis['created_at'])
             
             with st.container():
                 col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
@@ -1098,31 +1170,29 @@ with tabs[2]:
                 
                 with col2:
                     components = []
-                    if analysis.get('portfolio_data'):
+                    if analysis.get('holdings_data'):
                         components.append("📊")
-                    if analysis.get('compliance_results'):
+                    if analysis.get('analysis_results'):
                         components.append("⚖️")
-                    if analysis.get('advanced_metrics'):
-                        components.append("📈")
-                    if analysis.get('ai_analysis'):
-                        components.append("🤖")
                     
-                    st.caption(" ".join(components))
+                    st.caption(" ".join(components) if components else "Portfolio")
                 
                 with col3:
                     if st.button("📂", key=f"load_h_{idx}", use_container_width=True):
                         loaded = load_analysis_from_supabase(analysis['id'])
                         if loaded:
                             if loaded.get('portfolio_data'):
-                                st.session_state["compliance_results_df"] = pd.read_json(loaded['portfolio_data'])
+                                if isinstance(loaded['portfolio_data'], str):
+                                    st.session_state["compliance_results_df"] = pd.read_json(loaded['portfolio_data'])
+                                else:
+                                    st.session_state["compliance_results_df"] = pd.DataFrame(loaded['portfolio_data'])
                             if loaded.get('security_compliance'):
-                                st.session_state["security_level_compliance"] = pd.read_json(loaded['security_compliance'])
+                                if isinstance(loaded['security_compliance'], str):
+                                    st.session_state["security_level_compliance"] = pd.read_json(loaded['security_compliance'])
+                                elif loaded['security_compliance']:
+                                    st.session_state["security_level_compliance"] = pd.DataFrame(loaded['security_compliance'])
                             if loaded.get('breach_alerts'):
-                                st.session_state["breach_alerts"] = json.loads(loaded['breach_alerts'])
-                            if loaded.get('advanced_metrics'):
-                                st.session_state["advanced_metrics"] = json.loads(loaded['advanced_metrics'])
-                            if loaded.get('ai_analysis'):
-                                st.session_state["ai_analysis_response"] = loaded['ai_analysis']
+                                st.session_state["breach_alerts"] = loaded['breach_alerts'] if isinstance(loaded['breach_alerts'], list) else json.loads(loaded['breach_alerts'])
                             
                             st.success("✅ Loaded!")
                             time.sleep(1)
