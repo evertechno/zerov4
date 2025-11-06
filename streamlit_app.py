@@ -48,11 +48,15 @@ if "user_id" not in st.session_state: st.session_state["user_id"] = None
 if "user_email" not in st.session_state: st.session_state["user_email"] = None
 if "kite_access_token" not in st.session_state: st.session_state["kite_access_token"] = None
 if "compliance_results_df" not in st.session_state: st.session_state["compliance_results_df"] = pd.DataFrame()
+if "compliance_results" not in st.session_state: st.session_state["compliance_results"] = []
 if "advanced_metrics" not in st.session_state: st.session_state["advanced_metrics"] = None
 if "ai_analysis_response" not in st.session_state: st.session_state["ai_analysis_response"] = None
 if "security_level_compliance" not in st.session_state: st.session_state["security_level_compliance"] = pd.DataFrame()
 if "breach_alerts" not in st.session_state: st.session_state["breach_alerts"] = []
 if "saved_analyses" not in st.session_state: st.session_state["saved_analyses"] = []
+if "current_rules_text" not in st.session_state: st.session_state["current_rules_text"] = ""
+if "current_single_stock_limit" not in st.session_state: st.session_state["current_single_stock_limit"] = 10.0
+if "current_single_sector_limit" not in st.session_state: st.session_state["current_single_sector_limit"] = 25.0
 
 
 # --- Load Credentials ---
@@ -89,7 +93,6 @@ supabase = init_supabase()
 # --- Authentication Functions ---
 def register_user(email: str, password: str):
     try:
-        # Use Supabase Auth instead of custom table
         response = supabase.auth.sign_up({
             "email": email,
             "password": password
@@ -106,7 +109,6 @@ def register_user(email: str, password: str):
 
 def login_user(email: str, password: str):
     try:
-        # Use Supabase Auth
         response = supabase.auth.sign_in_with_password({
             "email": email,
             "password": password
@@ -135,7 +137,7 @@ def logout_user():
 
 # --- Data Persistence Functions ---
 def save_analysis_to_supabase(analysis_data: dict):
-    """Save complete analysis using your existing schema"""
+    """Save complete analysis using your existing schema - FIXED VERSION"""
     try:
         user_id = st.session_state["user_id"]
         
@@ -156,12 +158,12 @@ def save_analysis_to_supabase(analysis_data: dict):
         
         portfolio_id = portfolio_result.data[0]['id']
         
-        # Save compliance config
+        # Save compliance config - FIXED: Now includes single_sector_limit
         config_record = {
             'user_id': user_id,
             'portfolio_id': portfolio_id,
             'single_stock_limit': float(analysis_data.get('metadata', {}).get('single_stock_limit', 10.0)),
-            'single_sector_limit': float(analysis_data.get('metadata', {}).get('single_sector_limit', 25.0)),
+            'single_sector_limit': float(analysis_data.get('metadata', {}).get('single_sector_limit', 25.0)),  # ADDED
             'custom_rules': analysis_data.get('compliance_rules', '')
         }
         
@@ -172,14 +174,35 @@ def save_analysis_to_supabase(analysis_data: dict):
         
         config_id = config_result.data[0]['id']
         
-        # Save analysis results
+        # Save analysis results - FIXED: Properly handles compliance_results
+        compliance_results_data = analysis_data.get('compliance_results', [])
+        if isinstance(compliance_results_data, str):
+            try:
+                compliance_results_data = json.loads(compliance_results_data)
+            except:
+                compliance_results_data = []
+        
+        security_compliance_data = analysis_data.get('security_compliance')
+        if isinstance(security_compliance_data, str):
+            try:
+                security_compliance_data = json.loads(security_compliance_data)
+            except:
+                security_compliance_data = None
+        
+        breach_alerts_data = analysis_data.get('breach_alerts', [])
+        if isinstance(breach_alerts_data, str):
+            try:
+                breach_alerts_data = json.loads(breach_alerts_data)
+            except:
+                breach_alerts_data = []
+        
         analysis_record = {
             'user_id': user_id,
             'portfolio_id': portfolio_id,
             'config_id': config_id,
-            'compliance_results': json.loads(analysis_data.get('compliance_results', '[]')) if isinstance(analysis_data.get('compliance_results'), str) else analysis_data.get('compliance_results'),
-            'security_compliance': analysis_data.get('security_compliance'),
-            'breach_alerts': json.loads(analysis_data.get('breach_alerts', '[]')) if isinstance(analysis_data.get('breach_alerts'), str) else analysis_data.get('breach_alerts')
+            'compliance_results': compliance_results_data,
+            'security_compliance': security_compliance_data,
+            'breach_alerts': breach_alerts_data
         }
         
         analysis_result = supabase.table('analysis_results').insert(analysis_record).execute()
@@ -189,6 +212,8 @@ def save_analysis_to_supabase(analysis_data: dict):
         return False, None
     except Exception as e:
         st.error(f"Error saving: {str(e)}")
+        import traceback
+        st.error(f"Traceback: {traceback.format_exc()}")
         return False, None
 
 def get_user_analyses(user_id: str, limit: int = 10):
@@ -655,10 +680,19 @@ with st.sidebar:
                                 st.session_state["security_level_compliance"] = pd.DataFrame(loaded['security_compliance'])
                         if loaded.get('breach_alerts'):
                             st.session_state["breach_alerts"] = loaded['breach_alerts'] if isinstance(loaded['breach_alerts'], list) else json.loads(loaded['breach_alerts'])
+                        if loaded.get('compliance_results'):
+                            st.session_state["compliance_results"] = loaded['compliance_results'] if isinstance(loaded['compliance_results'], list) else json.loads(loaded['compliance_results'])
                         if loaded.get('advanced_metrics'):
                             st.session_state["advanced_metrics"] = loaded['advanced_metrics'] if isinstance(loaded['advanced_metrics'], dict) else json.loads(loaded['advanced_metrics'])
                         if loaded.get('ai_analysis'):
                             st.session_state["ai_analysis_response"] = loaded['ai_analysis']
+                        
+                        # Load compliance config values
+                        if loaded.get('metadata'):
+                            st.session_state["current_single_stock_limit"] = loaded['metadata'].get('single_stock_limit', 10.0)
+                            st.session_state["current_single_sector_limit"] = loaded['metadata'].get('single_sector_limit', 25.0)
+                        if loaded.get('compliance_rules'):
+                            st.session_state["current_rules_text"] = loaded['compliance_rules']
                         
                         st.success("Loaded!")
                         st.rerun()
@@ -694,16 +728,18 @@ with tabs[0]:
         uploaded_file = st.file_uploader("CSV file", type="csv")
         
         with st.expander("⚙️ Thresholds"):
-            single_stock_limit = st.number_input("Single Stock %", 1.0, 25.0, 10.0, 0.5)
-            single_sector_limit = st.number_input("Single Sector %", 5.0, 50.0, 25.0, 1.0)
+            single_stock_limit = st.number_input("Single Stock %", 1.0, 25.0, 
+                                                 st.session_state.get("current_single_stock_limit", 10.0), 0.5)
+            single_sector_limit = st.number_input("Single Sector %", 5.0, 50.0, 
+                                                  st.session_state.get("current_single_sector_limit", 25.0), 1.0)
     
     with col2:
         st.subheader("Compliance Rules")
-        rules_text = st.text_area("Rules (one per line)", height=200, 
-                                   value="""# Example Rules
+        default_rules = st.session_state.get("current_rules_text", """# Example Rules
 # STOCK RELIANCE < 10
 # SECTOR BANKING < 25
 # TOP_N_STOCKS 10 <= 50""")
+        rules_text = st.text_area("Rules (one per line)", height=200, value=default_rules)
     
     if uploaded_file and k:
         try:
@@ -732,13 +768,27 @@ with tabs[0]:
                     total_value = df_results['Real-time Value (Rs)'].sum()
                     df_results['Weight %'] = (df_results['Real-time Value (Rs)'] / total_value * 100) if total_value > 0 else 0
                     
-                    rules_config = {'single_stock_limit': single_stock_limit}
+                    # FIXED: Execute custom rules validation
+                    compliance_results = parse_and_validate_rules_enhanced(rules_text, df_results)
+                    st.session_state["compliance_results"] = compliance_results
+                    
+                    # Calculate security-level compliance
+                    rules_config = {
+                        'single_stock_limit': single_stock_limit,
+                        'single_sector_limit': single_sector_limit
+                    }
                     security_compliance = calculate_security_level_compliance(df_results, rules_config)
                     
                     st.session_state.compliance_results_df = df_results
                     st.session_state.security_level_compliance = security_compliance
+                    st.session_state.current_rules_text = rules_text
+                    st.session_state.current_single_stock_limit = single_stock_limit
+                    st.session_state.current_single_sector_limit = single_sector_limit
                     
+                    # FIXED: Detect breaches from both limits and custom rules
                     breaches = []
+                    
+                    # Stock limit breaches
                     if (df_results['Weight %'] > single_stock_limit).any():
                         breach_stocks = df_results[df_results['Weight %'] > single_stock_limit]
                         for _, stock in breach_stocks.iterrows():
@@ -748,6 +798,7 @@ with tabs[0]:
                                 'details': f"{stock['Symbol']} at {stock['Weight %']:.2f}% (Limit: {single_stock_limit}%)"
                             })
                     
+                    # Sector limit breaches
                     sector_weights = df_results.groupby('Industry')['Weight %'].sum()
                     if (sector_weights > single_sector_limit).any():
                         breach_sectors = sector_weights[sector_weights > single_sector_limit]
@@ -758,15 +809,24 @@ with tabs[0]:
                                 'details': f"{sector} at {weight:.2f}% (Limit: {single_sector_limit}%)"
                             })
                     
+                    # FIXED: Add custom rule failures to breaches
+                    for rule_result in compliance_results:
+                        if rule_result['status'] == "❌ FAIL":
+                            breaches.append({
+                                'type': 'Custom Rule Violation',
+                                'severity': rule_result.get('severity', '🟡 Medium'),
+                                'details': f"{rule_result['rule']} - {rule_result['details']}"
+                            })
+                    
                     st.session_state.breach_alerts = breaches
                     st.success("✅ Analysis Complete!")
                     
-                    # Save to Supabase
+                    # FIXED: Save to Supabase with all data properly structured
                     analysis_data = {
                         'portfolio_data': df_results.to_json(),
-                        'compliance_results': json.dumps(parse_and_validate_rules_enhanced(rules_text, df_results)),
+                        'compliance_results': compliance_results,  # Direct list, not JSON string
                         'compliance_rules': rules_text,
-                        'breach_alerts': json.dumps(breaches),
+                        'breach_alerts': breaches,  # Direct list, not JSON string
                         'security_compliance': security_compliance.to_json(),
                         'advanced_metrics': None,
                         'ai_analysis': None,
@@ -774,16 +834,23 @@ with tabs[0]:
                             'total_value': float(total_value),
                             'holdings_count': len(df_results),
                             'single_stock_limit': single_stock_limit,
-                            'single_sector_limit': single_sector_limit
+                            'single_sector_limit': single_sector_limit,  # ADDED
+                            'analysis_timestamp': datetime.now().isoformat()
                         }
                     }
                     
                     success, analysis_id = save_analysis_to_supabase(analysis_data)
                     if success:
                         st.success(f"💾 Auto-saved! ID: {analysis_id}")
+                        # Refresh saved analyses list
+                        st.session_state["saved_analyses"] = get_user_analyses(st.session_state["user_id"])
+                    else:
+                        st.warning("⚠️ Analysis completed but save failed. Check your database connection.")
         
         except Exception as e:
             st.error(f"Error: {e}")
+            import traceback
+            st.error(f"Traceback: {traceback.format_exc()}")
     
     # Display results
     results_df = st.session_state.get("compliance_results_df", pd.DataFrame())
@@ -846,6 +913,27 @@ with tabs[0]:
             if st.button("🔄 Calculate", type="primary", use_container_width=True):
                 with st.spinner("Calculating..."):
                     st.session_state.advanced_metrics = calculate_advanced_metrics(results_df, api_key, access_token)
+                    
+                    # Save metrics to database
+                    if st.session_state.advanced_metrics and st.session_state.get("compliance_results_df") is not None:
+                        analysis_data = {
+                            'portfolio_data': st.session_state["compliance_results_df"].to_json(),
+                            'compliance_results': st.session_state.get("compliance_results", []),
+                            'compliance_rules': st.session_state.get("current_rules_text", ""),
+                            'breach_alerts': st.session_state.get("breach_alerts", []),
+                            'security_compliance': st.session_state.get("security_level_compliance", pd.DataFrame()).to_json(),
+                            'advanced_metrics': st.session_state.advanced_metrics,
+                            'ai_analysis': st.session_state.get("ai_analysis_response"),
+                            'metadata': {
+                                'total_value': float(results_df['Real-time Value (Rs)'].sum()),
+                                'holdings_count': len(results_df),
+                                'single_stock_limit': st.session_state.get("current_single_stock_limit", 10.0),
+                                'single_sector_limit': st.session_state.get("current_single_sector_limit", 25.0),
+                                'analysis_timestamp': datetime.now().isoformat(),
+                                'metrics_calculated': True
+                            }
+                        }
+                        save_analysis_to_supabase(analysis_data)
             
             if st.session_state.advanced_metrics:
                 metrics = st.session_state.advanced_metrics
@@ -859,29 +947,52 @@ with tabs[0]:
         with analysis_tabs[3]:
             st.subheader("Rule Validation")
             
-            validation_results = parse_and_validate_rules_enhanced(rules_text, results_df)
+            # FIXED: Display the compliance results from session state
+            validation_results = st.session_state.get("compliance_results", [])
             
             if validation_results:
                 total_rules = len(validation_results)
                 passed = sum(1 for r in validation_results if r['status'] == "✅ PASS")
                 failed = sum(1 for r in validation_results if r['status'] == "❌ FAIL")
+                errors = sum(1 for r in validation_results if 'Error' in r['status'])
                 
-                summary_cols = st.columns(3)
+                summary_cols = st.columns(4)
                 summary_cols[0].metric("Total", total_rules)
                 summary_cols[1].metric("✅ Pass", passed)
                 summary_cols[2].metric("❌ Fail", failed)
+                summary_cols[3].metric("⚠️ Errors", errors)
                 
                 st.markdown("---")
                 
-                for res in validation_results:
-                    if res['status'] == "✅ PASS":
-                        with st.expander(f"{res['status']} | `{res['rule']}`", expanded=False):
-                            st.success(f"**Status:** {res['status']}")
-                            st.write(f"**Details:** {res['details']}")
-                    elif res['status'] == "❌ FAIL":
+                # Show failed rules first
+                failed_rules = [r for r in validation_results if r['status'] == "❌ FAIL"]
+                passed_rules = [r for r in validation_results if r['status'] == "✅ PASS"]
+                error_rules = [r for r in validation_results if 'Error' in r['status']]
+                
+                if failed_rules:
+                    st.markdown("### ❌ Failed Rules")
+                    for res in failed_rules:
                         with st.expander(f"{res['status']} {res.get('severity', '')} | `{res['rule']}`", expanded=True):
                             st.error(f"**Status:** {res['status']}")
                             st.write(f"**Details:** {res['details']}")
+                            if 'breach_amount' in res:
+                                st.write(f"**Breach Amount:** {res['breach_amount']:.2f}%")
+                
+                if passed_rules:
+                    st.markdown("### ✅ Passed Rules")
+                    for res in passed_rules:
+                        with st.expander(f"{res['status']} | `{res['rule']}`", expanded=False):
+                            st.success(f"**Status:** {res['status']}")
+                            st.write(f"**Details:** {res['details']}")
+                
+                if error_rules:
+                    st.markdown("### ⚠️ Rule Errors")
+                    for res in error_rules:
+                        with st.expander(f"{res['status']} | `{res['rule']}`", expanded=False):
+                            st.warning(f"**Status:** {res['status']}")
+                            st.write(f"**Details:** {res['details']}")
+            else:
+                st.info("No custom rules validated. Add rules and click Analyze.")
         
         with analysis_tabs[4]:
             st.subheader("Security Compliance")
@@ -954,6 +1065,11 @@ with tabs[0]:
                         'Symbol': 'count'
                     }).rename(columns={'Symbol': 'Count'})
                     sector_analysis.to_excel(writer, sheet_name='Sectors')
+                    
+                    # Add compliance results if available
+                    if st.session_state.get("compliance_results"):
+                        compliance_df = pd.DataFrame(st.session_state["compliance_results"])
+                        compliance_df.to_excel(writer, sheet_name='Compliance', index=False)
                 
                 output.seek(0)
                 st.download_button(
@@ -1004,6 +1120,13 @@ with tabs[1]:
                         breach_alerts = st.session_state.get("breach_alerts", [])
                         breach_summary = "\n".join([f"- {b['type']}: {b['details']}" for b in breach_alerts]) if breach_alerts else "No breaches."
                         
+                        # Include custom rule results in AI analysis
+                        compliance_summary = ""
+                        if st.session_state.get("compliance_results"):
+                            compliance_summary = "\n**Custom Rule Results:**\n"
+                            for rule in st.session_state["compliance_results"]:
+                                compliance_summary += f"- {rule['status']} {rule.get('severity', '')}: {rule['rule']} - {rule['details']}\n"
+                        
                         prompt = f"""You are an expert investment compliance analyst with SEBI regulations knowledge.
 
 **TASK:** Comprehensive compliance analysis.
@@ -1016,6 +1139,11 @@ with tabs[1]:
 **DETECTED ISSUES:**
 ```
 {breach_summary}
+```
+
+**CUSTOM COMPLIANCE RULES:**
+```
+{compliance_summary}
 ```
 
 **SCHEME DOCUMENTS:**
@@ -1044,6 +1172,9 @@ with tabs[1]:
 
 ### 3.2 Scheme-Specific
 Verify against uploaded documents
+
+### 3.3 Custom Rules
+Analyze the custom rule violations
 
 ## 4. Portfolio Quality & Risk
 Comprehensive risk analysis
@@ -1077,21 +1208,32 @@ Begin analysis:
                         st.session_state.ai_analysis_response = response.text
                         st.success("✅ Complete!")
                         
-                        # Save AI analysis
+                        # FIXED: Save AI analysis with all existing data
                         analysis_data = {
                             'portfolio_data': st.session_state["compliance_results_df"].to_json(),
-                            'compliance_results': None,
-                            'compliance_rules': None,
-                            'breach_alerts': json.dumps(st.session_state.get("breach_alerts", [])),
+                            'compliance_results': st.session_state.get("compliance_results", []),
+                            'compliance_rules': st.session_state.get("current_rules_text", ""),
+                            'breach_alerts': st.session_state.get("breach_alerts", []),
                             'security_compliance': st.session_state.get("security_level_compliance", pd.DataFrame()).to_json(),
-                            'advanced_metrics': json.dumps(st.session_state.get("advanced_metrics")),
+                            'advanced_metrics': st.session_state.get("advanced_metrics"),
                             'ai_analysis': response.text,
-                            'metadata': {'analysis_type': 'AI', 'depth': analysis_depth}
+                            'metadata': {
+                                'total_value': float(portfolio_df['Real-time Value (Rs)'].sum()),
+                                'holdings_count': len(portfolio_df),
+                                'single_stock_limit': st.session_state.get("current_single_stock_limit", 10.0),
+                                'single_sector_limit': st.session_state.get("current_single_sector_limit", 25.0),
+                                'analysis_type': 'AI',
+                                'depth': analysis_depth,
+                                'analysis_timestamp': datetime.now().isoformat()
+                            }
                         }
                         save_analysis_to_supabase(analysis_data)
+                        st.session_state["saved_analyses"] = get_user_analyses(st.session_state["user_id"])
                     
                     except Exception as e:
                         st.error(f"❌ Error: {e}")
+                        import traceback
+                        st.error(f"Traceback: {traceback.format_exc()}")
         
         if st.session_state.get("ai_analysis_response"):
             st.markdown("---")
@@ -1115,7 +1257,7 @@ Begin analysis:
                 st.download_button(
                     "📝 Markdown",
                     md_data,
-                    f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                    f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md',
                     use_container_width=True
                 )
             
@@ -1171,11 +1313,16 @@ with tabs[2]:
                 with col2:
                     components = []
                     if analysis.get('holdings_data'):
-                        components.append("📊")
+                        components.append("📊 Portfolio")
                     if analysis.get('analysis_results'):
-                        components.append("⚖️")
+                        # Check if there are analysis_results
+                        analysis_results = analysis.get('analysis_results', [])
+                        if analysis_results and len(analysis_results) > 0:
+                            first_result = analysis_results[0]
+                            if first_result.get('compliance_results'):
+                                components.append("⚖️ Rules")
                     
-                    st.caption(" ".join(components) if components else "Portfolio")
+                    st.caption(" | ".join(components) if components else "Data")
                 
                 with col3:
                     if st.button("📂", key=f"load_h_{idx}", use_container_width=True):
@@ -1193,6 +1340,19 @@ with tabs[2]:
                                     st.session_state["security_level_compliance"] = pd.DataFrame(loaded['security_compliance'])
                             if loaded.get('breach_alerts'):
                                 st.session_state["breach_alerts"] = loaded['breach_alerts'] if isinstance(loaded['breach_alerts'], list) else json.loads(loaded['breach_alerts'])
+                            if loaded.get('compliance_results'):
+                                st.session_state["compliance_results"] = loaded['compliance_results'] if isinstance(loaded['compliance_results'], list) else json.loads(loaded['compliance_results'])
+                            if loaded.get('advanced_metrics'):
+                                st.session_state["advanced_metrics"] = loaded['advanced_metrics'] if isinstance(loaded['advanced_metrics'], dict) else json.loads(loaded['advanced_metrics']) if loaded['advanced_metrics'] else None
+                            if loaded.get('ai_analysis'):
+                                st.session_state["ai_analysis_response"] = loaded['ai_analysis']
+                            
+                            # Load compliance config values
+                            if loaded.get('metadata'):
+                                st.session_state["current_single_stock_limit"] = loaded['metadata'].get('single_stock_limit', 10.0)
+                                st.session_state["current_single_sector_limit"] = loaded['metadata'].get('single_sector_limit', 25.0)
+                            if loaded.get('compliance_rules'):
+                                st.session_state["current_rules_text"] = loaded['compliance_rules']
                             
                             st.success("✅ Loaded!")
                             time.sleep(1)
