@@ -1257,7 +1257,7 @@ Begin analysis:
                 st.download_button(
                     "📝 Markdown",
                     md_data,
-                    f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md',
+                    f"ai_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
                     use_container_width=True
                 )
             
