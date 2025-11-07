@@ -228,7 +228,7 @@ def save_portfolio_with_stages(user_id: str, portfolio_name: str, portfolio_data
         return False, None
 
 def save_compliance_analysis(user_id: str, portfolio_id: str, compliance_data: dict):
-    """Save compliance analysis results"""
+    """Save compliance analysis results - FIXED for existing schema"""
     try:
         # Save or update compliance config
         config_record = {
@@ -253,17 +253,19 @@ def save_compliance_analysis(user_id: str, portfolio_id: str, compliance_data: d
         if not config_id:
             return False, None
         
-        # Save or update analysis results
+        # Save or update analysis results - ONLY fields that exist in schema
         analysis_record = {
             'user_id': user_id,
             'portfolio_id': portfolio_id,
             'config_id': config_id,
             'compliance_results': compliance_data.get('compliance_results', []),
             'security_compliance': compliance_data.get('security_compliance'),
-            'breach_alerts': compliance_data.get('breach_alerts', []),
-            'advanced_metrics': compliance_data.get('advanced_metrics'),
-            'ai_analysis': compliance_data.get('ai_analysis')
+            'breach_alerts': compliance_data.get('breach_alerts', [])
         }
+        
+        # Only add ai_analysis if it exists and is not None
+        if compliance_data.get('ai_analysis'):
+            analysis_record['ai_analysis'] = compliance_data['ai_analysis']
         
         # Check if analysis exists
         existing_analysis = supabase.table('analysis_results').select('*').eq('portfolio_id', portfolio_id).execute()
@@ -273,8 +275,18 @@ def save_compliance_analysis(user_id: str, portfolio_id: str, compliance_data: d
         else:
             analysis_result = supabase.table('analysis_results').insert(analysis_record).execute()
         
+        # Store advanced_metrics separately in portfolio metadata if provided
+        if compliance_data.get('advanced_metrics'):
+            portfolio_metadata_update = {
+                'metadata': {
+                    'advanced_metrics': compliance_data['advanced_metrics'],
+                    'last_updated': datetime.now().isoformat()
+                }
+            }
+            supabase.table('portfolios').update(portfolio_metadata_update).eq('id', portfolio_id).execute()
+        
         # Update portfolio stage
-        supabase.table('portfolios').update({'analysis_stage': 'ai_completed'}).eq('id', portfolio_id).execute()
+        supabase.table('portfolios').update({'analysis_stage': 'ai_completed' if compliance_data.get('ai_analysis') else 'compliance_done'}).eq('id', portfolio_id).execute()
         
         return True, portfolio_id
     except Exception as e:
@@ -295,7 +307,7 @@ def get_user_portfolios(user_id: str):
         return []
 
 def load_portfolio_full(portfolio_id: str):
-    """Load complete portfolio with all analysis data"""
+    """Load complete portfolio with all analysis data - FIXED for existing schema"""
     try:
         # Get portfolio
         portfolio_result = supabase.table('portfolios').select('*').eq('id', portfolio_id).execute()
@@ -313,6 +325,11 @@ def load_portfolio_full(portfolio_id: str):
         # Get KIM document
         kim_result = supabase.table('kim_documents').select('*').eq('user_id', portfolio['user_id']).eq('portfolio_name', portfolio['portfolio_name']).execute()
         
+        # Extract advanced_metrics from portfolio metadata if available
+        advanced_metrics = None
+        if portfolio.get('metadata') and isinstance(portfolio['metadata'], dict):
+            advanced_metrics = portfolio['metadata'].get('advanced_metrics')
+        
         # Combine data
         combined = {
             'id': portfolio_id,
@@ -325,7 +342,7 @@ def load_portfolio_full(portfolio_id: str):
             'compliance_results': analysis_result.data[0].get('compliance_results') if analysis_result.data else None,
             'security_compliance': analysis_result.data[0].get('security_compliance') if analysis_result.data else None,
             'breach_alerts': analysis_result.data[0].get('breach_alerts') if analysis_result.data else None,
-            'advanced_metrics': analysis_result.data[0].get('advanced_metrics') if analysis_result.data else None,
+            'advanced_metrics': advanced_metrics,
             'ai_analysis': analysis_result.data[0].get('ai_analysis') if analysis_result.data else None,
             'kim_document': kim_result.data[0] if kim_result.data else None,
             'metadata': portfolio.get('metadata', {})
@@ -694,6 +711,108 @@ def get_portfolio_summary(df):
         summary += f"- {sector}: {weight:.2f}%\n"
     
     return summary
+
+
+def render_portfolio_card(portfolio):
+    """Helper function to render portfolio card in history"""
+    portfolio_name = portfolio.get('portfolio_name', 'Unnamed Portfolio')
+    analysis_date = datetime.fromisoformat(portfolio['created_at'])
+    
+    with st.container():
+        col1, col2, col3, col4 = st.columns([4, 2, 1, 1])
+        
+        with col1:
+            st.markdown(f"**📁 {portfolio_name}**")
+            st.caption(f"{analysis_date.strftime('%Y-%m-%d %H:%M')}")
+            
+            if portfolio.get('metadata'):
+                metadata = portfolio['metadata']
+                if isinstance(metadata, str):
+                    metadata = json.loads(metadata)
+                
+                info_parts = []
+                if metadata.get('total_value'):
+                    info_parts.append(f"₹{metadata['total_value']:,.0f}")
+                if metadata.get('holdings_count'):
+                    info_parts.append(f"{metadata['holdings_count']} holdings")
+                
+                if info_parts:
+                    st.caption(" | ".join(info_parts))
+        
+        with col2:
+            # Show stage and breach count
+            stage = portfolio.get('analysis_stage', 'upload')
+            stage_text = {
+                'upload': '📤 Uploaded',
+                'compliance_done': '✅ Compliance',
+                'ai_completed': '🤖 AI Complete'
+            }.get(stage, 'Unknown')
+            
+            st.caption(stage_text)
+            
+            # Show breach count if available
+            if portfolio.get('analysis_results'):
+                results = portfolio['analysis_results']
+                if results and len(results) > 0:
+                    breach_alerts = results[0].get('breach_alerts', [])
+                    if breach_alerts:
+                        st.caption(f"❌ {len(breach_alerts)} breaches")
+        
+        with col3:
+            if st.button("📂", key=f"load_hist_{portfolio['id']}", use_container_width=True, help="Load Portfolio"):
+                loaded = load_portfolio_full(portfolio['id'])
+                if loaded:
+                    # Load all data into session state
+                    st.session_state["current_portfolio_id"] = portfolio['id']
+                    st.session_state["current_portfolio_name"] = loaded['portfolio_name']
+                    st.session_state["compliance_stage"] = loaded['analysis_stage']
+                    
+                    if loaded.get('portfolio_data'):
+                        if isinstance(loaded['portfolio_data'], str):
+                            st.session_state["compliance_results_df"] = pd.read_json(loaded['portfolio_data'])
+                        else:
+                            st.session_state["compliance_results_df"] = pd.DataFrame(loaded['portfolio_data'])
+                    
+                    if loaded.get('threshold_configs'):
+                        st.session_state["threshold_configs"] = loaded['threshold_configs']
+                    
+                    if loaded.get('compliance_rules'):
+                        st.session_state["current_rules_text"] = loaded['compliance_rules']
+                    
+                    if loaded.get('compliance_results'):
+                        st.session_state["compliance_results"] = loaded['compliance_results']
+                    
+                    if loaded.get('security_compliance'):
+                        if isinstance(loaded['security_compliance'], str):
+                            st.session_state["security_level_compliance"] = pd.read_json(loaded['security_compliance'])
+                        elif loaded['security_compliance']:
+                            st.session_state["security_level_compliance"] = pd.DataFrame(loaded['security_compliance'])
+                    
+                    if loaded.get('breach_alerts'):
+                        st.session_state["breach_alerts"] = loaded['breach_alerts']
+                    
+                    if loaded.get('advanced_metrics'):
+                        st.session_state["advanced_metrics"] = loaded['advanced_metrics']
+                    
+                    if loaded.get('ai_analysis'):
+                        st.session_state["ai_analysis_response"] = loaded['ai_analysis']
+                    
+                    if loaded.get('kim_document'):
+                        st.session_state["kim_documents"][loaded['portfolio_name']] = loaded['kim_document']
+                    
+                    st.success("✅ Portfolio Loaded!")
+                    time.sleep(0.5)
+                    st.rerun()
+        
+        with col4:
+            if st.button("🗑️", key=f"delete_hist_{portfolio['id']}", use_container_width=True, help="Delete Portfolio"):
+                if delete_portfolio(portfolio['id']):
+                    st.success("Deleted!")
+                    st.session_state["saved_analyses"] = get_user_portfolios(st.session_state["user_id"])
+                    time.sleep(0.5)
+                    st.rerun()
+        
+        st.markdown("---")
 
 
 # --- Authentication UI ---
@@ -1906,108 +2025,6 @@ with tabs[2]:
             st.markdown("### 📤 Uploaded Only")
             for portfolio in stage_groups['upload'][:10]:
                 render_portfolio_card(portfolio)
-
-
-def render_portfolio_card(portfolio):
-    """Helper function to render portfolio card"""
-    portfolio_name = portfolio.get('portfolio_name', 'Unnamed Portfolio')
-    analysis_date = datetime.fromisoformat(portfolio['created_at'])
-    
-    with st.container():
-        col1, col2, col3, col4 = st.columns([4, 2, 1, 1])
-        
-        with col1:
-            st.markdown(f"**📁 {portfolio_name}**")
-            st.caption(f"{analysis_date.strftime('%Y-%m-%d %H:%M')}")
-            
-            if portfolio.get('metadata'):
-                metadata = portfolio['metadata']
-                if isinstance(metadata, str):
-                    metadata = json.loads(metadata)
-                
-                info_parts = []
-                if metadata.get('total_value'):
-                    info_parts.append(f"₹{metadata['total_value']:,.0f}")
-                if metadata.get('holdings_count'):
-                    info_parts.append(f"{metadata['holdings_count']} holdings")
-                
-                if info_parts:
-                    st.caption(" | ".join(info_parts))
-        
-        with col2:
-            # Show stage and breach count
-            stage = portfolio.get('analysis_stage', 'upload')
-            stage_text = {
-                'upload': '📤 Uploaded',
-                'compliance_done': '✅ Compliance',
-                'ai_completed': '🤖 AI Complete'
-            }.get(stage, 'Unknown')
-            
-            st.caption(stage_text)
-            
-            # Show breach count if available
-            if portfolio.get('analysis_results'):
-                results = portfolio['analysis_results']
-                if results and len(results) > 0:
-                    breach_alerts = results[0].get('breach_alerts', [])
-                    if breach_alerts:
-                        st.caption(f"❌ {len(breach_alerts)} breaches")
-        
-        with col3:
-            if st.button("📂", key=f"load_hist_{portfolio['id']}", use_container_width=True, help="Load Portfolio"):
-                loaded = load_portfolio_full(portfolio['id'])
-                if loaded:
-                    # Load all data
-                    st.session_state["current_portfolio_id"] = portfolio['id']
-                    st.session_state["current_portfolio_name"] = loaded['portfolio_name']
-                    st.session_state["compliance_stage"] = loaded['analysis_stage']
-                    
-                    if loaded.get('portfolio_data'):
-                        if isinstance(loaded['portfolio_data'], str):
-                            st.session_state["compliance_results_df"] = pd.read_json(loaded['portfolio_data'])
-                        else:
-                            st.session_state["compliance_results_df"] = pd.DataFrame(loaded['portfolio_data'])
-                    
-                    if loaded.get('threshold_configs'):
-                        st.session_state["threshold_configs"] = loaded['threshold_configs']
-                    
-                    if loaded.get('compliance_rules'):
-                        st.session_state["current_rules_text"] = loaded['compliance_rules']
-                    
-                    if loaded.get('compliance_results'):
-                        st.session_state["compliance_results"] = loaded['compliance_results']
-                    
-                    if loaded.get('security_compliance'):
-                        if isinstance(loaded['security_compliance'], str):
-                            st.session_state["security_level_compliance"] = pd.read_json(loaded['security_compliance'])
-                        elif loaded['security_compliance']:
-                            st.session_state["security_level_compliance"] = pd.DataFrame(loaded['security_compliance'])
-                    
-                    if loaded.get('breach_alerts'):
-                        st.session_state["breach_alerts"] = loaded['breach_alerts']
-                    
-                    if loaded.get('advanced_metrics'):
-                        st.session_state["advanced_metrics"] = loaded['advanced_metrics']
-                    
-                    if loaded.get('ai_analysis'):
-                        st.session_state["ai_analysis_response"] = loaded['ai_analysis']
-                    
-                    if loaded.get('kim_document'):
-                        st.session_state["kim_documents"][loaded['portfolio_name']] = loaded['kim_document']
-                    
-                    st.success("✅ Portfolio Loaded!")
-                    time.sleep(0.5)
-                    st.rerun()
-        
-        with col4:
-            if st.button("🗑️", key=f"delete_hist_{portfolio['id']}", use_container_width=True, help="Delete Portfolio"):
-                if delete_portfolio(portfolio['id']):
-                    st.success("Deleted!")
-                    st.session_state["saved_analyses"] = get_user_portfolios(st.session_state["user_id"])
-                    time.sleep(0.5)
-                    st.rerun()
-        
-        st.markdown("---")
 
 
 # --- Footer ---
