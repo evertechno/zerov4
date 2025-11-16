@@ -1,27 +1,4 @@
-An excellent request. Adding a portfolio stress testing and audit function is a powerful feature for any compliance tool. It allows users to see how their portfolio would behave and if it would breach rules under adverse market conditions.
 
-Here is the updated code with the new "Stress Testing & Audit" tab integrated. I've added the necessary functions for simulation and a user-friendly interface to define scenarios and view the results, including a post-stress compliance audit.
-
-### Key Changes Made:
-
-1.  **New Tab Added:** A "⚡ Stress Testing & Audit" tab has been added to the main interface.
-2.  **Simulation Logic (`run_stress_test` function):**
-    *   A new function simulates three types of scenarios: Market Crash, Sector Shock, and Single Stock Failure.
-    *   It takes the original portfolio, applies the shock, and calculates the new "stressed" values and portfolio weights.
-    *   It returns the stressed portfolio DataFrame and a summary of the impact.
-3.  **Stress Testing UI:**
-    *   The new tab contains controls to select a scenario and configure its parameters (e.g., percentage drop).
-    *   A "Run Stress Test" button triggers the simulation.
-4.  **Results Display:**
-    *   **High-Level Metrics:** Shows the change in portfolio value in both absolute and percentage terms.
-    *   **Post-Stress Compliance Audit:** This is the crucial part. After the simulation, the tool automatically re-runs the defined compliance rules against the *new, stressed portfolio weights*. It clearly highlights any new breaches that occur due to the market shock.
-    *   **Detailed Impact Table:** A sortable table shows the before-and-after values and weights for each holding.
-    *   **Visualizations:** A bar chart visualizes the top 10 holdings most affected by the stress test, making it easy to identify sources of risk.
-5.  **State Management:** The app now clears stress test results from the session state when a new portfolio is created or loaded to prevent showing stale data.
-
-Here is the complete, modified script:
-
-```python
 import streamlit as st
 import pandas as pd
 import json
