@@ -43,7 +43,7 @@ st.set_page_config(page_title="Invsion Connect", layout="wide", initial_sidebar_
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_EXCHANGE = "NSE"
 BENCHMARK_SYMBOL = "NIFTY 50"
-COMPLIANCE_API_BASE_URL = "https://zeroapiv4.onrender.com/api/v1" # Replace with your API base URL
+COMPLIANCE_API_BASE_URL = "https://zeroapiv4.onrender.com/api/v1" # Adjusted API base URL
 
 # Initialize session state
 if "user_authenticated" not in st.session_state: st.session_state["user_authenticated"] = False
@@ -434,29 +434,50 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
         return pd.DataFrame({"_error": [str(e)]})
 
 
-# --- Enhanced Compliance Functions ---
-# NOTE: The parse_and_validate_rules_enhanced logic is now mostly handled by the external API.
-# This function will primarily format data for the API and then parse the API's response.
+# --- Compliance API Integration Helper ---
+def call_compliance_api(endpoint: str, payload: dict):
+    """
+    Generic helper function to call a compliance API endpoint.
+    Returns JSON response data or None on error.
+    """
+    try:
+        url = f"{COMPLIANCE_API_BASE_URL}{endpoint}"
+        st.info(f"Calling API: {url} with payload (truncated): {str(payload)[:500]}...") # Log payload for debug
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        st.success(f"API call to {endpoint} successful!")
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        st.error(f"API HTTP Error ({endpoint}): {e.response.status_code} - {e.response.text}")
+        return None
+    except requests.exceptions.ConnectionError as e:
+        st.error(f"API Connection Error ({endpoint}): {e}")
+        return None
+    except requests.exceptions.Timeout as e:
+        st.error(f"API Timeout Error ({endpoint}): {e}")
+        return None
+    except requests.exceptions.RequestException as e:
+        st.error(f"An unexpected API Request Error occurred ({endpoint}): {e}")
+        return None
+    except json.JSONDecodeError:
+        st.error(f"Failed to decode JSON response from API ({endpoint}): {response.text}")
+        return None
+    except Exception as e:
+        st.error(f"An unexpected error occurred during API call ({endpoint}): {e}")
+        return None
+
+
+# --- Enhanced Compliance Functions (using API) ---
 def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, threshold_configs: dict):
     """Calls the API to run compliance checks."""
-    try:
-        api_payload = {
-            "portfolio": portfolio_df.to_dict('records'),
-            "rules_text": rules_text,
-            "threshold_configs": threshold_configs
-        }
-        response = requests.post(f"{COMPLIANCE_API_BASE_URL}/simulate/portfolio", json=api_payload)
-        response.raise_for_status()  # Raise an exception for HTTP errors
-        return response.json()['compliance_results']
-    except requests.exceptions.RequestException as e:
-        st.error(f"API Error during compliance check: {e}")
-        return []
-    except json.JSONDecodeError:
-        st.error("Failed to decode JSON response from API.")
-        return []
-    except Exception as e:
-        st.error(f"An unexpected error occurred: {e}")
-        return []
+    payload = {
+        "portfolio": portfolio_df.to_dict('records'),
+        "rules_text": rules_text,
+        "threshold_configs": threshold_configs
+    }
+    api_response = call_compliance_api("/simulate/portfolio", payload)
+    return api_response['compliance_results'] if api_response and 'compliance_results' in api_response else []
+
 
 def calculate_security_level_compliance(portfolio_df: pd.DataFrame, threshold_configs: dict):
     """Enhanced security compliance with more thresholds"""
@@ -543,7 +564,7 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
         "diversification_ratio": None
     }
 
-# --- NEW: Stress Testing Functions ---
+# --- Stress Testing Functions (using local implementation) ---
 def run_stress_test(original_df, scenario_type, params):
     """
     Applies a stress scenario to a portfolio DataFrame.
@@ -1024,7 +1045,8 @@ k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state[
 api_key = KITE_CREDENTIALS["api_key"]
 access_token = st.session_state["kite_access_token"]
 
-tabs = st.tabs(["💼 Portfolio Analysis", "🤖 AI Analysis", "⚡ Stress Testing & Audit", "📚 History"])
+# Added a new tab: "🔧 API Interactions"
+tabs = st.tabs(["💼 Portfolio Analysis", "🤖 AI Analysis", "⚡ Stress Testing & Audit", "🔧 API Interactions", "📚 History"])
 
 
 # --- TAB 1: Enhanced Compliance Analysis ---
@@ -1534,7 +1556,7 @@ HHI < 800""")
                 from io import BytesIO
                 output = BytesIO()
                 
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                with pd.ExcelWriter(output, engine='openyxl') as writer:
                     # Holdings sheet
                     results_df.to_excel(writer, sheet_name='Holdings', index=False)
                     
@@ -1962,7 +1984,7 @@ Data limitations and assumptions made
                 st.session_state.ai_analysis_response = None
                 st.rerun()
 
-# --- TAB 3: NEW Stress Testing & Audit ---
+# --- TAB 3: Stress Testing & Audit (local implementation) ---
 with tabs[2]:
     st.header("⚡ Portfolio Stress Testing & Audit")
 
@@ -2004,9 +2026,6 @@ with tabs[2]:
                 # Re-run compliance audit on the stressed data using the API
                 # The API's compliance check assumes a 'Weight %' column which we create temporarily.
                 stressed_df_for_api = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'}).copy()
-                
-                # Ensure the DataFrame passed to the API has consistent columns expected by the API
-                # Convert to JSON serializable format for the API call
                 
                 stressed_compliance_results = call_compliance_api_run_check(
                     stressed_df_for_api,
@@ -2095,8 +2114,194 @@ with tabs[2]:
             fig.update_layout(yaxis_title="Loss in Value (Rs)", xaxis_title="Stock Symbol")
             st.plotly_chart(fig, use_container_width=True)
 
-# --- TAB 4: Enhanced History ---
+# --- NEW: TAB 4: API Interactions ---
 with tabs[3]:
+    st.header("🔧 Compliance API Interactions")
+    st.markdown("Interact directly with the compliance backend API for various simulation and suggestion tasks.")
+
+    current_portfolio_df = st.session_state.get("compliance_results_df")
+    current_rules_text = st.session_state.get("current_rules_text")
+    current_threshold_configs = st.session_state.get("threshold_configs")
+
+    if current_portfolio_df is None or current_portfolio_df.empty:
+        st.warning("⚠️ Please load or analyze a portfolio in 'Portfolio Analysis' tab to use API functions.")
+        st.stop()
+    if not current_rules_text:
+        st.warning("⚠️ Please define compliance rules in 'Portfolio Analysis' tab to use API functions.")
+        st.stop()
+    
+    st.info(f"**Using Portfolio:** `{st.session_state.get('current_portfolio_name', 'Unnamed Portfolio')}`")
+    st.caption("The portfolio data, rules, and thresholds from the 'Portfolio Analysis' tab are automatically used.")
+
+    # Convert current_portfolio_df to a JSON-serializable list of dicts for the API calls
+    # Ensure 'Symbol', 'Name', 'Quantity', 'LTP', 'Industry' are present and in correct format.
+    # The API's _recalculate_weights function will handle value and weight % if LTP/Quantity are given.
+    portfolio_for_api = current_portfolio_df[['Symbol', 'Name', 'Quantity', 'LTP', 'Industry']].copy()
+    portfolio_for_api.fillna({'Industry': 'UNKNOWN'}, inplace=True) # API might expect string for Industry
+    # Ensure numeric types are native Python types if `to_dict('records')` doesn't handle them perfectly
+    portfolio_for_api['Quantity'] = portfolio_for_api['Quantity'].astype(float)
+    portfolio_for_api['LTP'] = portfolio_for_api['LTP'].astype(float)
+
+
+    api_call_tab1, api_call_tab2, api_call_tab3, api_call_tab4 = st.tabs([
+        "Pre-Trade Simulation", 
+        "Optimal Trade Suggester", 
+        "Cash Flow Simulation", 
+        "Block Trade Allocation"
+    ])
+
+    with api_call_tab1:
+        st.subheader("Simulate Proposed Trades")
+        st.write("Test a single buy/sell trade against your current portfolio and rules.")
+        
+        trade_col1, trade_col2 = st.columns(2)
+        with trade_col1:
+            trade_symbol = st.text_input("Trade Symbol", key="trade_symbol", value=portfolio_for_api['Symbol'].iloc[0] if not portfolio_for_api.empty else "")
+            trade_action = st.selectbox("Action", ["BUY", "SELL"], key="trade_action")
+        with trade_col2:
+            trade_quantity = st.number_input("Quantity", min_value=1, value=10, key="trade_quantity")
+            
+        current_ltp_for_trade = current_portfolio_df[current_portfolio_df['Symbol'] == trade_symbol]['LTP'].iloc[0] if trade_symbol in current_portfolio_df['Symbol'].values else 0.0
+        trade_ltp = st.number_input(f"LTP for {trade_symbol}", value=float(current_ltp_for_trade), min_value=0.01)
+        
+        trade_industry = current_portfolio_df[current_portfolio_df['Symbol'] == trade_symbol]['Industry'].iloc[0] if trade_symbol in current_portfolio_df['Symbol'].values else "UNKNOWN"
+        trade_industry = st.text_input(f"Industry for {trade_symbol}", value=str(trade_industry))
+
+        if st.button("Simulate Trade", type="primary"):
+            trade_payload = {
+                "portfolio": portfolio_for_api.to_dict('records'),
+                "rules_text": current_rules_text,
+                "threshold_configs": current_threshold_configs,
+                "trade": {
+                    "symbol": trade_symbol.upper(),
+                    "action": trade_action.upper(),
+                    "quantity": int(trade_quantity),
+                    "ltp": float(trade_ltp),
+                    "industry": trade_industry.upper(),
+                    "name": trade_symbol.upper() # Add 'Name' to trade for API compatibility
+                }
+            }
+            with st.spinner(f"Simulating {trade_action} {trade_quantity} {trade_symbol}..."):
+                response_data = call_compliance_api("/simulate/trade", trade_payload)
+                if response_data:
+                    st.success("Pre-trade simulation results:")
+                    simulated_df = pd.DataFrame(response_data['simulated_portfolio'])
+                    st.markdown("##### Simulated Portfolio")
+                    st.dataframe(simulated_df.style.format({'Real-time Value (Rs)': '₹{:,.2f}', 'Weight %': '{:.2f}%', 'LTP': '₹{:,.2f}'}), use_container_width=True)
+                    st.markdown("##### Compliance Results After Trade")
+                    st.dataframe(pd.DataFrame(response_data['compliance_results']), use_container_width=True, hide_index=True)
+                else:
+                    st.error("Failed to get pre-trade simulation results.")
+
+    with api_call_tab2:
+        st.subheader("Optimal Trade Suggester")
+        st.write("Get suggestions for trades to resolve any detected compliance breaches.")
+
+        if st.button("Get Trade Suggestions", type="primary"):
+            trade_suggestion_payload = {
+                "portfolio": portfolio_for_api.to_dict('records'),
+                "rules_text": current_rules_text,
+                "threshold_configs": current_threshold_configs
+            }
+            with st.spinner("Requesting trade suggestions..."):
+                response_data = call_compliance_api("/suggest/trades", trade_suggestion_payload)
+                if response_data:
+                    if response_data['suggestions']:
+                        st.success("Optimal trade suggestions:")
+                        st.dataframe(pd.DataFrame(response_data['suggestions']), use_container_width=True, hide_index=True)
+                    else:
+                        st.info(response_data.get('message', "No suggestions available, portfolio might be compliant."))
+                    
+                    st.markdown("---")
+                    st.markdown("##### Current Compliance Before Suggestions (from API)")
+                    st.dataframe(pd.DataFrame(response_data['current_compliance']), use_container_width=True, hide_index=True)
+                else:
+                    st.error("Failed to get trade suggestions.")
+
+    with api_call_tab3:
+        st.subheader("Cash Flow Simulation")
+        st.write("Simulate the impact of adding or withdrawing cash from the portfolio.")
+
+        cash_amount = st.number_input("Cash Amount (Rs)", value=100000.0, step=10000.0, help="Positive for inflow, negative for outflow.")
+        
+        if st.button("Simulate Cash Flow", type="primary"):
+            cash_flow_payload = {
+                "portfolio": portfolio_for_api.to_dict('records'),
+                "rules_text": current_rules_text,
+                "threshold_configs": current_threshold_configs,
+                "cash_flow": {
+                    "amount": float(cash_amount)
+                }
+            }
+            with st.spinner("Simulating cash flow..."):
+                response_data = call_compliance_api("/simulate/cashflow", cash_flow_payload)
+                if response_data:
+                    st.success("Cash flow simulation results:")
+                    simulated_df = pd.DataFrame(response_data['simulated_portfolio'])
+                    st.markdown("##### Simulated Portfolio with Cash Flow")
+                    st.dataframe(simulated_df.style.format({'Real-time Value (Rs)': '₹{:,.2f}', 'Weight %': '{:.2f}%', 'LTP': '₹{:,.2f}'}), use_container_width=True)
+                    st.markdown("##### Compliance Results After Cash Flow")
+                    st.dataframe(pd.DataFrame(response_data['compliance_results']), use_container_width=True, hide_index=True)
+                else:
+                    st.error("Failed to simulate cash flow.")
+
+    with api_call_tab4:
+        st.subheader("Block Trade Allocation Check")
+        st.write("Check how a hypothetical block trade (split and allocated to your current portfolio) affects compliance. This assumes the entire block trade is allocated to this one portfolio for demonstration.")
+
+        bt_symbol = st.text_input("Block Trade Symbol", key="bt_symbol", value="RELIANCE")
+        bt_ltp = st.number_input("Block Trade LTP (Rs)", value=2500.0, key="bt_ltp")
+        bt_quantity = st.number_input("Block Trade Total Quantity", min_value=1, value=500, key="bt_quantity")
+        bt_action = st.selectbox("Block Trade Action", ["BUY", "SELL"], key="bt_action_block")
+        
+        # Determine industry for the block trade symbol
+        bt_industry = current_portfolio_df[current_portfolio_df['Symbol'].str.upper() == bt_symbol.upper()]['Industry'].iloc[0] \
+                        if bt_symbol.upper() in current_portfolio_df['Symbol'].str.upper().values else "UNKNOWN"
+        bt_industry_input = st.text_input(f"Industry for {bt_symbol}", value=str(bt_industry), key="bt_industry")
+
+        if st.button("Check Block Trade Allocation", type="primary"):
+            if not st.session_state.get('current_portfolio_id'):
+                st.error("No current portfolio loaded to check allocation against. Please load a portfolio first.")
+            else:
+                # For demonstration, we'll simulate the entire block trade being allocated to the *current* portfolio
+                # A real system would have multiple portfolios to allocate against.
+                allocation_payload = {
+                    "portfolios": [
+                        {
+                            "id": st.session_state.current_portfolio_id,
+                            "holdings": portfolio_for_api.to_dict('records'), # Using the current portfolio
+                            "rules_text": current_rules_text,
+                            "threshold_configs": current_threshold_configs,
+                            "allocation_quantity": int(bt_quantity) # Allocating total quantity to this single portfolio
+                        }
+                    ],
+                    "block_trade": {
+                        "symbol": bt_symbol.upper(),
+                        "action": bt_action.upper(),
+                        "ltp": float(bt_ltp),
+                        "industry": bt_industry_input.upper(),
+                        "name": bt_symbol.upper() # Add 'Name' to block_trade for API compatibility
+                    }
+                }
+                
+                with st.spinner(f"Checking block trade allocation for {bt_symbol}..."):
+                    response_data = call_compliance_api("/simulate/block_allocation", allocation_payload)
+                    if response_data and response_data['allocation_results']:
+                        st.success("Block trade allocation results:")
+                        # Display results for each portfolio (in this case, just the one current portfolio)
+                        for res in response_data['allocation_results']:
+                            st.markdown(f"##### Portfolio ID: {res['portfolio_id']}")
+                            if res['breach_count'] > 0:
+                                st.error(f"❌ {res['breach_count']} breaches detected after allocation.")
+                            else:
+                                st.success("✅ Compliant after allocation.")
+                            st.dataframe(pd.DataFrame(res['compliance_results']), use_container_width=True, hide_index=True)
+                    else:
+                        st.error("Failed to check block trade allocation.")
+
+
+# --- Original TAB 4: History ---
+with tabs[4]: # This is now the fifth tab
     st.header("📚 Portfolio History")
     
     col1, col2 = st.columns([3, 1])
