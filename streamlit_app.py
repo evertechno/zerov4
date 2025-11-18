@@ -12,6 +12,7 @@ import numpy as np
 import ta
 import fitz
 import hashlib
+import requests # Import requests for API calls
 
 # --- AI Imports ---
 try:
@@ -42,6 +43,7 @@ st.set_page_config(page_title="Invsion Connect", layout="wide", initial_sidebar_
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_EXCHANGE = "NSE"
 BENCHMARK_SYMBOL = "NIFTY 50"
+COMPLIANCE_API_BASE_URL = "https://zeroapiv4.onrender.com/api/v1" # Replace with your API base URL
 
 # Initialize session state
 if "user_authenticated" not in st.session_state: st.session_state["user_authenticated"] = False
@@ -433,166 +435,28 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
 
 
 # --- Enhanced Compliance Functions ---
-def parse_and_validate_rules_enhanced(rules_text: str, portfolio_df: pd.DataFrame, threshold_configs: dict):
-    """Enhanced rule validation with more rule types"""
-    results = []
-    if not rules_text or not rules_text.strip() or portfolio_df.empty: 
-        return results
-    
-    sector_weights = portfolio_df.groupby('Industry')['Weight %'].sum()
-    stock_weights = portfolio_df.set_index('Symbol')['Weight %']
-    
-    def check_pass(actual, op, threshold):
-        if op == '>': return actual > threshold
-        if op == '<': return actual < threshold
-        if op == '>=': return actual >= threshold
-        if op == '<=': return actual <= threshold
-        if op == '=': return abs(actual - threshold) < 0.01
-        return False
-    
-    for rule in rules_text.strip().split('\n'):
-        rule = rule.strip()
-        if not rule or rule.startswith('#'): 
-            continue
-        
-        parts = re.split(r'\s+', rule)
-        rule_type = parts[0].upper()
-        
-        try:
-            actual_value = None
-            details = ""
-            
-            if len(parts) < 3:
-                results.append({'rule': rule, 'status': 'Error', 'details': 'Invalid format', 'severity': 'N/A'})
-                continue
-            
-            op = parts[-2]
-            if op not in ['>', '<', '>=', '<=', '=']:
-                results.append({'rule': rule, 'status': 'Error', 'details': f"Invalid operator '{op}'", 'severity': 'N/A'})
-                continue
-            
-            threshold = float(parts[-1].replace('%', ''))
-            
-            # STOCK: Single stock weight check
-            if rule_type == 'STOCK' and len(parts) == 4:
-                symbol = parts[1].upper()
-                if symbol in stock_weights.index:
-                    actual_value = stock_weights.get(symbol, 0.0)
-                    details = f"Actual for {symbol}: {actual_value:.2f}%"
-                else:
-                    results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': f"Symbol '{symbol}' not found", 'severity': 'N/A'})
-                    continue
-            
-            # SECTOR: Single sector weight check
-            elif rule_type == 'SECTOR':
-                sector_name = ' '.join(parts[1:-2]).upper()
-                matching_sector = next((s for s in sector_weights.index if s.upper() == sector_name), None)
-                if matching_sector:
-                    actual_value = sector_weights.get(matching_sector, 0.0)
-                    details = f"Actual for {matching_sector}: {actual_value:.2f}%"
-                else:
-                    results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': f"Sector '{sector_name}' not found", 'severity': 'N/A'})
-                    continue
-            
-            # TOP_N_STOCKS: Top N stocks concentration
-            elif rule_type == 'TOP_N_STOCKS' and len(parts) == 4:
-                n = int(parts[1])
-                actual_value = portfolio_df.nlargest(n, 'Weight %')['Weight %'].sum()
-                details = f"Actual weight of top {n} stocks: {actual_value:.2f}%"
-            
-            # TOP_N_SECTORS: Top N sectors concentration
-            elif rule_type == 'TOP_N_SECTORS' and len(parts) == 4:
-                n = int(parts[1])
-                actual_value = sector_weights.nlargest(n).sum()
-                details = f"Actual weight of top {n} sectors: {actual_value:.2f}%"
-            
-            # COUNT_STOCKS: Total number of stocks
-            elif rule_type == 'COUNT_STOCKS' and len(parts) == 3:
-                actual_value = len(portfolio_df)
-                details = f"Actual count: {actual_value}"
-            
-            # COUNT_SECTORS: Total number of sectors
-            elif rule_type == 'COUNT_SECTORS' and len(parts) == 3:
-                actual_value = portfolio_df['Industry'].nunique()
-                details = f"Actual count: {actual_value}"
-            
-            # AVG_STOCK_WEIGHT: Average weight per stock
-            elif rule_type == 'AVG_STOCK_WEIGHT' and len(parts) == 3:
-                actual_value = portfolio_df['Weight %'].mean()
-                details = f"Average stock weight: {actual_value:.2f}%"
-            
-            # MAX_STOCK_WEIGHT: Maximum single stock weight
-            elif rule_type == 'MAX_STOCK_WEIGHT' and len(parts) == 3:
-                actual_value = portfolio_df['Weight %'].max()
-                details = f"Maximum stock weight: {actual_value:.2f}%"
-            
-            # MIN_STOCK_WEIGHT: Minimum single stock weight
-            elif rule_type == 'MIN_STOCK_WEIGHT' and len(parts) == 3:
-                actual_value = portfolio_df['Weight %'].min()
-                details = f"Minimum stock weight: {actual_value:.2f}%"
-            
-            # SECTOR_DIVERSITY: Number of stocks per sector
-            elif rule_type == 'SECTOR_DIVERSITY':
-                sector_name = ' '.join(parts[1:-2]).upper()
-                matching_sector = next((s for s in sector_weights.index if s.upper() == sector_name), None)
-                if matching_sector:
-                    actual_value = len(portfolio_df[portfolio_df['Industry'] == matching_sector])
-                    details = f"Stocks in {matching_sector}: {actual_value}"
-                else:
-                    results.append({'rule': rule, 'status': '⚠️ Invalid', 'details': f"Sector '{sector_name}' not found", 'severity': 'N/A'})
-                    continue
-            
-            # BOTTOM_N_STOCKS: Bottom N stocks concentration
-            elif rule_type == 'BOTTOM_N_STOCKS' and len(parts) == 4:
-                n = int(parts[1])
-                actual_value = portfolio_df.nsmallest(n, 'Weight %')['Weight %'].sum()
-                details = f"Actual weight of bottom {n} stocks: {actual_value:.2f}%"
-            
-            # HHI: Herfindahl-Hirschman Index (concentration measure)
-            elif rule_type == 'HHI' and len(parts) == 3:
-                actual_value = (portfolio_df['Weight %'] ** 2).sum()
-                details = f"Portfolio HHI: {actual_value:.2f}"
-            
-            # GINI: Gini coefficient (inequality measure)
-            elif rule_type == 'GINI' and len(parts) == 3:
-                weights_sorted = portfolio_df['Weight %'].sort_values().values
-                n = len(weights_sorted)
-                actual_value = (2 * np.sum((np.arange(1, n+1)) * weights_sorted)) / (n * np.sum(weights_sorted)) - (n + 1) / n
-                details = f"Portfolio Gini: {actual_value:.4f}"
-            
-            else:
-                results.append({'rule': rule, 'status': 'Error', 'details': 'Unrecognized format', 'severity': 'N/A'})
-                continue
-            
-            if actual_value is not None:
-                passed = check_pass(actual_value, op, threshold)
-                status = "✅ PASS" if passed else "❌ FAIL"
-                
-                if not passed:
-                    breach_magnitude = abs(actual_value - threshold)
-                    if breach_magnitude > threshold * 0.2:
-                        severity = "🔴 Critical"
-                    elif breach_magnitude > threshold * 0.1:
-                        severity = "🟠 High"
-                    else:
-                        severity = "🟡 Medium"
-                else:
-                    severity = "✅ Compliant"
-                
-                results.append({
-                    'rule': rule,
-                    'status': status,
-                    'details': f"{details} | Rule: {op} {threshold}",
-                    'severity': severity,
-                    'actual_value': actual_value,
-                    'threshold': threshold,
-                    'breach_amount': actual_value - threshold if not passed else 0
-                })
-        
-        except (ValueError, IndexError) as e:
-            results.append({'rule': rule, 'status': 'Error', 'details': f"Parse error: {e}", 'severity': 'N/A'})
-    
-    return results
+# NOTE: The parse_and_validate_rules_enhanced logic is now mostly handled by the external API.
+# This function will primarily format data for the API and then parse the API's response.
+def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, threshold_configs: dict):
+    """Calls the API to run compliance checks."""
+    try:
+        api_payload = {
+            "portfolio": portfolio_df.to_dict('records'),
+            "rules_text": rules_text,
+            "threshold_configs": threshold_configs
+        }
+        response = requests.post(f"{COMPLIANCE_API_BASE_URL}/simulate/portfolio", json=api_payload)
+        response.raise_for_status()  # Raise an exception for HTTP errors
+        return response.json()['compliance_results']
+    except requests.exceptions.RequestException as e:
+        st.error(f"API Error during compliance check: {e}")
+        return []
+    except json.JSONDecodeError:
+        st.error("Failed to decode JSON response from API.")
+        return []
+    except Exception as e:
+        st.error(f"An unexpected error occurred: {e}")
+        return []
 
 def calculate_security_level_compliance(portfolio_df: pd.DataFrame, threshold_configs: dict):
     """Enhanced security compliance with more thresholds"""
@@ -612,7 +476,7 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, threshold_co
     )
     
     # Add liquidity classification (placeholder - would need actual liquidity data)
-    security_compliance['Liquidity'] = '🟢 High'
+    security_compliance['Liquidity'] = '🟢 High' # This is a placeholder, as true liquidity data is not integrated
     
     return security_compliance
 
@@ -941,28 +805,28 @@ def render_threshold_config():
             st.session_state["threshold_configs"]['single_stock_limit'] = st.number_input(
                 "Single Stock Limit (%)", 1.0, 25.0, 
                 st.session_state["threshold_configs"].get('single_stock_limit', 10.0), 0.5,
-                help="Maximum weight for any single stock"
+                key="config_single_stock_limit", help="Maximum weight for any single stock"
             )
             st.session_state["threshold_configs"]['single_sector_limit'] = st.number_input(
                 "Single Sector Limit (%)", 5.0, 50.0,
                 st.session_state["threshold_configs"].get('single_sector_limit', 25.0), 1.0,
-                help="Maximum weight for any single sector"
+                key="config_single_sector_limit", help="Maximum weight for any single sector"
             )
             st.session_state["threshold_configs"]['group_exposure_limit'] = st.number_input(
                 "Group Exposure Limit (%)", 5.0, 50.0,
                 st.session_state["threshold_configs"].get('group_exposure_limit', 25.0), 1.0,
-                help="Maximum exposure to single business group"
+                key="config_group_exposure_limit", help="Maximum exposure to single business group"
             )
         with col2:
             st.session_state["threshold_configs"]['top_10_holdings_limit'] = st.number_input(
                 "Top 10 Holdings Limit (%)", 30.0, 80.0,
                 st.session_state["threshold_configs"].get('top_10_holdings_limit', 50.0), 5.0,
-                help="Maximum weight of top 10 holdings combined"
+                key="config_top_10_holdings_limit", help="Maximum weight of top 10 holdings combined"
             )
             st.session_state["threshold_configs"]['max_single_holding'] = st.number_input(
                 "Max Single Holding (%)", 1.0, 25.0,
                 st.session_state["threshold_configs"].get('max_single_holding', 10.0), 0.5,
-                help="Absolute maximum for any single position"
+                key="config_max_single_holding", help="Absolute maximum for any single position"
             )
     
     with st.expander("💰 Cash & Liquidity"):
@@ -971,19 +835,19 @@ def render_threshold_config():
             st.session_state["threshold_configs"]['cash_equivalent_min'] = st.number_input(
                 "Min Cash Equivalent (%)", 0.0, 20.0,
                 st.session_state["threshold_configs"].get('cash_equivalent_min', 0.0), 0.5,
-                help="Minimum cash and cash equivalents"
+                key="config_cash_equivalent_min", help="Minimum cash and cash equivalents"
             )
         with col2:
             st.session_state["threshold_configs"]['cash_equivalent_max'] = st.number_input(
                 "Max Cash Equivalent (%)", 0.0, 50.0,
                 st.session_state["threshold_configs"].get('cash_equivalent_max', 10.0), 1.0,
-                help="Maximum cash and cash equivalents"
+                key="config_cash_equivalent_max", help="Maximum cash and cash equivalents"
             )
         
         st.session_state["threshold_configs"]['liquidity_ratio_min'] = st.number_input(
             "Min Liquidity Ratio", 0.0, 1.0,
             st.session_state["threshold_configs"].get('liquidity_ratio_min', 0.9), 0.05,
-            help="Minimum portfolio liquidity ratio"
+            key="config_liquidity_ratio_min", help="Minimum portfolio liquidity ratio"
         )
     
     with st.expander("🌐 Special Instruments"):
@@ -992,18 +856,18 @@ def render_threshold_config():
             st.session_state["threshold_configs"]['foreign_security_limit'] = st.number_input(
                 "Foreign Securities Limit (%)", 0.0, 100.0,
                 st.session_state["threshold_configs"].get('foreign_security_limit', 50.0), 5.0,
-                help="Maximum exposure to foreign securities"
+                key="config_foreign_security_limit", help="Maximum exposure to foreign securities"
             )
             st.session_state["threshold_configs"]['derivative_limit'] = st.number_input(
                 "Derivatives Limit (%)", 0.0, 100.0,
                 st.session_state["threshold_configs"].get('derivative_limit', 50.0), 5.0,
-                help="Maximum derivatives exposure"
+                key="config_derivative_limit", help="Maximum derivatives exposure"
             )
         with col2:
             st.session_state["threshold_configs"]['unlisted_security_limit'] = st.number_input(
                 "Unlisted Securities Limit (%)", 0.0, 25.0,
                 st.session_state["threshold_configs"].get('unlisted_security_limit', 10.0), 1.0,
-                help="Maximum exposure to unlisted securities"
+                key="config_unlisted_security_limit", help="Maximum exposure to unlisted securities"
             )
     
     with st.expander("📈 Portfolio Structure"):
@@ -1012,18 +876,18 @@ def render_threshold_config():
             st.session_state["threshold_configs"]['min_holdings'] = st.number_input(
                 "Minimum Holdings", 5, 200,
                 st.session_state["threshold_configs"].get('min_holdings', 20), 5,
-                help="Minimum number of holdings"
+                key="config_min_holdings", help="Minimum number of holdings"
             )
             st.session_state["threshold_configs"]['min_sectors'] = st.number_input(
                 "Minimum Sectors", 1, 20,
                 st.session_state["threshold_configs"].get('min_sectors', 5), 1,
-                help="Minimum number of sectors"
+                key="config_min_sectors", help="Minimum number of sectors"
             )
         with col2:
             st.session_state["threshold_configs"]['max_holdings'] = st.number_input(
                 "Maximum Holdings", 20, 500,
                 st.session_state["threshold_configs"].get('max_holdings', 100), 10,
-                help="Maximum number of holdings"
+                key="config_max_holdings", help="Maximum number of holdings"
             )
 
 
@@ -1296,7 +1160,11 @@ HHI < 800""")
                     
                     if 'Industry' in df.columns:
                         df['Industry'] = df['Industry'].fillna('UNKNOWN').str.strip().str.upper()
-                    
+                    if 'Name' not in df.columns: # Ensure 'Name' exists for display
+                        df['Name'] = df['Symbol'] 
+                    if 'LTP' not in df.columns: # Ensure LTP exists before calling API or recalculating
+                        df['LTP'] = 0.0
+
                     # Fetch real-time prices
                     symbols = df['Symbol'].unique().tolist()
                     ltp_data = k.ltp([f"{DEFAULT_EXCHANGE}:{s}" for s in symbols])
@@ -1308,10 +1176,10 @@ HHI < 800""")
                     total_value = df_results['Real-time Value (Rs)'].sum()
                     df_results['Weight %'] = (df_results['Real-time Value (Rs)'] / total_value * 100) if total_value > 0 else 0
                     
-                    # Validate custom rules
-                    compliance_results = parse_and_validate_rules_enhanced(rules_text, df_results, st.session_state["threshold_configs"])
+                    # Call API for custom rules validation
+                    compliance_results = call_compliance_api_run_check(df_results, rules_text, st.session_state["threshold_configs"])
                     
-                    # Calculate security-level compliance
+                    # Calculate security-level compliance (local function)
                     security_compliance = calculate_security_level_compliance(df_results, st.session_state["threshold_configs"])
                     
                     # Store in session state
@@ -1336,27 +1204,34 @@ HHI < 800""")
                             })
                     
                     # Sector limit breaches
-                    sector_weights = df_results.groupby('Industry')['Weight %'].sum()
-                    single_sector_limit = st.session_state["threshold_configs"]['single_sector_limit']
-                    if (sector_weights > single_sector_limit).any():
-                        breach_sectors = sector_weights[sector_weights > single_sector_limit]
-                        for sector, weight in breach_sectors.items():
-                            breaches.append({
-                                'type': 'Sector Limit',
-                                'severity': '🟠 High',
-                                'details': f"{sector} at {weight:.2f}% (Limit: {single_sector_limit}%)"
-                            })
+                    if 'Industry' in df_results.columns: # Check for 'Industry' column before grouping
+                        sector_weights = df_results.groupby('Industry')['Weight %'].sum()
+                        single_sector_limit = st.session_state["threshold_configs"]['single_sector_limit']
+                        if (sector_weights > single_sector_limit).any():
+                            breach_sectors = sector_weights[sector_weights > single_sector_limit]
+                            for sector, weight in breach_sectors.items():
+                                breaches.append({
+                                    'type': 'Sector Limit',
+                                    'severity': '🟠 High',
+                                    'details': f"{sector} at {weight:.2f}% (Limit: {single_sector_limit}%)"
+                                })
                     
-                    # Custom rule failures
+                    # Custom rule failures (from API)
                     for rule_result in compliance_results:
-                        if rule_result['status'] == "❌ FAIL":
+                        if rule_result['status'] == "FAIL": # API returns "FAIL" not "❌ FAIL"
+                            severity = "🟡 Medium" # Default severity
+                            if abs(rule_result.get('breach_amount', 0)) > rule_result.get('threshold', 0) * 0.2:
+                                severity = "🔴 Critical"
+                            elif abs(rule_result.get('breach_amount', 0)) > rule_result.get('threshold', 0) * 0.1:
+                                severity = "🟠 High"
+                            
                             breaches.append({
                                 'type': 'Custom Rule Violation',
-                                'severity': rule_result.get('severity', '🟡 Medium'),
+                                'severity': severity,
                                 'details': f"{rule_result['rule']} - {rule_result['details']}"
                             })
                     
-                    # Portfolio structure checks
+                    # Portfolio structure checks (local function as they depend on the updated df_results)
                     if len(df_results) < st.session_state["threshold_configs"]['min_holdings']:
                         breaches.append({
                             'type': 'Min Holdings',
@@ -1371,13 +1246,14 @@ HHI < 800""")
                             'details': f"{len(df_results)} holdings (Max: {st.session_state['threshold_configs']['max_holdings']})"
                         })
                     
-                    sector_count = df_results['Industry'].nunique()
-                    if sector_count < st.session_state["threshold_configs"]['min_sectors']:
-                        breaches.append({
-                            'type': 'Min Sectors',
-                            'severity': '🟠 High',
-                            'details': f"Only {sector_count} sectors (Min: {st.session_state['threshold_configs']['min_sectors']})"
-                        })
+                    if 'Industry' in df_results.columns: # Check for 'Industry' column
+                        sector_count = df_results['Industry'].nunique()
+                        if sector_count < st.session_state["threshold_configs"]['min_sectors']:
+                            breaches.append({
+                                'type': 'Min Sectors',
+                                'severity': '🟠 High',
+                                'details': f"Only {sector_count} sectors (Min: {st.session_state['threshold_configs']['min_sectors']})"
+                            })
                     
                     st.session_state.breach_alerts = breaches
                     st.session_state.compliance_stage = "compliance_done"
@@ -1461,7 +1337,7 @@ HHI < 800""")
             kpi_cols = st.columns(6)
             kpi_cols[0].metric("Value", f"₹ {total_value:,.0f}")
             kpi_cols[1].metric("Holdings", f"{len(results_df)}")
-            kpi_cols[2].metric("Sectors", f"{results_df['Industry'].nunique()}")
+            kpi_cols[2].metric("Sectors", f"{results_df['Industry'].nunique() if 'Industry' in results_df.columns else 'N/A'}")
             kpi_cols[3].metric("Top Stock", f"{results_df['Weight %'].max():.2f}%")
             kpi_cols[4].metric("Top 10", f"{results_df.nlargest(10, 'Weight %')['Weight %'].sum():.2f}%")
             kpi_cols[5].metric("Status", "✅" if not st.session_state.get("breach_alerts") else f"❌ {len(st.session_state['breach_alerts'])}")
@@ -1474,12 +1350,15 @@ HHI < 800""")
                 st.plotly_chart(fig_pie, use_container_width=True)
             
             with col2:
-                sector_data = results_df.groupby('Industry')['Weight %'].sum().reset_index().sort_values('Weight %', ascending=False).head(10)
-                fig_sector = px.bar(sector_data, x='Weight %', y='Industry', orientation='h',
-                                   title='Top 10 Sectors', color='Weight %', color_continuous_scale='Blues')
-                fig_sector.update_layout(yaxis={'categoryorder': 'total ascending'})
-                st.plotly_chart(fig_sector, use_container_width=True)
-        
+                if 'Industry' in results_df.columns:
+                    sector_data = results_df.groupby('Industry')['Weight %'].sum().reset_index().sort_values('Weight %', ascending=False).head(10)
+                    fig_sector = px.bar(sector_data, x='Weight %', y='Industry', orientation='h',
+                                       title='Top 10 Sectors', color='Weight %', color_continuous_scale='Blues')
+                    fig_sector.update_layout(yaxis={'categoryorder': 'total ascending'})
+                    st.plotly_chart(fig_sector, use_container_width=True)
+                else:
+                    st.info("Industry data not available for sector analysis.")
+
         with analysis_tabs[1]:
             st.subheader("Holdings Details")
             st.dataframe(results_df[['Name', 'Symbol', 'Industry', 'Weight %', 'Real-time Value (Rs)', 'LTP', 'Quantity']].style.format({
@@ -1527,9 +1406,10 @@ HHI < 800""")
             
             if validation_results:
                 total_rules = len(validation_results)
-                passed = sum(1 for r in validation_results if r['status'] == "✅ PASS")
-                failed = sum(1 for r in validation_results if r['status'] == "❌ FAIL")
-                errors = sum(1 for r in validation_results if 'Error' in r['status'])
+                # API returns "PASS" or "FAIL"
+                passed = sum(1 for r in validation_results if r['status'] == "PASS")
+                failed = sum(1 for r in validation_results if r['status'] == "FAIL")
+                errors = sum(1 for r in validation_results if r['status'] == 'Error') # assuming API sends 'Error' for parsing issues
                 
                 summary_cols = st.columns(4)
                 summary_cols[0].metric("Total Rules", total_rules)
@@ -1539,30 +1419,37 @@ HHI < 800""")
                 
                 st.markdown("---")
                 
-                failed_rules = [r for r in validation_results if r['status'] == "❌ FAIL"]
-                passed_rules = [r for r in validation_results if r['status'] == "✅ PASS"]
-                error_rules = [r for r in validation_results if 'Error' in r['status']]
+                failed_rules = [r for r in validation_results if r['status'] == "FAIL"]
+                passed_rules = [r for r in validation_results if r['status'] == "PASS"]
+                error_rules = [r for r in validation_results if r['status'] == 'Error']
                 
                 if failed_rules:
                     st.markdown("### ❌ Failed Rules")
                     for res in failed_rules:
-                        with st.expander(f"{res['status']} {res.get('severity', '')} | `{res['rule']}`", expanded=True):
-                            st.error(f"**Status:** {res['status']}")
+                        # Re-calculate severity based on our logic for display consistency
+                        severity = "🟡 Medium" 
+                        if abs(res.get('breach_amount', 0)) > res.get('threshold', 0) * 0.2:
+                            severity = "🔴 Critical"
+                        elif abs(res.get('breach_amount', 0)) > res.get('threshold', 0) * 0.1:
+                            severity = "🟠 High"
+
+                        with st.expander(f"❌ FAIL {severity} | `{res['rule']}`", expanded=True):
+                            st.error(f"**Status:** FAIL")
                             st.write(f"**Details:** {res['details']}")
                             if 'breach_amount' in res:
-                                st.write(f"**Breach Amount:** {res['breach_amount']:.2f}%")
+                                st.write(f"**Breach Amount:** {res['breach_amount']:.2f}")
                 
                 if passed_rules:
                     st.markdown("### ✅ Passed Rules")
                     for res in passed_rules:
-                        with st.expander(f"{res['status']} | `{res['rule']}`", expanded=False):
-                            st.success(f"**Status:** {res['status']}")
+                        with st.expander(f"✅ PASS | `{res['rule']}`", expanded=False):
+                            st.success(f"**Status:** PASS")
                             st.write(f"**Details:** {res['details']}")
                 
                 if error_rules:
                     st.markdown("### ⚠️ Rule Errors")
                     for res in error_rules:
-                        with st.expander(f"{res['status']} | `{res['rule']}`", expanded=False):
+                        with st.expander(f"Error | `{res['rule']}`", expanded=False):
                             st.warning(f"**Status:** {res['status']}")
                             st.write(f"**Details:** {res['details']}")
             else:
@@ -1628,7 +1515,12 @@ HHI < 800""")
             hhi = (results_df['Weight %'] ** 2).sum()
             weights_sorted = results_df['Weight %'].sort_values().values
             n = len(weights_sorted)
-            gini = (2 * np.sum((np.arange(1, n+1)) * weights_sorted)) / (n * np.sum(weights_sorted)) - (n + 1) / n
+            gini = 0 # Initialize to 0 for cases where calculation might fail or not be applicable
+            if n > 0: # Avoid division by zero
+                # Handle potential case where sum(weights_sorted) could be 0, leading to div by zero
+                sum_weights = np.sum(weights_sorted)
+                if sum_weights > 0:
+                    gini = (2 * np.sum((np.arange(1, n+1)) * weights_sorted)) / (n * sum_weights) - (n + 1) / n
             
             st.markdown("### Concentration Indices")
             index_cols = st.columns(2)
@@ -1647,12 +1539,15 @@ HHI < 800""")
                     results_df.to_excel(writer, sheet_name='Holdings', index=False)
                     
                     # Sector analysis
-                    sector_analysis = results_df.groupby('Industry').agg({
-                        'Weight %': 'sum',
-                        'Real-time Value (Rs)': 'sum',
-                        'Symbol': 'count'
-                    }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
-                    sector_analysis.to_excel(writer, sheet_name='Sector Analysis')
+                    if 'Industry' in results_df.columns:
+                        sector_analysis = results_df.groupby('Industry').agg({
+                            'Weight %': 'sum',
+                            'Real-time Value (Rs)': 'sum',
+                            'Symbol': 'count'
+                        }).rename(columns={'Symbol': 'Count'}).sort_values('Weight %', ascending=False)
+                        sector_analysis.to_excel(writer, sheet_name='Sector Analysis')
+                    else:
+                        st.warning("Industry data not available for sector analysis in report.")
                     
                     # Compliance results
                     if st.session_state.get("compliance_results"):
@@ -1784,7 +1679,7 @@ with tabs[1]:
     st.markdown("---")
     
     # Run AI Analysis
-    if docs_text or existing_kim:
+    if (docs_text or existing_kim) or st.session_state.get("ai_analysis_response"): # Allow running without docs if there's previous analysis
         if st.button("🚀 Run AI Analysis", type="primary", use_container_width=True, key="ai_analyze_btn"):
             with st.spinner("🤖 AI is analyzing your portfolio..."):
                 try:
@@ -1801,7 +1696,19 @@ with tabs[1]:
                     if st.session_state.get("compliance_results"):
                         compliance_summary = "\n**Custom Rule Results:**\n"
                         for rule in st.session_state["compliance_results"]:
-                            compliance_summary += f"- {rule['status']} {rule.get('severity', '')}: {rule['rule']} - {rule['details']}\n"
+                            # Adjust status from "PASS"/"FAIL" to "✅ PASS"/"❌ FAIL" for display here
+                            display_status = "✅ PASS" if rule['status'] == "PASS" else "❌ FAIL" if rule['status'] == "FAIL" else rule['status']
+                            
+                            severity = "🟡 Medium" 
+                            if rule['status'] == "FAIL":
+                                if abs(rule.get('breach_amount', 0)) > rule.get('threshold', 0) * 0.2:
+                                    severity = "🔴 Critical"
+                                elif abs(rule.get('breach_amount', 0)) > rule.get('threshold', 0) * 0.1:
+                                    severity = "🟠 High"
+                            else:
+                                severity = "✅ Compliant"
+
+                            compliance_summary += f"- {display_status} {severity}: {rule['rule']} - {rule['details']}\n"
                     
                     # Include threshold configurations
                     threshold_summary = "\n**Threshold Configurations:**\n"
@@ -1838,7 +1745,7 @@ Keep response under 500 words."""
 
 **THRESHOLDS:** {threshold_summary}
 
-**SCHEME DOCUMENTS:** {docs_text}
+**SCHEME DOCUMENTS:** {docs_text_snippet}
 
 Provide comprehensive analysis:
 
@@ -1879,7 +1786,7 @@ Keep response under 2000 words."""
 {threshold_summary}
 
 **SCHEME DOCUMENTS (KIM/SID):**
-{docs_text}
+{docs_text_snippet}
 
 **ANALYSIS FRAMEWORK:**
 
@@ -1964,12 +1871,15 @@ Data limitations and assumptions made
 - Highlight both immediate and strategic concerns
 - Use clear severity classifications"""
                     
+                    # Truncate docs_text for Gemini input to avoid token limits
+                    docs_text_snippet = docs_text[:70000] if docs_text else "No scheme documents provided."
+
                     prompt = prompt_template.format(
                         portfolio_summary=portfolio_summary,
                         breach_summary=breach_summary,
                         compliance_summary=compliance_summary,
                         threshold_summary=threshold_summary,
-                        docs_text=docs_text[:80000] if docs_text else "No scheme documents provided"
+                        docs_text_snippet=docs_text_snippet
                     )
                     
                     model = genai.GenerativeModel('gemini-1.5-flash')
@@ -2014,7 +1924,9 @@ Data limitations and assumptions made
                     st.error(f"❌ AI Analysis Error: {e}")
                     import traceback
                     st.error(f"Traceback: {traceback.format_exc()}")
-    
+    else:
+        st.info("Upload KIM/SID documents or select an existing one to proceed with AI Analysis.")
+
     # Display AI Analysis Results
     if st.session_state.get("ai_analysis_response"):
         st.markdown("---")
@@ -2089,14 +2001,19 @@ with tabs[2]:
                 st.session_state['stressed_df'] = stressed_df
                 st.session_state['stress_summary'] = summary
                 
-                # Re-run compliance audit on the stressed data
-                # The rule parser expects a 'Weight %' column. Rename the stressed weight column temporarily for the check.
-                stressed_df_for_rules = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'})
-                stressed_compliance_results = parse_and_validate_rules_enhanced(
+                # Re-run compliance audit on the stressed data using the API
+                # The API's compliance check assumes a 'Weight %' column which we create temporarily.
+                stressed_df_for_api = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'}).copy()
+                
+                # Ensure the DataFrame passed to the API has consistent columns expected by the API
+                # Convert to JSON serializable format for the API call
+                
+                stressed_compliance_results = call_compliance_api_run_check(
+                    stressed_df_for_api,
                     st.session_state.current_rules_text,
-                    stressed_df_for_rules,
                     st.session_state.threshold_configs
                 )
+                
                 st.session_state['stressed_compliance_results'] = stressed_compliance_results
                 st.success("Stress test simulation complete.")
 
@@ -2127,7 +2044,7 @@ with tabs[2]:
 
             st.markdown("#### Post-Stress Compliance Audit")
             stressed_results = st.session_state['stressed_compliance_results']
-            new_breaches = [r for r in stressed_results if r['status'] == "❌ FAIL"]
+            new_breaches = [r for r in stressed_results if r['status'] == "FAIL"]
             
             if not new_breaches:
                 st.success("✅ **Portfolio remains compliant under this stress scenario.**")
@@ -2135,9 +2052,16 @@ with tabs[2]:
                 st.error(f"🚨 **{len(new_breaches)} Compliance Breaches Triggered Under Stress!**")
                 breach_data = []
                 for breach in new_breaches:
+                    # Re-calculate severity based on our logic for display consistency
+                    severity = "🟡 Medium" 
+                    if abs(breach.get('breach_amount', 0)) > breach.get('threshold', 0) * 0.2:
+                        severity = "🔴 Critical"
+                    elif abs(breach.get('breach_amount', 0)) > breach.get('threshold', 0) * 0.1:
+                        severity = "🟠 High"
+
                     breach_data.append({
                         "Rule": breach['rule'],
-                        "Severity": breach['severity'],
+                        "Severity": severity, # Use calculated severity for display
                         "Details": breach['details']
                     })
                 st.dataframe(pd.DataFrame(breach_data), use_container_width=True, hide_index=True)
@@ -2230,4 +2154,3 @@ st.markdown(f"""
     <p style='font-size: 0.8em;'>User: {st.session_state["user_email"]} | Session Active</p>
 </div>
 """, unsafe_allow_html=True)
-
