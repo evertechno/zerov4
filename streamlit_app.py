@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import json
@@ -108,7 +109,7 @@ def load_secrets():
 KITE_CREDENTIALS, GEMINI_CREDENTIALS, SUPABASE_CREDENTIALS = load_secrets()
 genai.configure(api_key=GEMINI_CREDENTIALS["api_key"])
 
-# --- Initialize Supabase ---
+# --- Initialize Supabase (Cached to prevent reconnects) ---
 @st.cache_resource
 def init_supabase() -> Client:
     return create_client(SUPABASE_CREDENTIALS["url"], SUPABASE_CREDENTIALS["key"])
@@ -397,21 +398,23 @@ def get_authenticated_kite_client(api_key: str, access_token: str):
         return k
     return None
 
-@st.cache_data(ttl=60)
-def get_ltp_price_cached(api_key: str, access_token: str, symbol: str, exchange: str = DEFAULT_EXCHANGE):
+# NO CACHE FOR LTP - Fetches fresh data every time
+def get_ltp_price_fresh(api_key: str, access_token: str, symbol: str, exchange: str = DEFAULT_EXCHANGE):
     k = get_authenticated_kite_client(api_key, access_token)
     if not k: 
         st.warning("Kite not connected to fetch LTP.")
-        return {"_error": "Not authenticated"}
+        return 0.0 # Return 0 if price not found
     try:
+        # Force fresh fetch by not using any cache decorator
         quote = k.ltp([f"{exchange.upper()}:{symbol.upper()}"]).get(f"{exchange.upper()}:{symbol.upper()}")
         if quote and 'last_price' in quote:
             return quote['last_price']
-        return 0.0 # Return 0 if price not found
+        return 0.0 
     except Exception as e:
         st.error(f"Error fetching LTP for {symbol}: {e}")
         return 0.0
 
+# CACHE ENABLED for Historical Data (Heavy payload, changes infrequently for daily metrics)
 @st.cache_data(ttl=3600)
 def get_historical_data_cached(api_key: str, access_token: str, symbol: str, from_date, to_date, interval: str, exchange: str = DEFAULT_EXCHANGE):
     k = get_authenticated_kite_client(api_key, access_token)
@@ -518,6 +521,7 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
     progress_bar = st.progress(0, text="Fetching historical data...")
     
     for i, symbol in enumerate(symbols):
+        # Uses Cached function for history
         hist_data = get_historical_data_cached(api_key, access_token, symbol, from_date, to_date, 'day')
         if not hist_data.empty and '_error' not in hist_data.columns:
             returns_df[symbol] = hist_data['close'].pct_change()
@@ -1195,9 +1199,9 @@ HHI < 800""")
                         if 'LTP' not in df.columns: # Ensure LTP exists before calling API or recalculating
                             df['LTP'] = 0.0
 
-                        # Fetch real-time prices
+                        # Fetch real-time prices using FRESH data (no cache)
                         symbols = df['Symbol'].unique().tolist()
-                        prices = {sym: get_ltp_price_cached(api_key, access_token, sym) for sym in symbols}
+                        prices = {sym: get_ltp_price_fresh(api_key, access_token, sym) for sym in symbols}
                         
                         df_results = df.copy()
                         df_results['LTP'] = df_results['Symbol'].map(prices)
@@ -1348,7 +1352,8 @@ HHI < 800""")
                     
                     prices = {}
                     for symbol in symbols:
-                        ltp = get_ltp_price_cached(api_key, access_token, symbol)
+                        # Uses the FRESH function (no cache)
+                        ltp = get_ltp_price_fresh(api_key, access_token, symbol)
                         prices[symbol] = ltp
                         
                     df_to_refresh['LTP'] = df_to_refresh['Symbol'].map(prices)
@@ -1367,9 +1372,9 @@ HHI < 800""")
                     st.session_state.security_level_compliance = security_compliance
                     st.session_state.compliance_results = compliance_results
                     
-                    # Detect breaches
+                    # Detect breaches (logic copied from Analyze for consistency)
                     breaches = []
-                    # ... (copy breach detection logic from "Analyze Compliance" button above) ...
+                    
                     # Stock limit breaches
                     single_stock_limit = st.session_state["threshold_configs"]['single_stock_limit']
                     if (df_to_refresh['Weight %'] > single_stock_limit).any():
@@ -1409,7 +1414,7 @@ HHI < 800""")
                                 'details': f"{rule_result['rule']} - {rule_result['details']}"
                             })
                     
-                    # Portfolio structure checks (local function as they depend on the updated df_results)
+                    # Portfolio structure checks
                     if len(df_to_refresh) < st.session_state["threshold_configs"]['min_holdings']:
                         breaches.append({
                             'type': 'Min Holdings',
