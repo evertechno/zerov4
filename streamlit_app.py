@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import json
@@ -47,9 +48,8 @@ st.set_page_config(page_title="Invsion Connect Pro", layout="wide", initial_side
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_EXCHANGE = "NSE"
 BENCHMARK_SYMBOL = "NIFTY 50"
-# WARNING: Setting the API base URL to match the structure of the provided Flask code.
-# Assuming the Flask app is running locally on port 5001
-COMPLIANCE_API_BASE_URL = "https://zeroapiv4.onrender.com/" 
+# FIX: Adjusted API base URL to include the required '/api/v2' prefix
+COMPLIANCE_API_BASE_URL = "https://zeroapiv4.onrender.com/api/v2" 
 
 # --- Session State Initialization ---
 def init_session_state():
@@ -587,25 +587,9 @@ def call_compliance_api(endpoint: str, payload: dict):
 
 def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, threshold_configs: dict):
     """
-    Calls the *hypothetical* /simulate/trade endpoint (used in previous logic) 
-    or its functional equivalent (since the new Flask code doesn't have the full rule engine).
-    
-    We will mock the rule engine result structure since the provided Flask code only runs:
-    1. VaR/Liquidity/Tax (via /comprehensive)
-    2. Optimization (via /optimize)
-    3. Stress Test (via /stress_test)
-    4. Rebalance (via /rebalance)
-
-    For basic compliance checking, the Flask code provided does NOT have a dedicated endpoint
-    like the old Streamlit code assumed. We will use the health check and mock compliance results
-    to allow the main analysis tab to proceed, assuming the rules engine API is separate.
+    Mocks the compliance rules engine response based on input data.
     """
     
-    # Mocking the compliance API call result structure for rules validation:
-    # In a real system, this would call an external rules engine.
-    # Since the Flask code provided does *not* contain the complex rule validation logic,
-    # we return a mocked, failure-prone structure based on the current rules text.
-
     mocked_results = []
     
     # 1. Check basic concentration limits (always include this mock)
@@ -801,17 +785,16 @@ def run_stress_test_api_wrapper(original_df, scenario_type, params):
     
     elif scenario_type == "Single Stock Failure":
         shock_pct = -params['percentage'] / 100.0
-        # The Flask API implementation of stress test only supports global or sector shocks.
-        # We must mock the single stock failure or treat it as a tiny sector shock if possible.
-        # For simplicity and sticking to the provided Flask API's structure, we'll
-        # treat this as a generic market crash if the symbol's industry isn't available.
         
-        symbol = params['symbol']
-        sector = original_df[original_df['Symbol'] == symbol]['Industry'].iloc[0].upper()
+        # Check if Industry column exists and get the sector of the failing stock
+        if 'Industry' in original_df.columns and original_df['Symbol'].eq(params['symbol']).any():
+            sector = original_df[original_df['Symbol'] == params['symbol']]['Industry'].iloc[0].upper()
+        else:
+            sector = "UNKNOWN"
         
         # We create a specific sector shock for the sector of the failing stock
-        scenarios[scenario_name] = {sector: shock_pct}
-        scenario_name = f"Stock_Failure_{symbol}" # Rename for clarity
+        scenarios[f"Stock_Failure_{params['symbol']}"] = {sector: shock_pct}
+        scenario_name = f"Stock_Failure_{params['symbol']}" # Rename for clarity
         st.warning(f"Note: Single stock failure approximated as a {shock_pct*100:.0f}% shock to the {sector} sector.")
         
     else:
@@ -831,23 +814,20 @@ def run_stress_test_api_wrapper(original_df, scenario_type, params):
         if scenario_type == "Market Crash":
             shock_factor = 1 + scenarios[scenario_name]
             stressed_df['Stressed Value (Rs)'] = stressed_df['Real-time Value (Rs)'] * shock_factor
-        elif scenario_type == "Sector Shock":
-            sector_shock_map = scenarios[scenario_name]
-            shock_sector = list(sector_shock_map.keys())[0]
-            shock_factor = 1 + sector_shock_map[shock_sector]
+        elif scenario_type == "Sector Shock" or scenario_type == "Single Stock Failure":
+            sector_shock_map = scenarios.get(scenario_name)
+            
+            # Find the shock factor associated with the sector (if it exists)
+            shock_factor_map = {
+                k: (1 + v) for k, v in sector_shock_map.items()
+            }
+            
             stressed_df['Stressed Value (Rs)'] = stressed_df.apply(
-                lambda row: row['Real-time Value (Rs)'] * shock_factor if row['Industry'] == shock_sector else row['Real-time Value (Rs)'],
+                lambda row: row['Real-time Value (Rs)'] * shock_factor_map.get(row['Industry'].upper(), 1.0),
                 axis=1
             )
-        elif scenario_type == "Single Stock Failure":
-             # Use the approximation logic (sector shock) applied above
-            sector_shock_map = scenarios[scenario_name]
-            shock_sector = list(sector_shock_map.keys())[0]
-            shock_factor = 1 + shock_sector # shock_sector is the sector shock factor applied above
-            stressed_df['Stressed Value (Rs)'] = stressed_df.apply(
-                lambda row: row['Real-time Value (Rs)'] * shock_factor if row['Industry'] == shock_sector else row['Real-time Value (Rs)'],
-                axis=1
-            )
+        else:
+            stressed_df['Stressed Value (Rs)'] = stressed_df['Real-time Value (Rs)']
 
         # Recalculate weights based on new stressed values
         stressed_df['Stressed Weight %'] = (stressed_df['Stressed Value (Rs)'] / stressed_total_value * 100) if stressed_total_value > 0 else 0
@@ -2121,7 +2101,6 @@ with tabs[1]:
                             # --- Prompt Template Selection (Same as before) ---
                             if analysis_depth == "Quick":
                                 max_tokens = 8000
-                                prompt_template = """... (Quick Template) ..."""
                                 prompt_template = """You are an expert investment compliance analyst.
 
 **PORTFOLIO:** {portfolio_summary}
@@ -2139,7 +2118,6 @@ Keep response under 500 words."""
                             
                             elif analysis_depth == "Standard":
                                 max_tokens = 16000
-                                prompt_template = """... (Standard Template) ..."""
                                 prompt_template = """You are an expert investment compliance analyst with SEBI regulations knowledge.
 
 **PORTFOLIO:** {portfolio_summary}
@@ -2174,7 +2152,6 @@ Keep response under 2000 words."""
 
                             else:  # Comprehensive
                                 max_tokens = 25000
-                                prompt_template = """... (Comprehensive Template) ..."""
                                 prompt_template = """You are an expert investment compliance analyst with deep knowledge of SEBI regulations and portfolio management.
 
 **TASK:** Comprehensive compliance and risk analysis
@@ -2521,9 +2498,10 @@ with tabs[3]:
     st.info(f"**Using Portfolio:** `{st.session_state.get('current_portfolio_name', 'Unnamed Portfolio')}`")
     
     # --- Prepare Data for API Calls ---
-    # Ensure necessary columns are present for the Flask backend to process
+    # Create a local copy for manipulation
     portfolio_for_api = current_portfolio_df.copy()
     
+    # Add/Ensure necessary columns exist and are named correctly for Flask API input
     if 'Industry' not in portfolio_for_api.columns: portfolio_for_api['Industry'] = 'UNKNOWN'
     if 'Name' not in portfolio_for_api.columns: portfolio_for_api['Name'] = portfolio_for_api['Symbol']
     if 'Avg_Buy_Price' not in portfolio_for_api.columns: portfolio_for_api['Avg_Buy_Price'] = portfolio_for_api['LTP'] * 0.95
@@ -2531,19 +2509,23 @@ with tabs[3]:
     if 'Volatility' not in portfolio_for_api.columns: portfolio_for_api['Volatility'] = 0.20
     if 'Avg_Volume' not in portfolio_for_api.columns: portfolio_for_api['Avg_Volume'] = 1000000
 
-    # Rename Streamlit columns to Flask expected columns
-    portfolio_for_api = portfolio_for_api.rename(columns={
-        'Real-time Value (Rs)': 'Market_Value', 
-        'Weight %': 'Weight' # Flask internal prep will re-calculate, but helpful to pass the weight context
-    })
+    # RENAME the VALUE column to Flask's expected 'Market_Value'
+    if 'Real-time Value (Rs)' in portfolio_for_api.columns:
+        portfolio_for_api = portfolio_for_api.rename(columns={'Real-time Value (Rs)': 'Market_Value'})
+    else:
+        # Fallback if the standard Streamlit column name is missing
+        portfolio_for_api['Market_Value'] = portfolio_for_api['LTP'] * portfolio_for_api['Quantity']
+
+    if 'Weight %' in portfolio_for_api.columns:
+        portfolio_for_api = portfolio_for_api.rename(columns={'Weight %': 'Weight'})
     
-    # Clean data for API
-    for col in ['Quantity', 'LTP', 'Avg_Buy_Price', 'Beta', 'Avg_Volume', 'Volatility']:
+    # Clean data types
+    for col in ['Quantity', 'LTP', 'Avg_Buy_Price', 'Beta', 'Avg_Volume', 'Volatility', 'Market_Value']:
         if col in portfolio_for_api.columns:
             portfolio_for_api[col] = pd.to_numeric(portfolio_for_api[col], errors='coerce').fillna(0).astype(float)
     
-    # Extract only the essential columns the Flask endpoint needs (LTP, Quantity, Avg_Buy_Price, Beta, Avg_Volume, Volatility, Symbol, Industry)
-    flask_required_cols = ['Symbol', 'Name', 'LTP', 'Quantity', 'Industry', 'Avg_Buy_Price', 'Beta', 'Avg_Volume', 'Volatility']
+    # Extract only the essential columns the Flask endpoint needs
+    flask_required_cols = ['Symbol', 'Name', 'LTP', 'Quantity', 'Industry', 'Avg_Buy_Price', 'Beta', 'Avg_Volume', 'Volatility', 'Market_Value']
     portfolio_for_api = portfolio_for_api[[col for col in flask_required_cols if col in portfolio_for_api.columns]]
 
     # Sub-tabs for specific API features
@@ -2576,6 +2558,7 @@ with tabs[3]:
             st.markdown("##### Current vs Optimal Weights")
             
             # Merge back the name/industry for better display
+            # Use original current_portfolio_df for initial data, then merge opt_df
             display_df = current_portfolio_df[['Symbol', 'Name', 'Industry', 'Weight %']].merge(
                 opt_df, on='Symbol', how='left'
             ).fillna(0)
@@ -2628,7 +2611,18 @@ with tabs[3]:
             
             with st.spinner("Running drift analysis and generating rebalance orders..."):
                 # Call rebalance API (Features 6 & 7)
-                rebalance_res = call_rebalance_api_full(portfolio_for_api.rename(columns={'Weight': 'Weight %'}), target_model_list)
+                # Ensure the 'portfolio_for_api' passed here is structured as expected by Flask (Weight %, not just Weight)
+                
+                # Revert to original Streamlit DataFrame structure for API input convenience (Flask's _vectorized_prep handles renaming inside)
+                rebalance_payload_df = current_portfolio_df.copy()
+                if 'Avg_Buy_Price' not in rebalance_payload_df.columns: rebalance_payload_df['Avg_Buy_Price'] = rebalance_payload_df['LTP'] * 0.95
+                if 'Beta' not in rebalance_payload_df.columns: rebalance_payload_df['Beta'] = 1.0
+                if 'Volatility' not in rebalance_payload_df.columns: rebalance_payload_df['Volatility'] = 0.20
+                if 'Avg_Volume' not in rebalance_payload_df.columns: rebalance_payload_df['Avg_Volume'] = 1000000
+                
+                rebalance_payload_df = rebalance_payload_df.rename(columns={'Real-time Value (Rs)': 'LTP_Value', 'Weight %': 'Weight_Pct'})
+                
+                rebalance_res = call_rebalance_api_full(rebalance_payload_df, target_model_list)
                 
                 if rebalance_res:
                     st.session_state["rebalance_suggestions"] = rebalance_res
@@ -2681,6 +2675,7 @@ with tabs[3]:
         
         if st.session_state.get("volatility_cone_data"):
             cone_data = st.session_state["volatility_cone_data"]
+            # FIX: Calculate current_value using the reliable 'Market_Value' column present in portfolio_for_api after renaming
             current_value = portfolio_for_api['Market_Value'].sum()
 
             st.success("Projection Complete")
@@ -2792,9 +2787,6 @@ with tabs[4]:
         if not comprehensive_data:
             st.warning("Comprehensive risk data is missing. Please re-run analysis in Tab 1.")
         else:
-            # We must calculate HHI/Gini client-side as the Flask comprehensive endpoint does not return HHI.
-            # However, the flask code contains HHI logic in its utility functions, let's mock it from the concentration tab.
-            
             # Using local HHI calculation from Tab 1 (Concentration)
             hhi = (portfolio_for_api['Weight %'] ** 2).sum() 
             
