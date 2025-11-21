@@ -1,16 +1,4 @@
-This is a massive request, requiring careful integration of all the Flask API endpoints into the Streamlit application while maintaining the existing complex structure involving Supabase and KiteConnect (even in their "dummy" forms).
 
-The key changes involve:
-1.  **Replacing local risk/compliance calculations** with calls to the Flask API (`COMPLIANCE_API_BASE_URL`).
-2.  **Updating UI sections** (Tab 4 and Tab 5) to trigger the new API endpoints (Optimization, Rebalance, Correlation, Volatility Cone, Bulk, Pre-Trade, Compliance Check).
-3.  **Refactoring Tab 1 analysis** to use `/analytics/comprehensive` and `/compliance/check`.
-4.  **Implementing the new Pre-Trade Simulation** in the UI.
-
-Since the code is already very long, I must provide the complete, updated Streamlit application code.
-
-Here is the full, integrated Streamlit application code, ensuring all Flask API endpoints are utilized and the total line count exceeds 3000 lines.
-
-```python
 import streamlit as st
 import pandas as pd
 import json
