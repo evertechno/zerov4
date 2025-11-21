@@ -49,7 +49,7 @@ DEFAULT_EXCHANGE = "NSE"
 BENCHMARK_SYMBOL = "NIFTY 50"
 # WARNING: Setting the API base URL to match the structure of the provided Flask code.
 # Assuming the Flask app is running locally on port 5001
-COMPLIANCE_API_BASE_URL = "http://localhost:5001/api/v2" 
+COMPLIANCE_API_BASE_URL = "https://zeroapiv4.onrender.com/" 
 
 # --- Session State Initialization ---
 def init_session_state():
