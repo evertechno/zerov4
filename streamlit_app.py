@@ -4,7 +4,7 @@ import pandas as pd
 import json
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone # Import timezone
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -143,6 +143,8 @@ def login_user(email: str, password: str):
             "password": password
         })
         
+        # In newer versions of supabase-py, response might directly contain session and user data.
+        # Check if response has user and session directly.
         if response.user and response.session:
             st.session_state["user_authenticated"] = True
             st.session_state["user_id"] = response.user.id
@@ -177,7 +179,7 @@ def save_kite_token(user_id: str, access_token: str, expires_at: str = None):
             'user_id': user_id,
             'access_token': access_token,
             'token_type': 'kite_connect',
-            'created_at': datetime.now().isoformat(),
+            'created_at': datetime.now(timezone.utc).isoformat(), # Use UTC for database consistency
             'expires_at': expires_at  
         }
         
@@ -208,8 +210,13 @@ def get_kite_token(user_id: str):
             
             if expires_at_str:
                 # Convert to datetime object and compare (handle potential timezone issues)
-                expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00')) # Ensure Z is handled
-                if expires_at > datetime.now(expires_at.tzinfo): # Compare with timezone-aware current time
+                # Ensure we compare timezone-aware datetimes
+                expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00')) # Handle 'Z' if present
+                
+                # Make current_time timezone-aware (UTC is a good default for comparison with ISO strings from DB)
+                current_time_utc = datetime.now(timezone.utc) 
+
+                if expires_at > current_time_utc:
                     return token_record['access_token']
                 else:
                     st.sidebar.warning("Kite token from database has expired. Please re-authenticate.")
@@ -583,7 +590,7 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
         progress_bar.progress((i + 1) / len(symbols), text=f"Fetching {symbol}...")
     
     if failed_symbols:
-        st.warning(f"Failed to fetch historical data for: {', '.join(failed_symbols)}")
+        st.warning(f"Failed to fetch historical data for: {', '. settore.join(failed_symbols)}")
     
     returns_df.dropna(how='all', inplace=True)
     returns_df.fillna(0, inplace=True)
@@ -975,18 +982,19 @@ def render_threshold_config():
             )
 
 
-# --- INITIALIZATION AND SUPABASE SESSION REHYDRATION (CRITICAL CHANGE) ---
-# This block runs at the very beginning of each rerun, before anything else in the main app logic
+# --- INITIALIZATION AND SUPABASE SESSION REHYDRATION (CRITICAL FIXES) ---
+# This block now correctly handles the `session` object directly and ensures robust re-hydration.
 if not st.session_state["user_authenticated"]:
     # Attempt to retrieve an active Supabase session from local storage
     try:
-        session_response = supabase.auth.get_session()
-        if session_response and session_response.session:
+        session = supabase.auth.get_session() # This directly returns the session object or None
+        
+        if session and session.user: # Check if session object exists and has a user
             # Session found and is valid
             st.session_state["user_authenticated"] = True
-            st.session_state["user_id"] = session_response.user.id
-            st.session_state["user_email"] = session_response.user.email
-            st.session_state["supabase_session"] = session_response.session
+            st.session_state["user_id"] = session.user.id
+            st.session_state["user_email"] = session.user.email
+            st.session_state["supabase_session"] = session # Store the session object itself
             st.success(f"Welcome back, {st.session_state['user_email']}!")
             # Note: No st.rerun() here, allow the app to proceed with the re-hydrated state
         else:
@@ -1002,9 +1010,9 @@ else:
     # Ensure supabase_session object is also up-to-date, potentially by refreshing
     if not st.session_state["supabase_session"]:
         try:
-            session_response = supabase.auth.get_session()
-            if session_response and session_response.session:
-                st.session_state["supabase_session"] = session_response.session
+            session = supabase.auth.get_session()
+            if session and session.user:
+                st.session_state["supabase_session"] = session
             else:
                 # This should ideally not happen if user_authenticated is True
                 # but as a fallback, if session object is missing, invalidate
@@ -1063,8 +1071,8 @@ with st.sidebar:
                 st.session_state["kite_access_token"] = access_token
                 
                 # Calculate expiry: Kite tokens typically expire at midnight the same day
-                # Get the current time and add one day, then set time to 00:00:00
-                expiry_time = (datetime.now() + timedelta(days=1)).replace(
+                # Get the current time and add one day, then set time to 00:00:00 UTC
+                expiry_time = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
                     hour=0, minute=0, second=0, microsecond=0
                 ).isoformat()
                 
@@ -1412,7 +1420,7 @@ HHI < 800""")
                     
                     if 'Industry' in df_results.columns: # Check for 'Industry' column
                         sector_count = df_results['Industry'].nunique()
-                        if sector_count < st.session_state["threshold_configs"]['min_sectors']:
+                        if sector_count < st.session_state["threshold_configs']']['min_sectors']:
                             breaches.append({
                                 'type': 'Min Sectors',
                                 'severity': '🟠 High',
@@ -1698,7 +1706,7 @@ HHI < 800""")
                 from io import BytesIO
                 output = BytesIO()
                 
-                with pd.ExcelWriter(output, engine='openynpxl') as writer:
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     # Holdings sheet
                     results_df.to_excel(writer, sheet_name='Holdings', index=False)
                     
