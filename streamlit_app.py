@@ -162,6 +162,61 @@ def logout_user():
     st.session_state.clear()
 
 
+# --- Token Management Functions (NEW) ---
+def save_kite_token(user_id: str, access_token: str, expires_at: str = None):
+    """Save Kite access token to database"""
+    try:
+        # Check if token exists for the user and type
+        existing = supabase.table('user_tokens').select('*').eq('user_id', user_id).eq('token_type', 'kite_connect').execute()
+        
+        token_data = {
+            'user_id': user_id,
+            'access_token': access_token,
+            'token_type': 'kite_connect',
+            'created_at': datetime.now().isoformat(),
+            'expires_at': expires_at  
+        }
+        
+        if existing.data:
+            # Update existing token
+            result = supabase.table('user_tokens').update(token_data).eq('id', existing.data[0]['id']).execute()
+        else:
+            # Insert new token
+            result = supabase.table('user_tokens').insert(token_data).execute()
+        
+        if result.data:
+            st.toast("Kite token saved to database.", icon="💾")
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Error saving Kite token: {str(e)}")
+        return False
+
+def get_kite_token(user_id: str):
+    """Retrieve Kite access token from database, checking expiry"""
+    try:
+        result = supabase.table('user_tokens').select('*').eq('user_id', user_id).eq('token_type', 'kite_connect').execute()
+        if result.data:
+            token_record = result.data[0]
+            expires_at_str = token_record.get('expires_at')
+            if expires_at_str:
+                # Convert to datetime object and compare
+                expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00')) # Handle 'Z' if present
+                if expires_at > datetime.now():
+                    return token_record['access_token']
+                else:
+                    st.warning("Kite token from database has expired. Please re-authenticate.")
+                    # Optionally, delete the expired token from DB
+                    supabase.table('user_tokens').delete().eq('id', token_record['id']).execute()
+            else:
+                # If no expiry is set, treat it as valid for now, but a warning might be appropriate
+                st.warning("Kite token found in DB, but no expiry specified. Assuming valid for now.")
+                return token_record['access_token']
+        return None
+    except Exception as e:
+        st.error(f"Error fetching Kite token: {str(e)}")
+        return None
+
 # --- Enhanced Database Functions ---
 def save_kim_document(user_id: str, portfolio_name: str, document_text: str, file_name: str):
     """Save KIM/SID document for a portfolio"""
@@ -486,7 +541,7 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, threshold_co
     
     security_compliance = portfolio_df.copy()
     single_stock_limit = threshold_configs.get('single_stock_limit', 10.0)
-    max_single_holding = threshold_configs.get('max_single_holding', 10.0)
+    #max_single_holding = threshold_configs.get('max_single_holding', 10.0) # Not used directly in this func
     
     security_compliance['Stock Limit Breach'] = security_compliance['Weight %'].apply(
         lambda x: '❌ Breach' if x > single_stock_limit else '✅ Compliant'
@@ -521,13 +576,13 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
         progress_bar.progress((i + 1) / len(symbols), text=f"Fetching {symbol}...")
     
     if failed_symbols:
-        st.warning(f"Failed to fetch: {', '.join(failed_symbols)}")
+        st.warning(f"Failed to fetch historical data for: {', '.join(failed_symbols)}")
     
     returns_df.dropna(how='all', inplace=True)
     returns_df.fillna(0, inplace=True)
     
     if returns_df.empty:
-        st.error("Not enough data for metrics.")
+        st.error("Not enough historical data for metrics calculation.")
         progress_bar.empty()
         return None
     
@@ -536,6 +591,7 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
     total_value_success = portfolio_df_success['Real-time Value (Rs)'].sum()
     
     if total_value_success == 0:
+        st.error("Total portfolio value is zero after filtering for successful symbols. Cannot calculate metrics.")
         progress_bar.empty()
         return None
     
@@ -934,27 +990,55 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### Kite Connect")
     
+    # --- NEW KITE TOKEN LOGIC ---
+    # Attempt to load token from DB if not in session state
+    if not st.session_state["kite_access_token"] and st.session_state["user_id"]:
+        with st.spinner("Checking for saved Kite token..."):
+            stored_token = get_kite_token(st.session_state["user_id"])
+            if stored_token:
+                st.session_state["kite_access_token"] = stored_token
+                st.sidebar.success("Kite token loaded from database ✅")
+            else:
+                st.sidebar.info("No active Kite token found in database.")
+
     if not st.session_state["kite_access_token"]:
         st.link_button("🔗 Login to Kite", login_url, use_container_width=True)
     
     request_token_param = st.query_params.get("request_token")
     if request_token_param and not st.session_state["kite_access_token"]:
-        with st.spinner("Authenticating..."):
+        with st.spinner("Authenticating with Kite..."):
             try:
                 data = kite_unauth_client.generate_session(request_token_param, api_secret=KITE_CREDENTIALS["api_secret"])
-                st.session_state["kite_access_token"] = data.get("access_token")
+                access_token = data.get("access_token")
+                
+                # Store in session state
+                st.session_state["kite_access_token"] = access_token
+                
+                # Calculate expiry: Kite tokens typically expire after midnight the same day
+                expiry_time = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                
+                # Store in database
+                save_kite_token(st.session_state["user_id"], access_token, expiry_time)
+                
                 st.success("Kite connected!")
                 st.query_params.clear()
                 st.rerun()
             except Exception as e:
-                st.error(f"Failed: {e}")
+                st.error(f"Failed to connect Kite: {e}")
     
     if st.session_state["kite_access_token"]:
         st.success("Kite Connected ✅")
-        if st.button("Disconnect", use_container_width=True):
+        if st.button("Disconnect Kite", use_container_width=True):
             st.session_state["kite_access_token"] = None
+            # Optionally, delete token from DB as well
+            try:
+                supabase.table('user_tokens').delete().eq('user_id', st.session_state["user_id"]).eq('token_type', 'kite_connect').execute()
+                st.success("Kite token removed from database.")
+            except Exception as e:
+                st.error(f"Error removing token from DB: {e}")
             st.rerun()
-    
+    # --- END NEW KITE TOKEN LOGIC ---
+
     st.markdown("---")
     st.markdown("### My Portfolios")
     
