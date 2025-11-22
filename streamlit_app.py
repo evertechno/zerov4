@@ -49,6 +49,7 @@ COMPLIANCE_API_BASE_URL = "https://zeroapiv4.onrender.com/api/v1" # Adjusted API
 if "user_authenticated" not in st.session_state: st.session_state["user_authenticated"] = False
 if "user_id" not in st.session_state: st.session_state["user_id"] = None
 if "user_email" not in st.session_state: st.session_state["user_email"] = None
+if "supabase_session" not in st.session_state: st.session_state["supabase_session"] = None # Added for Supabase session object
 if "kite_access_token" not in st.session_state: st.session_state["kite_access_token"] = None
 if "compliance_results_df" not in st.session_state: st.session_state["compliance_results_df"] = pd.DataFrame()
 if "compliance_results" not in st.session_state: st.session_state["compliance_results"] = []
@@ -136,16 +137,17 @@ def register_user(email: str, password: str):
 
 def login_user(email: str, password: str):
     try:
+        # Supabase client handles storing session in local storage automatically
         response = supabase.auth.sign_in_with_password({
             "email": email,
             "password": password
         })
         
-        if response.user:
+        if response.user and response.session:
             st.session_state["user_authenticated"] = True
             st.session_state["user_id"] = response.user.id
             st.session_state["user_email"] = response.user.email
-            st.session_state["supabase_session"] = response.session
+            st.session_state["supabase_session"] = response.session # Store the session object
             return True, "Login successful!"
         return False, "Invalid credentials."
     except Exception as e:
@@ -156,18 +158,20 @@ def login_user(email: str, password: str):
 
 def logout_user():
     try:
-        supabase.auth.sign_out()
-    except:
-        pass
-    st.session_state.clear()
+        supabase.auth.sign_out() # This clears local storage session
+        st.session_state.clear() # Clear Streamlit session state too
+        st.success("Logged out successfully.")
+    except Exception as e:
+        st.error(f"Error during logout: {e}")
+    st.rerun()
 
 
 # --- Token Management Functions (NEW) ---
 def save_kite_token(user_id: str, access_token: str, expires_at: str = None):
-    """Save Kite access token to database"""
+    """Save Kite access token to database for a specific user_id"""
     try:
         # Check if token exists for the user and type
-        existing = supabase.table('user_tokens').select('*').eq('user_id', user_id).eq('token_type', 'kite_connect').execute()
+        existing_tokens = supabase.table('user_tokens').select('*').eq('user_id', user_id).eq('token_type', 'kite_connect').execute()
         
         token_data = {
             'user_id': user_id,
@@ -177,19 +181,21 @@ def save_kite_token(user_id: str, access_token: str, expires_at: str = None):
             'expires_at': expires_at  
         }
         
-        if existing.data:
-            # Update existing token
-            result = supabase.table('user_tokens').update(token_data).eq('id', existing.data[0]['id']).execute()
+        if existing_tokens.data:
+            # Update existing token using its primary key 'id'
+            result = supabase.table('user_tokens').update(token_data).eq('id', existing_tokens.data[0]['id']).execute()
+            if result.data:
+                st.toast("Kite token updated in database.", icon="💾")
+                return True
         else:
             # Insert new token
             result = supabase.table('user_tokens').insert(token_data).execute()
-        
-        if result.data:
-            st.toast("Kite token saved to database.", icon="💾")
-            return True
+            if result.data:
+                st.toast("Kite token saved to database.", icon="💾")
+                return True
         return False
     except Exception as e:
-        st.error(f"Error saving Kite token: {str(e)}")
+        st.error(f"Error saving Kite token to DB: {str(e)}")
         return False
 
 def get_kite_token(user_id: str):
@@ -199,22 +205,23 @@ def get_kite_token(user_id: str):
         if result.data:
             token_record = result.data[0]
             expires_at_str = token_record.get('expires_at')
+            
             if expires_at_str:
-                # Convert to datetime object and compare
-                expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00')) # Handle 'Z' if present
-                if expires_at > datetime.now():
+                # Convert to datetime object and compare (handle potential timezone issues)
+                expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00')) # Ensure Z is handled
+                if expires_at > datetime.now(expires_at.tzinfo): # Compare with timezone-aware current time
                     return token_record['access_token']
                 else:
-                    st.warning("Kite token from database has expired. Please re-authenticate.")
+                    st.sidebar.warning("Kite token from database has expired. Please re-authenticate.")
                     # Optionally, delete the expired token from DB
                     supabase.table('user_tokens').delete().eq('id', token_record['id']).execute()
             else:
                 # If no expiry is set, treat it as valid for now, but a warning might be appropriate
-                st.warning("Kite token found in DB, but no expiry specified. Assuming valid for now.")
+                st.sidebar.warning("Kite token found in DB, but no expiry specified. Assuming valid for now.")
                 return token_record['access_token']
         return None
     except Exception as e:
-        st.error(f"Error fetching Kite token: {str(e)}")
+        st.sidebar.error(f"Error fetching Kite token from DB: {str(e)}")
         return None
 
 # --- Enhanced Database Functions ---
@@ -968,12 +975,54 @@ def render_threshold_config():
             )
 
 
-# --- MAIN APP ---
+# --- INITIALIZATION AND SUPABASE SESSION REHYDRATION (CRITICAL CHANGE) ---
+# This block runs at the very beginning of each rerun, before anything else in the main app logic
 if not st.session_state["user_authenticated"]:
-    render_auth_page()
-    st.stop()
+    # Attempt to retrieve an active Supabase session from local storage
+    try:
+        session_response = supabase.auth.get_session()
+        if session_response and session_response.session:
+            # Session found and is valid
+            st.session_state["user_authenticated"] = True
+            st.session_state["user_id"] = session_response.user.id
+            st.session_state["user_email"] = session_response.user.email
+            st.session_state["supabase_session"] = session_response.session
+            st.success(f"Welcome back, {st.session_state['user_email']}!")
+            # Note: No st.rerun() here, allow the app to proceed with the re-hydrated state
+        else:
+            # No valid session found in local storage, render authentication page
+            render_auth_page()
+            st.stop() # Stop further execution if user is not authenticated
+    except Exception as e:
+        st.error(f"Error restoring Supabase session: {e}")
+        render_auth_page()
+        st.stop()
+else:
+    # If user_authenticated is already True (from current session or just re-hydrated)
+    # Ensure supabase_session object is also up-to-date, potentially by refreshing
+    if not st.session_state["supabase_session"]:
+        try:
+            session_response = supabase.auth.get_session()
+            if session_response and session_response.session:
+                st.session_state["supabase_session"] = session_response.session
+            else:
+                # This should ideally not happen if user_authenticated is True
+                # but as a fallback, if session object is missing, invalidate
+                st.session_state["user_authenticated"] = False
+                st.session_state["user_id"] = None
+                st.session_state["user_email"] = None
+                st.warning("Supabase session lost. Please log in again.")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Error checking Supabase session: {e}")
+            st.session_state["user_authenticated"] = False
+            st.session_state["user_id"] = None
+            st.session_state["user_email"] = None
+            st.warning("Supabase session check failed. Please log in again.")
+            st.rerun()
 
-# User authenticated
+
+# --- MAIN APP (ONLY runs if user_authenticated is TRUE) ---
 st.title("Invsion Connect")
 st.markdown(f"Welcome, **{st.session_state['user_email']}** 👋")
 
@@ -984,14 +1033,13 @@ with st.sidebar:
     st.info(f"**{st.session_state['user_email']}**")
     
     if st.button("🚪 Logout", use_container_width=True):
-        logout_user()
-        st.rerun()
+        logout_user() # Will call st.rerun()
     
     st.markdown("---")
     st.markdown("### Kite Connect")
     
-    # --- NEW KITE TOKEN LOGIC ---
-    # Attempt to load token from DB if not in session state
+    # --- KITE TOKEN LOGIC (IMPROVED LOADING) ---
+    # Attempt to load Kite token from DB if not in session state AND user_id is available
     if not st.session_state["kite_access_token"] and st.session_state["user_id"]:
         with st.spinner("Checking for saved Kite token..."):
             stored_token = get_kite_token(st.session_state["user_id"])
@@ -999,7 +1047,7 @@ with st.sidebar:
                 st.session_state["kite_access_token"] = stored_token
                 st.sidebar.success("Kite token loaded from database ✅")
             else:
-                st.sidebar.info("No active Kite token found in database.")
+                st.sidebar.info("No active Kite token found in database for this user.")
 
     if not st.session_state["kite_access_token"]:
         st.link_button("🔗 Login to Kite", login_url, use_container_width=True)
@@ -1014,30 +1062,39 @@ with st.sidebar:
                 # Store in session state
                 st.session_state["kite_access_token"] = access_token
                 
-                # Calculate expiry: Kite tokens typically expire after midnight the same day
-                expiry_time = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                # Calculate expiry: Kite tokens typically expire at midnight the same day
+                # Get the current time and add one day, then set time to 00:00:00
+                expiry_time = (datetime.now() + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ).isoformat()
                 
-                # Store in database
-                save_kite_token(st.session_state["user_id"], access_token, expiry_time)
+                # Store in database, ensuring user_id is available
+                if st.session_state["user_id"]:
+                    save_kite_token(st.session_state["user_id"], access_token, expiry_time)
+                else:
+                    st.warning("User ID not available to save Kite token persistently.")
                 
                 st.success("Kite connected!")
-                st.query_params.clear()
-                st.rerun()
+                st.query_params.clear() # Clear request_token from URL
+                st.rerun() # Rerun to remove request_token and update UI
             except Exception as e:
                 st.error(f"Failed to connect Kite: {e}")
+                st.query_params.clear() # Clear request_token even on failure
+                st.rerun() # Rerun to remove request_token and update UI
     
     if st.session_state["kite_access_token"]:
         st.success("Kite Connected ✅")
         if st.button("Disconnect Kite", use_container_width=True):
             st.session_state["kite_access_token"] = None
             # Optionally, delete token from DB as well
-            try:
-                supabase.table('user_tokens').delete().eq('user_id', st.session_state["user_id"]).eq('token_type', 'kite_connect').execute()
-                st.success("Kite token removed from database.")
-            except Exception as e:
-                st.error(f"Error removing token from DB: {e}")
+            if st.session_state["user_id"]:
+                try:
+                    supabase.table('user_tokens').delete().eq('user_id', st.session_state["user_id"]).eq('token_type', 'kite_connect').execute()
+                    st.success("Kite token removed from database.")
+                except Exception as e:
+                    st.error(f"Error removing token from DB: {e}")
             st.rerun()
-    # --- END NEW KITE TOKEN LOGIC ---
+    # --- END KITE TOKEN LOGIC ---
 
     st.markdown("---")
     st.markdown("### My Portfolios")
@@ -1046,7 +1103,8 @@ with st.sidebar:
         st.session_state["saved_analyses"] = get_user_portfolios(st.session_state["user_id"])
     
     if not st.session_state.get("saved_analyses"):
-        st.session_state["saved_analyses"] = get_user_portfolios(st.session_state["user_id"])
+        if st.session_state["user_id"]: # Only fetch if user_id is available
+            st.session_state["saved_analyses"] = get_user_portfolios(st.session_state["user_id"])
     
     if st.session_state["saved_analyses"]:
         st.markdown(f"**{len(st.session_state['saved_analyses'])} portfolios**")
@@ -1640,7 +1698,7 @@ HHI < 800""")
                 from io import BytesIO
                 output = BytesIO()
                 
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                with pd.ExcelWriter(output, engine='openynpxl') as writer:
                     # Holdings sheet
                     results_df.to_excel(writer, sheet_name='Holdings', index=False)
                     
@@ -2440,6 +2498,6 @@ st.markdown(f"""
     <p><strong>Invsion Connect</strong> - Professional Portfolio Compliance Platform</p>
     <p style='font-size: 0.9em;'>⚠️ For informational purposes only. Consult professionals for investment decisions.</p>
     <p style='font-size: 0.8em;'>Powered by KiteConnect, Google Gemini AI & Supabase</p>
-    <p style='font-size: 0.8em;'>User: {st.session_state["user_email"]} | Session Active</p>
+    <p style='font-size: 0.8em;'>User: {st.session_state.get("user_email", "Guest")} | Session Active</p>
 </div>
 """, unsafe_allow_html=True)
