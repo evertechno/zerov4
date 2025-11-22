@@ -4,7 +4,8 @@ import pandas as pd
 import json
 import re
 import time
-from datetime import datetime, timedelta, timezone # Import timezone
+# --- CRITICAL FIX: Ensuring datetime components are imported ---
+from datetime import datetime, timedelta, timezone 
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -12,7 +13,7 @@ import numpy as np
 import ta
 import fitz
 import hashlib
-import requests
+import requests # Import requests for API calls
 
 # --- AI Imports ---
 try:
@@ -177,8 +178,7 @@ def save_kite_token(user_id: str, access_token: str, expires_at: str = None):
             'user_id': user_id,
             'access_token': access_token,
             'token_type': 'kite_connect',
-            # FIX: Use timezone-aware datetime (UTC) for creation time
-            'created_at': datetime.now(timezone.utc).isoformat(), 
+            'created_at': datetime.now().isoformat(),
             'expires_at': expires_at
         }
         
@@ -199,17 +199,13 @@ def get_kite_token(user_id: str):
     try:
         result = supabase.table('user_tokens').select('*').eq('user_id', user_id).eq('token_type', 'kite_connect').execute()
         if result.data:
+            # Check expiry if available and token is old, prompt user to re-login if expired
             token = result.data[0]['access_token']
             expires_at_str = result.data[0].get('expires_at')
             
             if expires_at_str:
-                # FIX: Parse the stored string as timezone-aware (UTC)
                 expires_at = datetime.fromisoformat(expires_at_str)
-                if expires_at.tzinfo is None:
-                    # If the string stored had no timezone info (old records), assume UTC to be safe
-                    expires_at = expires_at.replace(tzinfo=timezone.utc)
-                
-                if expires_at < datetime.now(timezone.utc):
+                if expires_at < datetime.now():
                     st.warning("Your stored Kite token has expired. Please log in via Kite again.")
                     return None # Return None to force re-login
             return token
@@ -233,8 +229,7 @@ def save_kim_document(user_id: str, portfolio_name: str, document_text: str, fil
             'document_text': document_text,
             'file_name': file_name,
             'document_hash': doc_hash,
-            # FIX: Use timezone-aware datetime (UTC)
-            'extracted_at': datetime.now(timezone.utc).isoformat()
+            'extracted_at': datetime.now().isoformat()
         }
         
         if existing.data:
@@ -248,6 +243,17 @@ def save_kim_document(user_id: str, portfolio_name: str, document_text: str, fil
     except Exception as e:
         st.error(f"Error saving KIM document: {str(e)}")
         return False, None
+
+def get_kim_document(user_id: str, portfolio_name: str):
+    """Retrieve saved KIM document for a portfolio"""
+    try:
+        result = supabase.table('kim_documents').select('*').eq('user_id', user_id).eq('portfolio_name', portfolio_name).execute()
+        if result.data:
+            return result.data[0]
+        return None
+    except Exception as e:
+        st.error(f"Error fetching KIM document: {str(e)}")
+        return None
 
 def save_portfolio_with_stages(user_id: str, portfolio_name: str, portfolio_data: dict, compliance_stage: str):
     """Save portfolio at different stages of analysis"""
@@ -271,8 +277,6 @@ def save_portfolio_with_stages(user_id: str, portfolio_name: str, portfolio_data
             portfolio_id = existing.data[0]['id']
         else:
             # Create new portfolio
-            # FIX: Add created_at timestamp to maintain consistency in sorting/fetching
-            portfolio_record['created_at'] = datetime.now(timezone.utc).isoformat()
             result = supabase.table('portfolios').insert(portfolio_record).execute()
             portfolio_id = result.data[0]['id'] if result.data else None
         
@@ -282,6 +286,85 @@ def save_portfolio_with_stages(user_id: str, portfolio_name: str, portfolio_data
         import traceback
         st.error(f"Traceback: {traceback.format_exc()}")
         return False, None
+
+def save_compliance_analysis(user_id: str, portfolio_id: str, compliance_data: dict):
+    """Save compliance analysis results - FIXED for existing schema"""
+    try:
+        # Save or update compliance config
+        config_record = {
+            'user_id': user_id,
+            'portfolio_id': portfolio_id,
+            'single_stock_limit': float(compliance_data.get('threshold_configs', {}).get('single_stock_limit', 10.0)),
+            'single_sector_limit': float(compliance_data.get('threshold_configs', {}).get('single_sector_limit', 25.0)),
+            'custom_rules': compliance_data.get('custom_rules', ''),
+            'threshold_configs': compliance_data.get('threshold_configs', {})
+        }
+        
+        # Check if config exists
+        existing_config = supabase.table('compliance_configs').select('*').eq('portfolio_id', portfolio_id).execute()
+        
+        if existing_config.data:
+            config_result = supabase.table('compliance_configs').update(config_record).eq('id', existing_config.data[0]['id']).execute()
+            config_id = existing_config.data[0]['id']
+        else:
+            config_result = supabase.table('compliance_configs').insert(config_record).execute()
+            config_id = config_result.data[0]['id'] if config_result.data else None
+        
+        if not config_id:
+            return False, None
+        
+        # Save or update analysis results - ONLY fields that exist in schema
+        analysis_record = {
+            'user_id': user_id,
+            'portfolio_id': portfolio_id,
+            'config_id': config_id,
+            'compliance_results': compliance_data.get('compliance_results', []),
+            'security_compliance': compliance_data.get('security_compliance'),
+            'breach_alerts': compliance_data.get('breach_alerts', [])
+        }
+        
+        # Only add ai_analysis if it exists and is not None
+        if compliance_data.get('ai_analysis'):
+            analysis_record['ai_analysis'] = compliance_data['ai_analysis']
+        
+        # Check if analysis exists
+        existing_analysis = supabase.table('analysis_results').select('*').eq('portfolio_id', portfolio_id).execute()
+        
+        if existing_analysis.data:
+            analysis_result = supabase.table('analysis_results').update(analysis_record).eq('id', existing_analysis.data[0]['id']).execute()
+        else:
+            analysis_result = supabase.table('analysis_results').insert(analysis_record).execute()
+        
+        # Store advanced_metrics separately in portfolio metadata if provided
+        if compliance_data.get('advanced_metrics'):
+            portfolio_metadata_update = {
+                'metadata': {
+                    'advanced_metrics': compliance_data['advanced_metrics'],
+                    'last_updated': datetime.now().isoformat()
+                }
+            }
+            supabase.table('portfolios').update(portfolio_metadata_update).eq('id', portfolio_id).execute()
+        
+        # Update portfolio stage
+        supabase.table('portfolios').update({'analysis_stage': 'ai_completed' if compliance_data.get('ai_analysis') else 'compliance_done'}).eq('id', portfolio_id).execute()
+        
+        return True, portfolio_id
+    except Exception as e:
+        st.error(f"Error saving compliance analysis: {str(e)}")
+        import traceback
+        st.error(f"Traceback: {traceback.format_exc()}")
+        return False, None
+
+def get_user_portfolios(user_id: str):
+    """Get all portfolios for a user"""
+    try:
+        result = supabase.table('portfolios').select(
+            '*, analysis_results(*), compliance_configs(*)'
+        ).eq('user_id', user_id).order('created_at', desc=True).execute()
+        return result.data if result.data else []
+    except Exception as e:
+        st.error(f"Error fetching portfolios: {str(e)}")
+        return []
 
 def load_portfolio_full(portfolio_id: str):
     """Load complete portfolio with all analysis data - FIXED for existing schema"""
@@ -330,6 +413,34 @@ def load_portfolio_full(portfolio_id: str):
         st.error(f"Error loading portfolio: {str(e)}")
         return None
 
+def delete_portfolio(portfolio_id: str):
+    """Delete portfolio and all related data"""
+    try:
+        # Get portfolio to find portfolio_name
+        portfolio = supabase.table('portfolios').select('*').eq('id', portfolio_id).execute()
+        if portfolio.data:
+            portfolio_name = portfolio.data[0]['portfolio_name']
+            user_id = portfolio.data[0]['user_id']
+            
+            # Delete KIM document
+            supabase.table('kim_documents').delete().eq('user_id', user_id).eq('portfolio_name', portfolio_name).execute()
+        
+        # Delete portfolio (cascade will handle related records)
+        supabase.table('portfolios').delete().eq('id', portfolio_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error deleting portfolio: {str(e)}")
+        return False
+
+
+# --- KiteConnect Setup ---
+@st.cache_resource(ttl=3600)
+def init_kite_unauth_client(api_key: str) -> KiteConnect:
+    return KiteConnect(api_key=api_key)
+
+kite_unauth_client = init_kite_unauth_client(KITE_CREDENTIALS["api_key"])
+login_url = kite_unauth_client.login_url()
+
 
 # --- Utility Functions ---
 def get_authenticated_kite_client(api_key: str, access_token: str):
@@ -362,18 +473,11 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
             return pd.DataFrame({"_error": [f"Token not found for {symbol}"]})
         
         token = int(token_row.iloc[0]['instrument_token'])
-        
-        # FIX: Ensure from_date and to_date are timezone-aware if needed by underlying KiteConnect, 
-        # though historical_data often handles naive dates by assuming local time or UTC.
-        # We convert to be safe if the local datetime objects are naive.
-        from_dt = datetime.combine(from_date, datetime.min.time()).replace(tzinfo=timezone.utc) if from_date.tzinfo is None else from_date
-        to_dt = datetime.combine(to_date, datetime.max.time()).replace(tzinfo=timezone.utc) if to_date.tzinfo is None else to_date
-        
-        data = k.historical_data(token, from_date=from_dt, to_date=to_dt, interval=interval)
+        data = k.historical_data(token, from_date=datetime.combine(from_date, datetime.min.time()), 
+                                to_date=datetime.combine(to_date, datetime.max.time()), interval=interval)
         df = pd.DataFrame(data)
         
         if not df.empty:
-            # FIX: Convert the 'date' column (which should be UTC-aware from Kite) to datetime objects
             df["date"] = pd.to_datetime(df["date"])
             df.set_index("date", inplace=True)
             df.sort_index(inplace=True)
@@ -390,7 +494,7 @@ def call_compliance_api(endpoint: str, payload: dict):
     """
     try:
         url = f"{COMPLIANCE_API_BASE_URL}{endpoint}"
-        # st.info(f"Calling API: {url} with payload (truncated): {str(payload)[:500]}...") # Log payload for debug
+        st.info(f"Calling API: {url} with payload (truncated): {str(payload)[:500]}...") # Log payload for debug
         response = requests.post(url, json=payload, timeout=60)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
         st.success(f"API call to {endpoint} successful!")
@@ -418,11 +522,8 @@ def call_compliance_api(endpoint: str, payload: dict):
 # --- Enhanced Compliance Functions (using API) ---
 def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, threshold_configs: dict):
     """Calls the API to run compliance checks."""
-    # Ensure portfolio structure sent to API matches expectations (e.g., correct float types)
-    portfolio_records = portfolio_df.to_dict('records')
-    
     payload = {
-        "portfolio": portfolio_records,
+        "portfolio": portfolio_df.to_dict('records'),
         "rules_text": rules_text,
         "threshold_configs": threshold_configs
     }
@@ -455,10 +556,8 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, threshold_co
 def calculate_advanced_metrics(portfolio_df, api_key, access_token):
     """Calculate portfolio risk metrics"""
     symbols = portfolio_df['Symbol'].tolist()
-    # FIX: Ensure dates are date objects for get_historical_data_cached, and use UTC for calculation consistency
-    today = datetime.now(timezone.utc).date()
-    from_date = today - timedelta(days=366)
-    to_date = today
+    from_date = datetime.now().date() - timedelta(days=366)
+    to_date = datetime.now().date()
     
     returns_df = pd.DataFrame()
     failed_symbols = []
@@ -466,7 +565,6 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
     progress_bar = st.progress(0, text="Fetching historical data...")
     
     for i, symbol in enumerate(symbols):
-        # Pass naive dates, the cache function handles UTC conversion for Kite API call
         hist_data = get_historical_data_cached(api_key, access_token, symbol, from_date, to_date, 'day')
         if not hist_data.empty and '_error' not in hist_data.columns:
             returns_df[symbol] = hist_data['close'].pct_change()
@@ -496,12 +594,10 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
     weights = (portfolio_df_success['Real-time Value (Rs)'] / total_value_success).values
     portfolio_returns = returns_df.dot(weights)
     
-    # Calculate VaR/CVaR using portfolio returns series which is offset-naive (daily returns)
     var_95 = portfolio_returns.quantile(0.05)
     var_99 = portfolio_returns.quantile(0.01)
     cvar_95 = portfolio_returns[portfolio_returns <= var_95].mean()
     
-    # Annualize Volatility
     portfolio_vol = portfolio_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
     
     progress_bar.empty()
@@ -615,22 +711,11 @@ def get_portfolio_summary(df):
 def render_portfolio_card(portfolio):
     """Helper function to render portfolio card in history"""
     portfolio_name = portfolio.get('portfolio_name', 'Unnamed Portfolio')
-    # FIX: Handle timezone conversion when loading created_at from DB
-    created_at_str = portfolio.get('created_at')
-    if created_at_str:
-        try:
-            analysis_date = datetime.fromisoformat(created_at_str)
-            # Ensure it's timezone-aware if it arrived naive (though Supabase usually returns aware ISO)
-            if analysis_date.tzinfo is None or analysis_date.tzinfo.utcoffset(analysis_date) is None:
-                 analysis_date = analysis_date.replace(tzinfo=timezone.utc)
-        except ValueError:
-            analysis_date = datetime.now() # Fallback
-    else:
-        analysis_date = datetime.now()
-
+    analysis_date = datetime.fromisoformat(portfolio['created_at'])
     
     with st.container():
         col1, col2, col3, col4 = st.columns([4, 2, 1, 1])
+        
         with col1:
             st.markdown(f"**📁 {portfolio_name}**")
             st.caption(f"{analysis_date.strftime('%Y-%m-%d %H:%M')}")
@@ -730,6 +815,164 @@ def render_portfolio_card(portfolio):
         st.markdown("---")
 
 
+# --- Authentication UI ---
+def render_auth_page():
+    st.title("🔐 Invsion Connect")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.markdown("### Professional Portfolio Compliance Platform")
+        
+        auth_tab1, auth_tab2 = st.tabs(["Login", "Register"])
+        
+        with auth_tab1:
+            with st.form("login_form"):
+                email = st.text_input("Email")
+                password = st.text_input("Password", type="password")
+                submit_login = st.form_submit_button("Login", use_container_width=True, type="primary")
+                
+                if submit_login:
+                    if email and password:
+                        success, message = login_user(email, password)
+                        if success:
+                            st.success(message)
+                            # NEW: Attempt to load Kite token from DB after successful login
+                            if st.session_state.get("user_id"):
+                                stored_token = get_kite_token(st.session_state["user_id"])
+                                if stored_token:
+                                    st.session_state["kite_access_token"] = stored_token
+                                    st.success("Kite token loaded from database.")
+                                else:
+                                    st.warning("No valid Kite token found in DB. Please connect Kite in the sidebar.")
+                            
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.error(message)
+                    else:
+                        st.warning("Enter email and password.")
+        
+        with auth_tab2:
+            with st.form("register_form"):
+                reg_email = st.text_input("Email", key="reg_email")
+                reg_password = st.text_input("Password", type="password", key="reg_password")
+                reg_password_confirm = st.text_input("Confirm Password", type="password")
+                submit_register = st.form_submit_button("Register", use_container_width=True, type="primary")
+                
+                if submit_register:
+                    if reg_email and reg_password and reg_password_confirm:
+                        if reg_password != reg_password_confirm:
+                            st.error("Passwords don't match!")
+                        elif len(reg_password) < 6:
+                            st.error("Password must be at least 6 characters.")
+                        else:
+                            success, message = register_user(reg_email, reg_password)
+                            if success:
+                                st.success(message)
+                            else:
+                                st.error(message)
+                    else:
+                        st.warning("Fill all fields.")
+
+
+# --- Enhanced Threshold Configuration UI ---
+def render_threshold_config():
+    """Render comprehensive threshold configuration panel"""
+    st.subheader("⚙️ Compliance Thresholds")
+    
+    with st.expander("📊 Basic Limits", expanded=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state["threshold_configs"]['single_stock_limit'] = st.number_input(
+                "Single Stock Limit (%)", 1.0, 25.0, 
+                st.session_state["threshold_configs"].get('single_stock_limit', 10.0), 0.5,
+                key="config_single_stock_limit", help="Maximum weight for any single stock"
+            )
+            st.session_state["threshold_configs"]['single_sector_limit'] = st.number_input(
+                "Single Sector Limit (%)", 5.0, 50.0,
+                st.session_state["threshold_configs"].get('single_sector_limit', 25.0), 1.0,
+                key="config_single_sector_limit", help="Maximum weight for any single sector"
+            )
+            st.session_state["threshold_configs"]['group_exposure_limit'] = st.number_input(
+                "Group Exposure Limit (%)", 5.0, 50.0,
+                st.session_state["threshold_configs"].get('group_exposure_limit', 25.0), 1.0,
+                key="config_group_exposure_limit", help="Maximum exposure to single business group"
+            )
+        with col2:
+            st.session_state["threshold_configs"]['top_10_holdings_limit'] = st.number_input(
+                "Top 10 Holdings Limit (%)", 30.0, 80.0,
+                st.session_state["threshold_configs"].get('top_10_holdings_limit', 50.0), 5.0,
+                key="config_top_10_holdings_limit", help="Maximum weight of top 10 holdings combined"
+            )
+            st.session_state["threshold_configs"]['max_single_holding'] = st.number_input(
+                "Max Single Holding (%)", 1.0, 25.0,
+                st.session_state["threshold_configs"].get('max_single_holding', 10.0), 0.5,
+                key="config_max_single_holding", help="Absolute maximum for any single position"
+            )
+    
+    with st.expander("💰 Cash & Liquidity"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state["threshold_configs"]['cash_equivalent_min'] = st.number_input(
+                "Min Cash Equivalent (%)", 0.0, 20.0,
+                st.session_state["threshold_configs"].get('cash_equivalent_min', 0.0), 0.5,
+                key="config_cash_equivalent_min", help="Minimum cash and cash equivalents"
+            )
+        with col2:
+            st.session_state["threshold_configs"]['cash_equivalent_max'] = st.number_input(
+                "Max Cash Equivalent (%)", 0.0, 50.0,
+                st.session_state["threshold_configs"].get('cash_equivalent_max', 10.0), 1.0,
+                key="config_cash_equivalent_max", help="Maximum cash and cash equivalents"
+            )
+        
+        st.session_state["threshold_configs"]['liquidity_ratio_min'] = st.number_input(
+            "Min Liquidity Ratio", 0.0, 1.0,
+            st.session_state["threshold_configs"].get('liquidity_ratio_min', 0.9), 0.05,
+            key="config_liquidity_ratio_min", help="Minimum portfolio liquidity ratio"
+        )
+    
+    with st.expander("🌐 Special Instruments"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state["threshold_configs"]['foreign_security_limit'] = st.number_input(
+                "Foreign Securities Limit (%)", 0.0, 100.0,
+                st.session_state["threshold_configs"].get('foreign_security_limit', 50.0), 5.0,
+                key="config_foreign_security_limit", help="Maximum exposure to foreign securities"
+            )
+            st.session_state["threshold_configs"]['derivative_limit'] = st.number_input(
+                "Derivatives Limit (%)", 0.0, 100.0,
+                st.session_state["threshold_configs"].get('derivative_limit', 50.0), 5.0,
+                key="config_derivative_limit", help="Maximum derivatives exposure"
+            )
+        with col2:
+            st.session_state["threshold_configs"]['unlisted_security_limit'] = st.number_input(
+                "Unlisted Securities Limit (%)", 0.0, 25.0,
+                st.session_state["threshold_configs"].get('unlisted_security_limit', 10.0), 1.0,
+                key="config_unlisted_security_limit", help="Maximum exposure to unlisted securities"
+            )
+    
+    with st.expander("📈 Portfolio Structure"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state["threshold_configs"]['min_holdings'] = st.number_input(
+                "Minimum Holdings", 5, 200,
+                st.session_state["threshold_configs"].get('min_holdings', 20), 5,
+                key="config_min_holdings", help="Minimum number of holdings"
+            )
+            st.session_state["threshold_configs"]['min_sectors'] = st.number_input(
+                "Minimum Sectors", 1, 20,
+                st.session_state["threshold_configs"].get('min_sectors', 5), 1,
+                key="config_min_sectors", help="Minimum number of sectors"
+            )
+        with col2:
+            st.session_state["threshold_configs"]['max_holdings'] = st.number_input(
+                "Maximum Holdings", 20, 500,
+                st.session_state["threshold_configs"].get('max_holdings', 100), 10,
+                key="config_max_holdings", help="Maximum number of holdings"
+            )
+
+
 # --- MAIN APP ---
 if not st.session_state["user_authenticated"]:
     render_auth_page()
@@ -775,13 +1018,11 @@ with st.sidebar:
                 st.session_state["kite_access_token"] = access_token
                 
                 # 2. Calculate expiry (Kite tokens expire at midnight)
-                # FIX: Ensure expiry is timezone-aware (UTC)
-                expiry_dt = (datetime.now(timezone.utc) + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-                expiry_iso = expiry_dt.isoformat()
+                expiry = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
                 # 3. Store in database
                 if st.session_state.get("user_id"):
-                    if save_kite_token(st.session_state["user_id"], access_token, expiry_iso):
+                    if save_kite_token(st.session_state["user_id"], access_token, expiry):
                         st.success("Kite connected & token saved to DB!")
                     else:
                         st.warning("Kite connected, but DB save failed.")
@@ -806,7 +1047,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### My Portfolios")
     
-    if st.button("🔄 Refresh History", use_container_width=True):
+    if st.button("🔄 Refresh", use_container_width=True):
         st.session_state["saved_analyses"] = get_user_portfolios(st.session_state["user_id"])
     
     if not st.session_state.get("saved_analyses"):
@@ -828,7 +1069,7 @@ with st.sidebar:
             with st.expander(f"{stage_emoji} {portfolio_name}"):
                 st.caption(f"Stage: {analysis_stage}")
                 
-                if st.button(f"Load", key=f"load_hist_{portfolio['id']}", use_container_width=True):
+                if st.button(f"Load", key=f"load_{portfolio['id']}", use_container_width=True):
                     loaded = load_portfolio_full(portfolio['id'])
                     if loaded:
                         # Load all data into session state
@@ -1037,10 +1278,12 @@ HHI < 800""")
                     }
                     df = df.rename(columns=header_map)
                     
-                    # Ensure necessary columns exist, even if empty/defaulted
-                    if 'Industry' not in df.columns: df['Industry'] = 'UNKNOWN'
-                    if 'Name' not in df.columns: df['Name'] = df['Symbol']
-                    if 'LTP' not in df.columns: df['LTP'] = 0.0
+                    if 'Industry' in df.columns:
+                        df['Industry'] = df['Industry'].fillna('UNKNOWN').str.strip().str.upper()
+                    if 'Name' not in df.columns: # Ensure 'Name' exists for display
+                        df['Name'] = df['Symbol'] 
+                    if 'LTP' not in df.columns: # Ensure LTP exists before calling API or recalculating
+                        df['LTP'] = 0.0
 
                     # Fetch real-time prices
                     symbols = df['Symbol'].unique().tolist()
@@ -1081,7 +1324,7 @@ HHI < 800""")
                             })
                     
                     # Sector limit breaches
-                    if 'Industry' in df_results.columns and df_results['Industry'].nunique() > 0: # Check for 'Industry' column and if it has data
+                    if 'Industry' in df_results.columns: # Check for 'Industry' column before grouping
                         sector_weights = df_results.groupby('Industry')['Weight %'].sum()
                         single_sector_limit = st.session_state["threshold_configs"]['single_sector_limit']
                         if (sector_weights > single_sector_limit).any():
@@ -1143,7 +1386,7 @@ HHI < 800""")
                         'metadata': {
                             'total_value': float(total_value),
                             'holdings_count': len(df_results),
-                            'analysis_timestamp': datetime.now(timezone.utc).isoformat() # FIX: Use aware time
+                            'analysis_timestamp': datetime.now().isoformat()
                         }
                     }
                     
@@ -1338,11 +1581,8 @@ HHI < 800""")
             security_df = st.session_state.get("security_level_compliance", pd.DataFrame())
             
             if not security_df.empty:
-                # Ensure column exists before checking its value
-                has_breach_col = 'Stock Limit Breach' in security_df.columns
-                
-                breach_count = (security_df['Stock Limit Breach'] == '❌ Breach').sum() if has_breach_col else 0
-                compliant_count = (security_df['Stock Limit Breach'] == '✅ Compliant').sum() if has_breach_col else len(security_df)
+                breach_count = (security_df['Stock Limit Breach'] == '❌ Breach').sum()
+                compliant_count = (security_df['Stock Limit Breach'] == '✅ Compliant').sum()
                 
                 summary_cols = st.columns(3)
                 summary_cols[0].metric("Total Securities", len(security_df))
@@ -1352,9 +1592,7 @@ HHI < 800""")
                 st.dataframe(security_df[['Name', 'Symbol', 'Industry', 'Weight %', 'Stock Limit Breach', 'Concentration Risk']].style.format({
                     'Weight %': '{:.2f}%'
                 }), use_container_width=True, height=500)
-            else:
-                 st.info("Security level data not calculated yet.")
-
+        
         with analysis_tabs[5]:
             st.subheader("Concentration Analysis")
             
@@ -1387,10 +1625,10 @@ HHI < 800""")
             
             st.markdown("### Concentration Benchmarks")
             bench_cols = st.columns(5)
-            bench_cols[0].metric("Top 1", f"{sorted_df.iloc[0]['Weight %']:.2f}%" if not sorted_df.empty else "N/A")
-            bench_cols[1].metric("Top 3", f"{sorted_df.head(3)['Weight %'].sum():.2f}%" if len(sorted_df) >= 3 else "N/A")
-            bench_cols[2].metric("Top 5", f"{sorted_df.head(5)['Weight %'].sum():.2f}%" if len(sorted_df) >= 5 else "N/A")
-            bench_cols[3].metric("Top 10", f"{sorted_df.head(10)['Weight %'].sum():.2f}%" if len(sorted_df) >= 10 else "N/A")
+            bench_cols[0].metric("Top 1", f"{sorted_df.iloc[0]['Weight %']:.2f}%")
+            bench_cols[1].metric("Top 3", f"{sorted_df.head(3)['Weight %'].sum():.2f}%")
+            bench_cols[2].metric("Top 5", f"{sorted_df.head(5)['Weight %'].sum():.2f}%")
+            bench_cols[3].metric("Top 10", f"{sorted_df.head(10)['Weight %'].sum():.2f}%")
             bench_cols[4].metric("Top 20", f"{sorted_df.head(20)['Weight %'].sum():.2f}%" if len(sorted_df) >= 20 else "N/A")
             
             # HHI and Gini
@@ -1398,11 +1636,10 @@ HHI < 800""")
             weights_sorted = results_df['Weight %'].sort_values().values
             n = len(weights_sorted)
             gini = 0 # Initialize to 0 for cases where calculation might fail or not be applicable
-            if n > 1: # Need at least two elements for Gini calculation logic
-                # Normalize weights to sum to 1 for Gini calculation formula clarity, though total sum of % > 100 can happen due to floating point issues/API differences
+            if n > 0: # Avoid division by zero
+                # Handle potential case where sum(weights_sorted) could be 0, leading to div by zero
                 sum_weights = np.sum(weights_sorted)
                 if sum_weights > 0:
-                     # Gini calculation based on sorted weights (0 to 100 scale for percentage weights)
                     gini = (2 * np.sum((np.arange(1, n+1)) * weights_sorted)) / (n * sum_weights) - (n + 1) / n
             
             st.markdown("### Concentration Indices")
@@ -1485,14 +1722,7 @@ with tabs[1]:
     
     if existing_kim:
         st.success(f"✅ KIM/SID document already uploaded: **{existing_kim['file_name']}**")
-        # FIX: Ensure extracted_at is handled safely for display
-        try:
-            extracted_time = datetime.fromisoformat(existing_kim['extracted_at'])
-            if extracted_time.tzinfo is None:
-                 extracted_time = extracted_time.replace(tzinfo=timezone.utc)
-            st.caption(f"Extracted on: {extracted_time.strftime('%Y-%m-%d %H:%M')} UTC")
-        except:
-            st.caption(f"Extracted on: {existing_kim.get('extracted_at', 'Unknown Time')}")
+        st.caption(f"Extracted on: {datetime.fromisoformat(existing_kim['extracted_at']).strftime('%Y-%m-%d %H:%M')}")
         
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -1772,7 +2002,6 @@ Data limitations and assumptions made
                         docs_text_snippet=docs_text_snippet
                     )
                     
-                    # Use a model that handles large context windows well, like gemini-1.5-flash
                     model = genai.GenerativeModel('gemini-1.5-flash')
                     
                     response = model.generate_content(
@@ -1893,16 +2122,11 @@ with tabs[2]:
                 st.session_state['stress_summary'] = summary
                 
                 # Re-run compliance audit on the stressed data using the API
-                # We need to calculate the stressed 'Weight %' manually for the API call to correctly run its internal checks
-                # The API expects 'Weight %' to reflect the current state, which means we must use the calculated 'Stressed Weight %' column for the check, renaming it back temporarily.
-                
-                stressed_df_api_input = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'})
-                
-                # Crucially, the API needs the current state *after* the shock but *before* rebalancing/compliance fixes.
-                # We pass the shocked portfolio state and the original rules/thresholds.
+                # The API's _recalculate_weights function will handle value and weight % if LTP/Quantity are given.
+                stressed_df_for_api = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'}).copy()
                 
                 stressed_compliance_results = call_compliance_api_run_check(
-                    stressed_df_api_input,
+                    stressed_df_for_api,
                     st.session_state.current_rules_text,
                     st.session_state.threshold_configs
                 )
@@ -2127,7 +2351,7 @@ with tabs[3]:
         bt_quantity = st.number_input("Block Trade Total Quantity", min_value=1, value=500, key="bt_quantity")
         bt_action = st.selectbox("Block Trade Action", ["BUY", "SELL"], key="bt_action_block")
         
-        # Safely determine industry for the block trade symbol based on current portfolio holdings, or default
+        # Determine industry for the block trade symbol
         bt_row = current_portfolio_df[current_portfolio_df['Symbol'].str.upper() == bt_symbol.upper()]
         bt_industry = bt_row['Industry'].iloc[0] if not bt_row.empty and not bt_row['Industry'].empty else "UNKNOWN"
         
