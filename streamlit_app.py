@@ -4,7 +4,7 @@ import pandas as pd
 import json
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone # Import timezone for UTC awareness
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
@@ -110,7 +110,7 @@ KITE_CREDENTIALS, GEMINI_CREDENTIALS, SUPABASE_CREDENTIALS = load_secrets()
 genai.configure(api_key=GEMINI_CREDENTIALS["api_key"])
 
 # --- Initialize Supabase ---
-@st.cache_resource
+@st.cache_resource(ttl=3600)
 def init_supabase() -> Client:
     return create_client(SUPABASE_CREDENTIALS["url"], SUPABASE_CREDENTIALS["key"])
 
@@ -156,17 +156,21 @@ def login_user(email: str, password: str):
 
 def logout_user():
     try:
+        # Clear token from DB before clearing session state
+        if st.session_state.get("user_id") and st.session_state.get("kite_access_token"):
+            supabase.table('user_tokens').delete().eq('user_id', st.session_state["user_id"]).eq('token_type', 'kite_connect').execute()
+        
         supabase.auth.sign_out()
     except:
         pass
     st.session_state.clear()
 
 
-# --- Token Management Functions (NEW) ---
+# --- Enhanced Database Functions ---
 def save_kite_token(user_id: str, access_token: str, expires_at: str = None):
     """Save Kite access token to database"""
     try:
-        # Check if token exists for the user and type
+        # Check if token exists
         existing = supabase.table('user_tokens').select('*').eq('user_id', user_id).eq('token_type', 'kite_connect').execute()
         
         token_data = {
@@ -174,7 +178,7 @@ def save_kite_token(user_id: str, access_token: str, expires_at: str = None):
             'access_token': access_token,
             'token_type': 'kite_connect',
             'created_at': datetime.now().isoformat(),
-            'expires_at': expires_at  
+            'expires_at': expires_at
         }
         
         if existing.data:
@@ -184,40 +188,35 @@ def save_kite_token(user_id: str, access_token: str, expires_at: str = None):
             # Insert new token
             result = supabase.table('user_tokens').insert(token_data).execute()
         
-        if result.data:
-            st.toast("Kite token saved to database.", icon="💾")
-            return True
-        return False
+        return True
     except Exception as e:
         st.error(f"Error saving Kite token: {str(e)}")
         return False
 
 def get_kite_token(user_id: str):
-    """Retrieve Kite access token from database, checking expiry"""
+    """Retrieve Kite access token from database"""
     try:
         result = supabase.table('user_tokens').select('*').eq('user_id', user_id).eq('token_type', 'kite_connect').execute()
         if result.data:
-            token_record = result.data[0]
-            expires_at_str = token_record.get('expires_at')
+            # Check expiry if available and token is old, prompt user to re-login if expired
+            token = result.data[0]['access_token']
+            expires_at_str = result.data[0].get('expires_at')
+            
             if expires_at_str:
-                # Convert to datetime object and compare
-                expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00')) # Handle 'Z' if present
-                if expires_at > datetime.now():
-                    return token_record['access_token']
-                else:
-                    st.warning("Kite token from database has expired. Please re-authenticate.")
-                    # Optionally, delete the expired token from DB
-                    supabase.table('user_tokens').delete().eq('id', token_record['id']).execute()
-            else:
-                # If no expiry is set, treat it as valid for now, but a warning might be appropriate
-                st.warning("Kite token found in DB, but no expiry specified. Assuming valid for now.")
-                return token_record['access_token']
+                # FIX: Convert the database timezone-aware string back to an aware datetime object
+                expires_at = datetime.fromisoformat(expires_at_str)
+                
+                # Compare aware datetime (from DB) with current time, ensuring current time is also aware (UTC)
+                if expires_at < datetime.now(timezone.utc):
+                    st.warning("Your stored Kite token has expired. Please log in via Kite again.")
+                    return None # Return None to force re-login
+            return token
         return None
     except Exception as e:
         st.error(f"Error fetching Kite token: {str(e)}")
         return None
 
-# --- Enhanced Database Functions ---
+
 def save_kim_document(user_id: str, portfolio_name: str, document_text: str, file_name: str):
     """Save KIM/SID document for a portfolio"""
     try:
@@ -541,7 +540,7 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, threshold_co
     
     security_compliance = portfolio_df.copy()
     single_stock_limit = threshold_configs.get('single_stock_limit', 10.0)
-    #max_single_holding = threshold_configs.get('max_single_holding', 10.0) # Not used directly in this func
+    max_single_holding = threshold_configs.get('max_single_holding', 10.0)
     
     security_compliance['Stock Limit Breach'] = security_compliance['Weight %'].apply(
         lambda x: '❌ Breach' if x > single_stock_limit else '✅ Compliant'
@@ -576,13 +575,13 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
         progress_bar.progress((i + 1) / len(symbols), text=f"Fetching {symbol}...")
     
     if failed_symbols:
-        st.warning(f"Failed to fetch historical data for: {', '.join(failed_symbols)}")
+        st.warning(f"Failed to fetch: {', '.join(failed_symbols)}")
     
     returns_df.dropna(how='all', inplace=True)
     returns_df.fillna(0, inplace=True)
     
     if returns_df.empty:
-        st.error("Not enough historical data for metrics calculation.")
+        st.error("Not enough data for metrics.")
         progress_bar.empty()
         return None
     
@@ -591,7 +590,6 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
     total_value_success = portfolio_df_success['Real-time Value (Rs)'].sum()
     
     if total_value_success == 0:
-        st.error("Total portfolio value is zero after filtering for successful symbols. Cannot calculate metrics.")
         progress_bar.empty()
         return None
     
@@ -841,6 +839,15 @@ def render_auth_page():
                         success, message = login_user(email, password)
                         if success:
                             st.success(message)
+                            # NEW: Attempt to load Kite token from DB after successful login
+                            if st.session_state.get("user_id"):
+                                stored_token = get_kite_token(st.session_state["user_id"])
+                                if stored_token:
+                                    st.session_state["kite_access_token"] = stored_token
+                                    st.success("Kite token loaded from database.")
+                                else:
+                                    st.warning("No valid Kite token found in DB. Please connect Kite in the sidebar.")
+                            
                             time.sleep(0.5)
                             st.rerun()
                         else:
@@ -973,7 +980,15 @@ if not st.session_state["user_authenticated"]:
     render_auth_page()
     st.stop()
 
-# User authenticated
+# --- Post-Login/Initial Load Token Check ---
+# If the user is authenticated but the token is missing (e.g., refreshed browser tab), try loading from DB
+if not st.session_state["kite_access_token"] and st.session_state["user_id"]:
+    stored_token = get_kite_token(st.session_state["user_id"])
+    if stored_token:
+        st.session_state["kite_access_token"] = stored_token
+        st.sidebar.toast("Kite token reloaded from database.")
+
+
 st.title("Invsion Connect")
 st.markdown(f"Welcome, **{st.session_state['user_email']}** 👋")
 
@@ -990,55 +1005,49 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### Kite Connect")
     
-    # --- NEW KITE TOKEN LOGIC ---
-    # Attempt to load token from DB if not in session state
-    if not st.session_state["kite_access_token"] and st.session_state["user_id"]:
-        with st.spinner("Checking for saved Kite token..."):
-            stored_token = get_kite_token(st.session_state["user_id"])
-            if stored_token:
-                st.session_state["kite_access_token"] = stored_token
-                st.sidebar.success("Kite token loaded from database ✅")
-            else:
-                st.sidebar.info("No active Kite token found in database.")
-
     if not st.session_state["kite_access_token"]:
         st.link_button("🔗 Login to Kite", login_url, use_container_width=True)
     
+    # Handle Kite Redirect (Token Exchange)
     request_token_param = st.query_params.get("request_token")
     if request_token_param and not st.session_state["kite_access_token"]:
-        with st.spinner("Authenticating with Kite..."):
+        with st.spinner("Authenticating..."):
             try:
                 data = kite_unauth_client.generate_session(request_token_param, api_secret=KITE_CREDENTIALS["api_secret"])
                 access_token = data.get("access_token")
                 
-                # Store in session state
+                # 1. Store in session
                 st.session_state["kite_access_token"] = access_token
                 
-                # Calculate expiry: Kite tokens typically expire after midnight the same day
-                expiry_time = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-                
-                # Store in database
-                save_kite_token(st.session_state["user_id"], access_token, expiry_time)
-                
-                st.success("Kite connected!")
+                # 2. Calculate expiry (Kite tokens expire at midnight)
+                # FIX: Ensure expiry is UTC aware when saving to DB
+                expiry_naive = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                expiry_aware = expiry_naive.replace(tzinfo=timezone.utc)
+
+                # 3. Store in database
+                if st.session_state.get("user_id"):
+                    if save_kite_token(st.session_state["user_id"], access_token, expiry_aware.isoformat()):
+                        st.success("Kite connected & token saved to DB!")
+                    else:
+                        st.warning("Kite connected, but DB save failed.")
+                else:
+                    st.warning("User ID missing, token not saved to DB.")
+
                 st.query_params.clear()
                 st.rerun()
             except Exception as e:
-                st.error(f"Failed to connect Kite: {e}")
+                st.error(f"Failed Kite Authentication: {e}")
     
     if st.session_state["kite_access_token"]:
         st.success("Kite Connected ✅")
-        if st.button("Disconnect Kite", use_container_width=True):
-            st.session_state["kite_access_token"] = None
-            # Optionally, delete token from DB as well
-            try:
+        if st.button("Disconnect", use_container_width=True):
+            # Clear DB token on manual disconnect
+            if st.session_state.get("user_id"):
                 supabase.table('user_tokens').delete().eq('user_id', st.session_state["user_id"]).eq('token_type', 'kite_connect').execute()
-                st.success("Kite token removed from database.")
-            except Exception as e:
-                st.error(f"Error removing token from DB: {e}")
+            
+            st.session_state["kite_access_token"] = None
             st.rerun()
-    # --- END NEW KITE TOKEN LOGIC ---
-
+    
     st.markdown("---")
     st.markdown("### My Portfolios")
     
@@ -1064,7 +1073,7 @@ with st.sidebar:
             with st.expander(f"{stage_emoji} {portfolio_name}"):
                 st.caption(f"Stage: {analysis_stage}")
                 
-                if st.button(f"Load", key=f"load_{portfolio['id']}", use_container_width=True):
+                if st.button(f"Load", key=f"load_hist_{portfolio['id']}", use_container_width=True):
                     loaded = load_portfolio_full(portfolio['id'])
                     if loaded:
                         # Load all data into session state
@@ -1110,7 +1119,7 @@ with st.sidebar:
                         st.session_state["stressed_df"] = None
                         st.session_state["stressed_compliance_results"] = None
                         
-                        st.success("Loaded!")
+                        st.success("✅ Portfolio Loaded!")
                         time.sleep(0.5)
                         st.rerun()
                 
@@ -1124,7 +1133,15 @@ with st.sidebar:
         st.info("No portfolios yet")
 
 
-# --- Main Tabs ---
+# --- Main Content ---
+
+# If token is missing but user is logged in, try loading from DB
+if not st.session_state["kite_access_token"] and st.session_state["user_id"]:
+    stored_token = get_kite_token(st.session_state["user_id"])
+    if stored_token:
+        st.session_state["kite_access_token"] = stored_token
+        st.toast("Kite token reloaded from database.")
+
 k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state["kite_access_token"])
 api_key = KITE_CREDENTIALS["api_key"]
 access_token = st.session_state["kite_access_token"]
@@ -1533,7 +1550,7 @@ HHI < 800""")
                     st.markdown("### ❌ Failed Rules")
                     for res in failed_rules:
                         # Re-calculate severity based on our logic for display consistency
-                        severity = "🟡 Medium" 
+                        severity = "🟡 Medium" # Default severity
                         if abs(res.get('breach_amount', 0)) > res.get('threshold', 0) * 0.2:
                             severity = "🔴 Critical"
                         elif abs(res.get('breach_amount', 0)) > res.get('threshold', 0) * 0.1:
@@ -1805,7 +1822,7 @@ with tabs[1]:
                             # Adjust status from "PASS"/"FAIL" to "✅ PASS"/"❌ FAIL" for display here
                             display_status = "✅ PASS" if rule['status'] == "PASS" else "❌ FAIL" if rule['status'] == "FAIL" else rule['status']
                             
-                            severity = "🟡 Medium" 
+                            severity = "🟡 Medium" # Default severity
                             if rule['status'] == "FAIL":
                                 if abs(rule.get('breach_amount', 0)) > rule.get('threshold', 0) * 0.2:
                                     severity = "🔴 Critical"
@@ -2108,7 +2125,7 @@ with tabs[2]:
                 st.session_state['stress_summary'] = summary
                 
                 # Re-run compliance audit on the stressed data using the API
-                # The API's compliance check assumes a 'Weight %' column which we create temporarily.
+                # The API's _recalculate_weights function will handle value and weight % if LTP/Quantity are given.
                 stressed_df_for_api = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'}).copy()
                 
                 stressed_compliance_results = call_compliance_api_run_check(
@@ -2208,7 +2225,7 @@ with tabs[3]:
     current_threshold_configs = st.session_state.get("threshold_configs")
 
     if current_portfolio_df is None or current_portfolio_df.empty:
-        st.warning("⚠️ Please load or analyze a portfolio in 'Portfolio Analysis' tab to use API functions.")
+        st.warning("⚠️ Please load or analyze a portfolio in the 'Portfolio Analysis' tab first.")
         st.stop()
     if not current_rules_text:
         st.warning("⚠️ Please define compliance rules in 'Portfolio Analysis' tab to use API functions.")
@@ -2219,7 +2236,6 @@ with tabs[3]:
 
     # Convert current_portfolio_df to a JSON-serializable list of dicts for the API calls
     # Ensure 'Symbol', 'Name', 'Quantity', 'LTP', 'Industry' are present and in correct format.
-    # The API's _recalculate_weights function will handle value and weight % if LTP/Quantity are given.
     portfolio_for_api = current_portfolio_df[['Symbol', 'Name', 'Quantity', 'LTP', 'Industry']].copy()
     portfolio_for_api.fillna({'Industry': 'UNKNOWN'}, inplace=True) # API might expect string for Industry
     # Ensure numeric types are native Python types if `to_dict('records')` doesn't handle them perfectly
@@ -2384,7 +2400,7 @@ with tabs[3]:
                         st.error("Failed to check block trade allocation.")
 
 
-# --- Original TAB 4: History ---
+# --- TAB 5: History ---
 with tabs[4]: # This is now the fifth tab
     st.header("📚 Portfolio History")
     
