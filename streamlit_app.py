@@ -1556,7 +1556,7 @@ HHI < 800""")
                 from io import BytesIO
                 output = BytesIO()
                 
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                with pd.ExcelWriter(output, engine='openyxl') as writer:
                     # Holdings sheet
                     results_df.to_excel(writer, sheet_name='Holdings', index=False)
                     
