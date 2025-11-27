@@ -19,4 +19,4 @@
 ta
 supabase
 requests
-scipy.stats
+scipy
