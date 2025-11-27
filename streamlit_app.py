@@ -13,6 +13,7 @@ import ta
 import fitz
 import hashlib
 import requests # Import requests for API calls
+import scipy.stats as stats # For risk calculations
 
 # --- AI Imports ---
 try:
@@ -66,6 +67,9 @@ if "compliance_stage" not in st.session_state: st.session_state["compliance_stag
 if "stress_summary" not in st.session_state: st.session_state["stress_summary"] = None
 if "stressed_df" not in st.session_state: st.session_state["stressed_df"] = None
 if "stressed_compliance_results" not in st.session_state: st.session_state["stressed_compliance_results"] = None
+if "risk_returns_df" not in st.session_state: st.session_state["risk_returns_df"] = pd.DataFrame()
+if "benchmark_returns" not in st.session_state: st.session_state["benchmark_returns"] = pd.Series()
+
 
 if "threshold_configs" not in st.session_state: 
     st.session_state["threshold_configs"] = {
@@ -288,6 +292,7 @@ def save_compliance_analysis(user_id: str, portfolio_id: str, compliance_data: d
             portfolio_metadata_update = {
                 'metadata': {
                     'advanced_metrics': compliance_data['advanced_metrics'],
+                    'risk_returns_df': compliance_data.get('risk_returns_df', None),
                     'last_updated': datetime.now().isoformat()
                 }
             }
@@ -333,10 +338,17 @@ def load_portfolio_full(portfolio_id: str):
         # Get KIM document
         kim_result = supabase.table('kim_documents').select('*').eq('user_id', portfolio['user_id']).eq('portfolio_name', portfolio['portfolio_name']).execute()
         
-        # Extract advanced_metrics from portfolio metadata if available
+        # Extract advanced_metrics and risk_returns_df from portfolio metadata if available
         advanced_metrics = None
+        risk_returns_df = pd.DataFrame()
         if portfolio.get('metadata') and isinstance(portfolio['metadata'], dict):
             advanced_metrics = portfolio['metadata'].get('advanced_metrics')
+            if portfolio['metadata'].get('risk_returns_df'):
+                try:
+                    # Risk returns is stored as JSON string
+                    risk_returns_df = pd.read_json(portfolio['metadata']['risk_returns_df'])
+                except:
+                    pass
         
         # Combine data
         combined = {
@@ -351,6 +363,7 @@ def load_portfolio_full(portfolio_id: str):
             'security_compliance': analysis_result.data[0].get('security_compliance') if analysis_result.data else None,
             'breach_alerts': analysis_result.data[0].get('breach_alerts') if analysis_result.data else None,
             'advanced_metrics': advanced_metrics,
+            'risk_returns_df': risk_returns_df, # Add loaded returns data
             'ai_analysis': analysis_result.data[0].get('ai_analysis') if analysis_result.data else None,
             'kim_document': kim_result.data[0] if kim_result.data else None,
             'metadata': portfolio.get('metadata', {})
@@ -415,14 +428,25 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
     try:
         instruments = k.instruments(exchange)
         df_inst = pd.DataFrame(instruments)
-        token_row = df_inst[(df_inst['exchange'] == exchange.upper()) & (df_inst['tradingsymbol'] == symbol.upper())]
+        
+        # Handle NIFTY 50 benchmark
+        if symbol.upper() == BENCHMARK_SYMBOL.upper():
+            # Find the index instrument (usually listed under exchange 'NSE')
+            token_row = df_inst[(df_inst['exchange'] == 'NSE') & (df_inst['tradingsymbol'] == 'NIFTY')]
+        else:
+            token_row = df_inst[(df_inst['exchange'] == exchange.upper()) & (df_inst['tradingsymbol'] == symbol.upper())]
         
         if token_row.empty:
             return pd.DataFrame({"_error": [f"Token not found for {symbol}"]})
         
         token = int(token_row.iloc[0]['instrument_token'])
-        data = k.historical_data(token, from_date=datetime.combine(from_date, datetime.min.time()), 
-                                to_date=datetime.combine(to_date, datetime.max.time()), interval=interval)
+        
+        # Kite API expects datetime objects
+        start_datetime = datetime.combine(from_date, datetime.min.time())
+        end_datetime = datetime.combine(to_date, datetime.max.time())
+        
+        data = k.historical_data(token, from_date=start_datetime, 
+                                to_date=end_datetime, interval=interval)
         df = pd.DataFrame(data)
         
         if not df.empty:
@@ -442,10 +466,10 @@ def call_compliance_api(endpoint: str, payload: dict):
     """
     try:
         url = f"{COMPLIANCE_API_BASE_URL}{endpoint}"
-        st.info(f"Calling API: {url} with payload (truncated): {str(payload)[:500]}...") # Log payload for debug
+        # st.info(f"Calling API: {url} with payload (truncated): {str(payload)[:500]}...") # Log payload for debug
         response = requests.post(url, json=payload, timeout=60)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-        st.success(f"API call to {endpoint} successful!")
+        # st.success(f"API call to {endpoint} successful!")
         return response.json()
     except requests.exceptions.HTTPError as e:
         st.error(f"API HTTP Error ({endpoint}): {e.response.status_code} - {e.response.text}")
@@ -486,7 +510,6 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, threshold_co
     
     security_compliance = portfolio_df.copy()
     single_stock_limit = threshold_configs.get('single_stock_limit', 10.0)
-    max_single_holding = threshold_configs.get('max_single_holding', 10.0)
     
     security_compliance['Stock Limit Breach'] = security_compliance['Weight %'].apply(
         lambda x: '❌ Breach' if x > single_stock_limit else '✅ Compliant'
@@ -501,10 +524,12 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, threshold_co
     
     return security_compliance
 
-def calculate_advanced_metrics(portfolio_df, api_key, access_token):
-    """Calculate portfolio risk metrics"""
+def calculate_advanced_metrics(portfolio_df, api_key, access_token, lookback_days=366):
+    """Calculate portfolio risk metrics including Beta, Alpha, and Sharpe"""
+    
+    # 1. Prepare data fetching
     symbols = portfolio_df['Symbol'].tolist()
-    from_date = datetime.now().date() - timedelta(days=366)
+    from_date = datetime.now().date() - timedelta(days=lookback_days)
     to_date = datetime.now().date()
     
     returns_df = pd.DataFrame()
@@ -512,24 +537,37 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
     
     progress_bar = st.progress(0, text="Fetching historical data...")
     
+    # 2. Fetch Stock Historical Data
     for i, symbol in enumerate(symbols):
         hist_data = get_historical_data_cached(api_key, access_token, symbol, from_date, to_date, 'day')
         if not hist_data.empty and '_error' not in hist_data.columns:
             returns_df[symbol] = hist_data['close'].pct_change()
         else:
             failed_symbols.append(symbol)
-        progress_bar.progress((i + 1) / len(symbols), text=f"Fetching {symbol}...")
+        progress_bar.progress(0.4 * (i + 1) / len(symbols), text=f"Fetching {symbol}...")
     
     if failed_symbols:
-        st.warning(f"Failed to fetch: {', '.join(failed_symbols)}")
+        st.warning(f"Failed to fetch historical data for: {', '.join(failed_symbols)}")
     
-    returns_df.dropna(how='all', inplace=True)
-    returns_df.fillna(0, inplace=True)
+    # 3. Fetch Benchmark Data (NIFTY 50)
+    benchmark_data = get_historical_data_cached(api_key, access_token, BENCHMARK_SYMBOL, from_date, to_date, 'day')
+    if benchmark_data.empty or '_error' in benchmark_data.columns:
+        st.error(f"Failed to fetch benchmark data for {BENCHMARK_SYMBOL}.")
+        benchmark_returns = pd.Series(0, index=returns_df.index)
+        risk_free_rate = 0.04 / TRADING_DAYS_PER_YEAR # Proxy
+    else:
+        benchmark_returns = benchmark_data['close'].pct_change()
+        risk_free_rate = 0.04 / TRADING_DAYS_PER_YEAR # Daily Risk-Free Rate (e.g., 4% Annual)
+
+    # 4. Clean and Align Data
+    all_returns = pd.concat([returns_df, benchmark_returns.rename('Benchmark')], axis=1)
+    all_returns.dropna(how='all', inplace=True)
+    all_returns.fillna(0, inplace=True)
     
-    if returns_df.empty:
-        st.error("Not enough data for metrics.")
+    if all_returns.empty:
+        st.error("Not enough aligned data for metrics.")
         progress_bar.empty()
-        return None
+        return None, pd.DataFrame()
     
     successful_symbols = returns_df.columns.tolist()
     portfolio_df_success = portfolio_df.set_index('Symbol').reindex(successful_symbols).reset_index()
@@ -537,45 +575,91 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token):
     
     if total_value_success == 0:
         progress_bar.empty()
-        return None
+        return None, pd.DataFrame()
     
     weights = (portfolio_df_success['Real-time Value (Rs)'] / total_value_success).values
-    portfolio_returns = returns_df.dot(weights)
+    portfolio_returns = all_returns[successful_symbols].dot(weights).rename('Portfolio')
     
-    var_95 = portfolio_returns.quantile(0.05)
-    var_99 = portfolio_returns.quantile(0.01)
-    cvar_95 = portfolio_returns[portfolio_returns <= var_95].mean()
+    # Align portfolio returns with benchmark returns
+    combined_returns = pd.concat([portfolio_returns, all_returns['Benchmark']], axis=1).dropna()
     
-    portfolio_vol = portfolio_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+    # 5. Calculate Metrics
     
+    # A. Value at Risk (VaR) & CVaR (Historical Method)
+    var_95 = combined_returns['Portfolio'].quantile(0.05)
+    var_99 = combined_returns['Portfolio'].quantile(0.01)
+    cvar_95 = combined_returns['Portfolio'][combined_returns['Portfolio'] <= var_95].mean()
+    
+    # B. Portfolio Volatility (Annualized Standard Deviation)
+    portfolio_vol = combined_returns['Portfolio'].std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+    
+    # C. Beta (Covariance / Variance of Benchmark)
+    if combined_returns['Benchmark'].var() > 1e-6: # Check for non-zero variance
+        beta = combined_returns['Portfolio'].cov(combined_returns['Benchmark']) / combined_returns['Benchmark'].var()
+    else:
+        beta = 0.0
+        
+    # D. Alpha (Jensen's Alpha) and Tracking Error
+    
+    # Annualize returns
+    annualized_portfolio_return = combined_returns['Portfolio'].mean() * TRADING_DAYS_PER_YEAR
+    annualized_benchmark_return = combined_returns['Benchmark'].mean() * TRADING_DAYS_PER_YEAR
+
+    # Calculate Alpha (Jensen's)
+    # Alpha = Rp - [Rf + Beta * (Rm - Rf)]
+    annualized_risk_free_rate = risk_free_rate * TRADING_DAYS_PER_YEAR
+    alpha = annualized_portfolio_return - (annualized_risk_free_rate + beta * (annualized_benchmark_return - annualized_risk_free_rate))
+    
+    # E. Sharpe Ratio (Annualized)
+    sharpe_ratio = (annualized_portfolio_return - annualized_risk_free_rate) / portfolio_vol if portfolio_vol > 0 else 0
+    
+    # F. Tracking Error (Annualized Standard Deviation of Active Return)
+    active_return = combined_returns['Portfolio'] - combined_returns['Benchmark']
+    tracking_error = active_return.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+    
+    # G. Information Ratio (Alpha / Tracking Error)
+    information_ratio = alpha / tracking_error if tracking_error > 1e-6 else 0
+    
+    # H. Sortino Ratio (Measures return against downside risk)
+    downside_returns = combined_returns['Portfolio'][combined_returns['Portfolio'] < 0]
+    downside_volatility = downside_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) if not downside_returns.empty else 0
+    sortino_ratio = (annualized_portfolio_return - annualized_risk_free_rate) / downside_volatility if downside_volatility > 0 else 0
+    
+    # I. Stock-level correlation and diversification
+    corr_matrix = returns_df.corr()
+    avg_correlation = corr_matrix.mean().mean() # Mean of all correlation coefficients
+
+    # Diversification Ratio (DR = Sum(W*Vol) / Portfolio Vol)
+    stock_vols_annual = returns_df.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+    weighted_stock_vols = (stock_vols_annual.reindex(successful_symbols) * weights).sum()
+    diversification_ratio = weighted_stock_vols / portfolio_vol if portfolio_vol > 0 else 0
+    
+    progress_bar.progress(1.0, text="Metrics calculated.")
     progress_bar.empty()
     
-    return {
+    metrics = {
+        "annualized_return": annualized_portfolio_return,
+        "portfolio_volatility": portfolio_vol,
+        "sharpe_ratio": sharpe_ratio,
         "var_95": var_95,
         "var_99": var_99,
         "cvar_95": cvar_95,
-        "portfolio_volatility": portfolio_vol,
-        "beta": None,
-        "alpha": None,
-        "tracking_error": None,
-        "information_ratio": None,
-        "sortino_ratio": None,
-        "avg_correlation": None,
-        "diversification_ratio": None
+        "beta": beta,
+        "alpha": alpha,
+        "tracking_error": tracking_error,
+        "information_ratio": information_ratio,
+        "sortino_ratio": sortino_ratio,
+        "avg_correlation": avg_correlation,
+        "diversification_ratio": diversification_ratio
     }
+    
+    # Store the daily returns data for visualization later
+    return metrics, combined_returns.reset_index()
 
 # --- Stress Testing Functions (using local implementation) ---
 def run_stress_test(original_df, scenario_type, params):
     """
     Applies a stress scenario to a portfolio DataFrame.
-
-    Args:
-        original_df (pd.DataFrame): The original portfolio data.
-        scenario_type (str): The type of scenario ('Market Crash', etc.).
-        params (dict): Parameters for the scenario.
-
-    Returns:
-        tuple: A tuple containing the stressed DataFrame and a summary dictionary.
     """
     stressed_df = original_df.copy()
     original_total_value = stressed_df['Real-time Value (Rs)'].sum()
@@ -617,7 +701,7 @@ def run_stress_test(original_df, scenario_type, params):
     
     return stressed_df, summary
 
-# --- AI Analysis Functions ---
+# --- AI Analysis Functions (kept for context, unchanged) ---
 def extract_text_from_files(uploaded_files):
     full_text = ""
     for file in uploaded_files:
@@ -736,6 +820,9 @@ def render_portfolio_card(portfolio):
                     
                     if loaded.get('advanced_metrics'):
                         st.session_state["advanced_metrics"] = loaded['advanced_metrics']
+                    
+                    if loaded.get('risk_returns_df'):
+                        st.session_state["risk_returns_df"] = loaded['risk_returns_df']
                     
                     if loaded.get('ai_analysis'):
                         st.session_state["ai_analysis_response"] = loaded['ai_analysis']
@@ -1014,7 +1101,10 @@ with st.sidebar:
                         
                         if loaded.get('advanced_metrics'):
                             st.session_state["advanced_metrics"] = loaded['advanced_metrics']
-                        
+                            
+                        if loaded.get('risk_returns_df') is not None and not loaded['risk_returns_df'].empty:
+                            st.session_state["risk_returns_df"] = loaded['risk_returns_df']
+                            
                         if loaded.get('ai_analysis'):
                             st.session_state["ai_analysis_response"] = loaded['ai_analysis']
                         
@@ -1045,8 +1135,8 @@ k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state[
 api_key = KITE_CREDENTIALS["api_key"]
 access_token = st.session_state["kite_access_token"]
 
-# Added a new tab: "🔧 API Interactions"
-tabs = st.tabs(["💼 Portfolio Analysis", "🤖 AI Analysis", "⚡ Stress Testing & Audit", "🔧 API Interactions", "📚 History"])
+# Rename Tab 3 to "Risk & Analysis"
+tabs = st.tabs(["💼 Portfolio Analysis", "🤖 AI Analysis", "📈 Risk & Analysis", "🔧 API Interactions", "📚 History"])
 
 
 # --- TAB 1: Enhanced Compliance Analysis ---
@@ -1076,6 +1166,8 @@ with tabs[0]:
                 st.session_state["compliance_results"] = []
                 st.session_state["breach_alerts"] = []
                 st.session_state["ai_analysis_response"] = None
+                st.session_state["advanced_metrics"] = None
+                st.session_state["risk_returns_df"] = pd.DataFrame()
                 # Clear stress test state
                 st.session_state["stress_summary"] = None
                 st.session_state["stressed_df"] = None
@@ -1309,8 +1401,8 @@ HHI < 800""")
                             'compliance_results': compliance_results,
                             'security_compliance': security_compliance.to_json(),
                             'breach_alerts': breaches,
-                            'advanced_metrics': None,
-                            'ai_analysis': None
+                            'advanced_metrics': st.session_state.get("advanced_metrics"), # Preserve if already calculated
+                            'ai_analysis': st.session_state.get("ai_analysis_response") # Preserve if already calculated
                         }
                         
                         save_compliance_analysis(st.session_state["user_id"], portfolio_id, compliance_data)
@@ -1342,10 +1434,10 @@ HHI < 800""")
         else:
             st.success("✅ **No compliance breaches detected!**")
         
+        # Removed the 'Metrics' tab content as it's moving to 'Risk & Analysis'
         analysis_tabs = st.tabs([
             "📊 Dashboard",
             "🔍 Details",
-            "📈 Metrics",
             "⚖️ Rules",
             "🔐 Security",
             "📊 Concentration",
@@ -1390,38 +1482,8 @@ HHI < 800""")
                 'Quantity': '{:,.0f}'
             }), use_container_width=True, height=500)
         
+        # Note: analysis_tabs[2] is now 'Rules'
         with analysis_tabs[2]:
-            st.subheader("Advanced Risk Metrics")
-            
-            if st.button("🔄 Calculate Metrics", type="primary", use_container_width=True):
-                with st.spinner("Calculating advanced metrics..."):
-                    metrics = calculate_advanced_metrics(results_df, api_key, access_token)
-                    st.session_state.advanced_metrics = metrics
-                    
-                    if metrics and st.session_state.get("current_portfolio_id"):
-                        compliance_data = {
-                            'threshold_configs': st.session_state["threshold_configs"],
-                            'custom_rules': st.session_state.get("current_rules_text", ""),
-                            'compliance_results': st.session_state.get("compliance_results", []),
-                            'security_compliance': st.session_state.get("security_level_compliance", pd.DataFrame()).to_json(),
-                            'breach_alerts': st.session_state.get("breach_alerts", []),
-                            'advanced_metrics': metrics,
-                            'ai_analysis': st.session_state.get("ai_analysis_response")
-                        }
-                        save_compliance_analysis(st.session_state["user_id"], st.session_state["current_portfolio_id"], compliance_data)
-                        st.success("✅ Metrics calculated and saved!")
-            
-            if st.session_state.get("advanced_metrics"):
-                metrics = st.session_state.advanced_metrics
-                
-                st.markdown("### Risk Metrics")
-                risk_cols = st.columns(4)
-                risk_cols[0].metric("VaR (95%)", f"{metrics['var_95'] * 100:.2f}%")
-                risk_cols[1].metric("VaR (99%)", f"{metrics['var_99'] * 100:.2f}%")
-                risk_cols[2].metric("CVaR (95%)", f"{metrics['cvar_95'] * 100:.2f}%")
-                risk_cols[3].metric("Volatility", f"{metrics['portfolio_volatility'] * 100:.2f}%" if metrics['portfolio_volatility'] else "N/A")
-        
-        with analysis_tabs[3]:
             st.subheader("Rule Validation Results")
             
             validation_results = st.session_state.get("compliance_results", [])
@@ -1477,7 +1539,8 @@ HHI < 800""")
             else:
                 st.info("No custom rules validated. Add rules and click Analyze.")
         
-        with analysis_tabs[4]:
+        # Note: analysis_tabs[3] is now 'Security'
+        with analysis_tabs[3]:
             st.subheader("Security-Level Compliance")
             
             security_df = st.session_state.get("security_level_compliance", pd.DataFrame())
@@ -1495,7 +1558,8 @@ HHI < 800""")
                     'Weight %': '{:.2f}%'
                 }), use_container_width=True, height=500)
         
-        with analysis_tabs[5]:
+        # Note: analysis_tabs[4] is now 'Concentration'
+        with analysis_tabs[4]:
             st.subheader("Concentration Analysis")
             
             sorted_df = results_df.sort_values('Weight %', ascending=False).reset_index(drop=True)
@@ -1542,21 +1606,28 @@ HHI < 800""")
                 # Handle potential case where sum(weights_sorted) could be 0, leading to div by zero
                 sum_weights = np.sum(weights_sorted)
                 if sum_weights > 0:
-                    gini = (2 * np.sum((np.arange(1, n+1)) * weights_sorted)) / (n * sum_weights) - (n + 1) / n
+                    # Gini formula using cumulative sums, adjusted for weighted data.
+                    # Simplified Gini approximation for discrete data: G = (1/n) * (n + 1 - 2*sum(r_i * w_i / sum(w)) )
+                    # This calculation often needs a robust library implementation; here's a standard approximation:
+                    index = np.arange(1, n + 1)
+                    relative_weights = weights_sorted / sum_weights
+                    gini = (np.sum((2 * index - n - 1) * relative_weights)) / n
+                    
             
             st.markdown("### Concentration Indices")
             index_cols = st.columns(2)
             index_cols[0].metric("HHI (Herfindahl-Hirschman)", f"{hhi:.2f}", help="Lower is more diversified. <1000 is good")
             index_cols[1].metric("Gini Coefficient", f"{gini:.4f}", help="0=perfect equality, 1=maximum inequality")
         
-        with analysis_tabs[6]:
+        # Note: analysis_tabs[5] is now 'Report'
+        with analysis_tabs[5]:
             st.subheader("Export Report")
             
             if st.button("📊 Generate Excel Report", type="primary", use_container_width=True):
                 from io import BytesIO
                 output = BytesIO()
                 
-                with pd.ExcelWriter(output, engine='openyxl') as writer:
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     # Holdings sheet
                     results_df.to_excel(writer, sheet_name='Holdings', index=False)
                     
@@ -1581,6 +1652,12 @@ HHI < 800""")
                         breach_df = pd.DataFrame(st.session_state["breach_alerts"])
                         breach_df.to_excel(writer, sheet_name='Breaches', index=False)
                     
+                    # Advanced Metrics (if available)
+                    if st.session_state.get("advanced_metrics"):
+                        metrics_df = pd.DataFrame([st.session_state["advanced_metrics"]]).T
+                        metrics_df.columns = ['Value']
+                        metrics_df.to_excel(writer, sheet_name='Advanced Metrics')
+                    
                     # Threshold configs
                     config_df = pd.DataFrame([st.session_state["threshold_configs"]]).T
                     config_df.columns = ['Value']
@@ -1596,7 +1673,7 @@ HHI < 800""")
                 )
 
 
-# --- TAB 2: Enhanced AI Analysis ---
+# --- TAB 2: Enhanced AI Analysis (unchanged) ---
 with tabs[1]:
     st.header("🤖 AI-Powered Compliance Analysis")
     
@@ -1927,6 +2004,7 @@ Data limitations and assumptions made
                             'security_compliance': st.session_state.get("security_level_compliance", pd.DataFrame()).to_json(),
                             'breach_alerts': st.session_state.get("breach_alerts", []),
                             'advanced_metrics': st.session_state.get("advanced_metrics"),
+                            'risk_returns_df': st.session_state.get("risk_returns_df", pd.DataFrame()).to_json(),
                             'ai_analysis': response.text
                         }
                         
@@ -1984,47 +2062,141 @@ Data limitations and assumptions made
                 st.session_state.ai_analysis_response = None
                 st.rerun()
 
-# --- TAB 3: Stress Testing & Audit (local implementation) ---
+# --- TAB 3: Risk & Analysis (Enhanced) ---
 with tabs[2]:
-    st.header("⚡ Portfolio Stress Testing & Audit")
+    st.header("📈 Risk & Analysis")
 
+    portfolio_df = st.session_state.get("compliance_results_df")
+    
     if 'compliance_results_df' not in st.session_state or st.session_state.compliance_results_df.empty:
         st.warning("⚠️ Please upload and analyze a portfolio in the 'Portfolio Analysis' tab first.")
-    else:
-        df = st.session_state.compliance_results_df
-        st.info(f"Running tests on: **{st.session_state.get('current_portfolio_name', 'Unnamed Portfolio')}**")
-        st.markdown("---")
+        st.stop()
+    
+    if not k:
+        st.warning("⚠️ Connect to Kite for real-time risk data.")
+        st.stop()
+        
+    st.info(f"Analyzing: **{st.session_state.get('current_portfolio_name', 'Unnamed Portfolio')}**")
+    
+    
+    risk_tab1, risk_tab2, risk_tab3 = st.tabs(["Advanced Metrics", "Stress Testing", "Security Risk Breakdown"])
 
-        st.subheader("1. Define Stress Scenario")
+    # --- Risk Tab 1: Advanced Metrics ---
+    with risk_tab1:
+        st.subheader("Advanced Portfolio Risk Metrics")
+        
+        col_calc, col_period = st.columns([1, 1])
+        with col_period:
+            lookback = st.slider("Lookback Period (Days)", 90, 730, 366)
+            
+        with col_calc:
+            if st.button("🔄 Calculate/Recalculate Advanced Metrics", type="primary", use_container_width=True):
+                with st.spinner(f"Calculating advanced metrics using {lookback} days of history..."):
+                    metrics, returns_df = calculate_advanced_metrics(portfolio_df, api_key, access_token, lookback)
+                    st.session_state.advanced_metrics = metrics
+                    st.session_state.risk_returns_df = returns_df
+                    
+                    if metrics and st.session_state.get("current_portfolio_id"):
+                        # Save metrics and returns data (returns as JSON string)
+                        compliance_data = {
+                            'threshold_configs': st.session_state["threshold_configs"],
+                            'custom_rules': st.session_state.get("current_rules_text", ""),
+                            'compliance_results': st.session_state.get("compliance_results", []),
+                            'security_compliance': st.session_state.get("security_level_compliance", pd.DataFrame()).to_json(),
+                            'breach_alerts': st.session_state.get("breach_alerts", []),
+                            'advanced_metrics': metrics,
+                            'risk_returns_df': returns_df.to_json(date_format='iso'),
+                            'ai_analysis': st.session_state.get("ai_analysis_response")
+                        }
+                        
+                        save_compliance_analysis(st.session_state["user_id"], st.session_state["current_portfolio_id"], compliance_data)
+                        st.success("✅ Metrics calculated and saved!")
+
+        
+        metrics = st.session_state.get("advanced_metrics")
+        returns_df = st.session_state.get("risk_returns_df", pd.DataFrame())
+
+        if metrics:
+            st.markdown("---")
+            st.markdown("### Return & Risk Adjusted Performance")
+            
+            perf_cols = st.columns(4)
+            perf_cols[0].metric("Annualized Return", f"{metrics['annualized_return'] * 100:.2f}%")
+            perf_cols[1].metric("Portfolio Volatility", f"{metrics['portfolio_volatility'] * 100:.2f}%")
+            perf_cols[2].metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
+            perf_cols[3].metric("Sortino Ratio", f"{metrics['sortino_ratio']:.2f}")
+            
+            st.markdown("### Relative Risk Metrics (vs NIFTY 50)")
+            relative_cols = st.columns(4)
+            relative_cols[0].metric("Beta", f"{metrics['beta']:.2f}")
+            relative_cols[1].metric("Jensen's Alpha", f"{metrics['alpha'] * 100:.2f}%")
+            relative_cols[2].metric("Tracking Error", f"{metrics['tracking_error'] * 100:.2f}%")
+            relative_cols[3].metric("Information Ratio", f"{metrics['information_ratio']:.2f}")
+
+            st.markdown("### Concentration & Downside Risk")
+            risk_cols = st.columns(4)
+            risk_cols[0].metric("Diversification Ratio", f"{metrics['diversification_ratio']:.2f}")
+            risk_cols[1].metric("Avg Correlation", f"{metrics['avg_correlation']:.2f}")
+            risk_cols[2].metric("VaR (95%) Daily", f"{metrics['var_95'] * 100:.2f}%")
+            risk_cols[3].metric("CVaR (95%) Daily", f"{metrics['cvar_95'] * 100:.2f}%")
+            
+            if not returns_df.empty:
+                st.markdown("---")
+                st.subheader("Performance Visualization")
+                
+                # Cumulative Return Plot
+                cumulative_returns = (1 + returns_df[['Portfolio', 'Benchmark']]).cumprod() - 1
+                cumulative_returns = cumulative_returns * 100 # Display as percentage
+                
+                fig_cum = px.line(cumulative_returns, x=cumulative_returns.index, y=['Portfolio', 'Benchmark'],
+                                  title="Cumulative Returns (%) vs Benchmark",
+                                  labels={'value': 'Cumulative Return (%)', 'date': 'Date', 'variable': 'Index'})
+                fig_cum.update_layout(legend_title_text="Index")
+                st.plotly_chart(fig_cum, use_container_width=True)
+                
+                # Active Risk Plot (Tracking Error visualization)
+                returns_df['Active Return'] = returns_df['Portfolio'] - returns_df['Benchmark']
+                
+                fig_active = px.area(returns_df, x='date', y='Active Return',
+                                     title='Daily Active Return (Tracking Error)',
+                                     labels={'Active Return': 'Daily Active Return', 'date': 'Date'})
+                st.plotly_chart(fig_active, use_container_width=True)
+        else:
+            st.info("Click 'Calculate/Recalculate Advanced Metrics' to generate portfolio risk data.")
+            
+
+    # --- Risk Tab 2: Stress Testing ---
+    with risk_tab2:
+        st.subheader("Stress Testing and Scenario Modeling")
+
         col1, col2 = st.columns([1, 2])
         with col1:
             scenario_type = st.selectbox(
                 "Select a Stress Scenario",
                 ["Market Crash", "Sector Shock", "Single Stock Failure"],
-                key="stress_scenario_type"
+                key="stress_scenario_type_risk"
             )
         
         params = {}
         with col2:
             if scenario_type == "Market Crash":
-                params['percentage'] = st.slider("Market-wide Drop (%)", 5, 50, 20, help="Simulates a uniform drop across all portfolio holdings.")
+                params['percentage'] = st.slider("Market-wide Drop (%)", 5, 50, 20, key="scen_pct_market")
             elif scenario_type == "Sector Shock":
-                all_sectors = sorted(df['Industry'].unique().tolist())
-                params['sector'] = st.selectbox("Select Sector to Shock", all_sectors)
-                params['percentage'] = st.slider(f"Drop in {params['sector']} Sector (%)", 5, 75, 25)
+                all_sectors = sorted(portfolio_df['Industry'].unique().tolist())
+                params['sector'] = st.selectbox("Select Sector to Shock", all_sectors, key="scen_sector")
+                params['percentage'] = st.slider(f"Drop in {params['sector']} Sector (%)", 5, 75, 25, key="scen_pct_sector")
             elif scenario_type == "Single Stock Failure":
-                all_stocks = sorted(df['Symbol'].unique().tolist())
-                params['symbol'] = st.selectbox("Select Stock to Shock", all_stocks, help="Simulate an adverse event for a single company.")
-                params['percentage'] = st.slider(f"Drop in {params['symbol']} (%)", 10, 90, 50)
+                all_stocks = sorted(portfolio_df['Symbol'].unique().tolist())
+                params['symbol'] = st.selectbox("Select Stock to Shock", all_stocks, key="scen_symbol")
+                params['percentage'] = st.slider(f"Drop in {params['symbol']} (%)", 10, 90, 50, key="scen_pct_stock")
 
-        if st.button("🔬 Run Stress Test", use_container_width=True, type="primary"):
+        if st.button("🔬 Run Stress Test", use_container_width=True, type="primary", key="run_stress_risk"):
             with st.spinner("Simulating scenario and auditing compliance..."):
-                stressed_df, summary = run_stress_test(df, scenario_type, params)
+                stressed_df, summary = run_stress_test(portfolio_df, scenario_type, params)
                 st.session_state['stressed_df'] = stressed_df
                 st.session_state['stress_summary'] = summary
                 
                 # Re-run compliance audit on the stressed data using the API
-                # The API's compliance check assumes a 'Weight %' column which we create temporarily.
                 stressed_df_for_api = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'}).copy()
                 
                 stressed_compliance_results = call_compliance_api_run_check(
@@ -2035,16 +2207,15 @@ with tabs[2]:
                 
                 st.session_state['stressed_compliance_results'] = stressed_compliance_results
                 st.success("Stress test simulation complete.")
-
-        # --- Display Stress Test Results ---
+        
+        
         if 'stress_summary' in st.session_state and st.session_state['stress_summary'] is not None:
             st.markdown("---")
-            st.subheader("2. Stress Test Results")
+            st.subheader("Stress Test Results: Impact Summary")
             
             summary = st.session_state['stress_summary']
             stressed_df = st.session_state['stressed_df']
             
-            st.markdown("#### Impact Summary")
             kpi_cols = st.columns(4)
             kpi_cols[0].metric("Original Value", f"₹ {summary['original_value']:,.0f}")
             kpi_cols[1].metric("Stressed Value", f"₹ {summary['stressed_value']:,.0f}")
@@ -2071,7 +2242,6 @@ with tabs[2]:
                 st.error(f"🚨 **{len(new_breaches)} Compliance Breaches Triggered Under Stress!**")
                 breach_data = []
                 for breach in new_breaches:
-                    # Re-calculate severity based on our logic for display consistency
                     severity = "🟡 Medium" 
                     if abs(breach.get('breach_amount', 0)) > breach.get('threshold', 0) * 0.2:
                         severity = "🔴 Critical"
@@ -2080,41 +2250,89 @@ with tabs[2]:
 
                     breach_data.append({
                         "Rule": breach['rule'],
-                        "Severity": severity, # Use calculated severity for display
+                        "Severity": severity,
                         "Details": breach['details']
                     })
                 st.dataframe(pd.DataFrame(breach_data), use_container_width=True, hide_index=True)
             
             st.markdown("#### Detailed Portfolio Impact")
-            display_df = stressed_df[[
-                'Symbol', 'Name', 'Industry', 'Weight %', 'Stressed Weight %', 
-                'Real-time Value (Rs)', 'Stressed Value (Rs)'
-            ]].copy()
-            display_df['Value Change (Rs)'] = display_df['Stressed Value (Rs)'] - display_df['Real-time Value (Rs)']
-            display_df['Weight Change (%)'] = display_df['Stressed Weight %'] - display_df['Weight %']
             
-            st.dataframe(display_df[[
-                'Symbol', 'Name', 'Weight %', 'Stressed Weight %', 'Weight Change (%)',
-                'Real-time Value (Rs)', 'Stressed Value (Rs)', 'Value Change (Rs)'
-            ]].style.format({
-                'Weight %': '{:.2f}%',
-                'Stressed Weight %': '{:.2f}%',
-                'Weight Change (%)': '{:+.2f}%',
-                'Real-time Value (Rs)': '₹{:,.0f}',
-                'Stressed Value (Rs)': '₹{:,.0f}',
+            # Show top 5 losers
+            display_df = stressed_df.copy()
+            display_df['Value Change (Rs)'] = display_df['Stressed Value (Rs)'] - display_df['Real-time Value (Rs)']
+            top_5_losers = display_df.sort_values('Value Change (Rs)').head(5)[['Symbol', 'Value Change (Rs)', 'Weight %', 'Stressed Weight %']]
+            
+            st.dataframe(top_5_losers.style.format({
                 'Value Change (Rs)': '₹{:,.0f}',
+                'Weight %': '{:.2f}%',
+                'Stressed Weight %': '{:.2f}%'
             }), use_container_width=True)
 
-            st.markdown("#### Visual Impact Analysis")
-            top_15_losers = display_df.sort_values('Value Change (Rs)').head(15)
-            fig = px.bar(top_15_losers, x='Symbol', y='Value Change (Rs)', 
-                         title='Top 15 Holdings by Value Lost',
-                         labels={'Value Change (Rs)': 'Loss in Value (Rs)', 'Symbol': 'Stock Symbol'},
-                         hover_name='Name')
-            fig.update_layout(yaxis_title="Loss in Value (Rs)", xaxis_title="Stock Symbol")
-            st.plotly_chart(fig, use_container_width=True)
+    # --- Risk Tab 3: Security Risk Breakdown ---
+    with risk_tab3:
+        st.subheader("Security-Level Risk Contribution")
+        
+        # Security Contribution Analysis
+        if metrics and not portfolio_df.empty and returns_df is not None and not returns_df.empty:
+            
+            st.info("Requires the 'Advanced Metrics' calculation to be run first.")
+            
+            risk_contribution_df = portfolio_df[['Symbol', 'Name', 'Weight %', 'Industry']].copy()
+            
+            # Calculate Beta for each security (requires individual returns)
+            stock_returns_df = returns_df.drop(columns=['Portfolio', 'Active Return']).set_index('date')
+            benchmark_returns = stock_returns_df['Benchmark']
+            stock_returns_df.drop(columns=['Benchmark'], inplace=True)
+            
+            security_betas = {}
+            security_volatility = {}
+            
+            for symbol in stock_returns_df.columns:
+                if stock_returns_df[symbol].var() > 1e-6 and benchmark_returns.var() > 1e-6:
+                     # Calculate security beta
+                    beta_val = stock_returns_df[symbol].cov(benchmark_returns) / benchmark_returns.var()
+                    security_betas[symbol] = beta_val
+                else:
+                    security_betas[symbol] = 0.0
+                
+                # Calculate security volatility
+                security_volatility[symbol] = stock_returns_df[symbol].std() * np.sqrt(TRADING_DAYS_PER_YEAR)
+            
+            risk_contribution_df['Beta'] = risk_contribution_df['Symbol'].map(security_betas).fillna(0)
+            risk_contribution_df['Annualized Volatility'] = risk_contribution_df['Symbol'].map(security_volatility).fillna(0) * 100 # as %
+            
+            # Risk Contribution: w * Beta (Simple approximation) or Marginal VaR (more complex)
+            # Simple contribution to portfolio beta: w * beta_i
+            risk_contribution_df['Beta Contribution'] = (risk_contribution_df['Weight %'] / 100) * risk_contribution_df['Beta']
+            
+            st.markdown("#### Top Risk Contributors (by Beta)")
+            top_beta = risk_contribution_df.nlargest(10, 'Beta Contribution')
+            
+            st.dataframe(top_beta[['Name', 'Symbol', 'Weight %', 'Beta', 'Annualized Volatility', 'Beta Contribution']].style.format({
+                'Weight %': '{:.2f}%',
+                'Beta': '{:.2f}',
+                'Annualized Volatility': '{:.2f}%',
+                'Beta Contribution': '{:.2f}'
+            }), use_container_width=True)
 
-# --- NEW: TAB 4: API Interactions ---
+            # Security vs Benchmark Comparison Plot (Beta vs Weight)
+            fig_risk = px.scatter(
+                risk_contribution_df,
+                x='Weight %',
+                y='Beta',
+                size='Annualized Volatility',
+                color='Industry',
+                hover_data=['Name', 'Beta Contribution'],
+                title='Security Risk Profile: Weight vs Beta'
+            )
+            fig_risk.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="Benchmark Beta=1.0")
+            st.plotly_chart(fig_risk, use_container_width=True)
+
+        else:
+            st.info("Calculate 'Advanced Metrics' first to see security risk breakdown.")
+
+
+# --- TAB 4: API Interactions (unchanged) ---
 with tabs[3]:
     st.header("🔧 Compliance API Interactions")
     st.markdown("Interact directly with the compliance backend API for various simulation and suggestion tasks.")
@@ -2134,11 +2352,8 @@ with tabs[3]:
     st.caption("The portfolio data, rules, and thresholds from the 'Portfolio Analysis' tab are automatically used.")
 
     # Convert current_portfolio_df to a JSON-serializable list of dicts for the API calls
-    # Ensure 'Symbol', 'Name', 'Quantity', 'LTP', 'Industry' are present and in correct format.
-    # The API's _recalculate_weights function will handle value and weight % if LTP/Quantity are given.
     portfolio_for_api = current_portfolio_df[['Symbol', 'Name', 'Quantity', 'LTP', 'Industry']].copy()
-    portfolio_for_api.fillna({'Industry': 'UNKNOWN'}, inplace=True) # API might expect string for Industry
-    # Ensure numeric types are native Python types if `to_dict('records')` doesn't handle them perfectly
+    portfolio_for_api.fillna({'Industry': 'UNKNOWN'}, inplace=True) 
     portfolio_for_api['Quantity'] = portfolio_for_api['Quantity'].astype(float)
     portfolio_for_api['LTP'] = portfolio_for_api['LTP'].astype(float)
 
@@ -2264,7 +2479,6 @@ with tabs[3]:
                 st.error("No current portfolio loaded to check allocation against. Please load a portfolio first.")
             else:
                 # For demonstration, we'll simulate the entire block trade being allocated to the *current* portfolio
-                # A real system would have multiple portfolios to allocate against.
                 allocation_payload = {
                     "portfolios": [
                         {
@@ -2300,8 +2514,8 @@ with tabs[3]:
                         st.error("Failed to check block trade allocation.")
 
 
-# --- Original TAB 4: History ---
-with tabs[4]: # This is now the fifth tab
+# --- TAB 5: History (unchanged) ---
+with tabs[4]:
     st.header("📚 Portfolio History")
     
     col1, col2 = st.columns([3, 1])
