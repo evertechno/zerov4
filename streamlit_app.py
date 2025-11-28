@@ -44,8 +44,8 @@ st.set_page_config(page_title="Invsion Connect", layout="wide", initial_sidebar_
 # --- Global Constants ---
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_EXCHANGE = "NSE"
-BENCHMARK_SYMBOL = "NIFTY 50"
-COMPLIANCE_API_BASE_URL = "https://zeroapiv4.onrender.com/api/v1" # Adjusted API base URL
+BENCHMARK_NIFTY_SYMBOL = "NIFTY 50" # Use a specific constant for the default benchmark
+COMPLIANCE_API_BASE_URL = "https://zeroapiv4.onrender.com/api/v1" 
 
 # --- Standard Advanced Metrics Structure ---
 DEFAULT_ADVANCED_METRICS = {
@@ -96,6 +96,7 @@ if "stressed_df" not in st.session_state: st.session_state["stressed_df"] = None
 if "stressed_compliance_results" not in st.session_state: st.session_state["stressed_compliance_results"] = None
 if "risk_returns_df" not in st.session_state: st.session_state["risk_returns_df"] = pd.DataFrame()
 if "benchmark_returns" not in st.session_state: st.session_state["benchmark_returns"] = pd.Series()
+if "current_benchmark_symbol" not in st.session_state: st.session_state["current_benchmark_symbol"] = BENCHMARK_NIFTY_SYMBOL
 
 
 if "threshold_configs" not in st.session_state: 
@@ -330,6 +331,9 @@ def save_compliance_analysis(user_id: str, portfolio_id: str, compliance_data: d
         if compliance_data.get('risk_returns_df') is not None:
             # Store DataFrame as JSON string
             current_metadata['risk_returns_df'] = compliance_data['risk_returns_df']
+            
+        if compliance_data.get('benchmark_symbol'):
+            current_metadata['benchmark_symbol'] = compliance_data['benchmark_symbol']
         
         portfolio_metadata_update = {'metadata': current_metadata}
         supabase.table('portfolios').update(portfolio_metadata_update).eq('id', portfolio_id).execute()
@@ -376,6 +380,7 @@ def load_portfolio_full(portfolio_id: str):
         # Extract advanced_metrics and risk_returns_df from portfolio metadata if available
         advanced_metrics = DEFAULT_ADVANCED_METRICS.copy()
         risk_returns_df = pd.DataFrame()
+        benchmark_symbol = BENCHMARK_NIFTY_SYMBOL
         
         metadata = portfolio.get('metadata', {})
         if isinstance(metadata, str): # Handle case where metadata might be stored as a string
@@ -394,8 +399,10 @@ def load_portfolio_full(portfolio_id: str):
                     # Risk returns is stored as JSON string
                     risk_returns_df = pd.read_json(metadata['risk_returns_df'])
                 except Exception as e:
-                    # st.warning(f"Failed to load risk_returns_df: {e}")
                     pass
+            
+            if metadata.get('benchmark_symbol'):
+                benchmark_symbol = metadata['benchmark_symbol']
         
         # Combine data
         combined = {
@@ -413,7 +420,8 @@ def load_portfolio_full(portfolio_id: str):
             'risk_returns_df': risk_returns_df, # Add loaded returns data
             'ai_analysis': analysis_result.data[0].get('ai_analysis') if analysis_result.data else None,
             'kim_document': kim_result.data[0] if kim_result.data else None,
-            'metadata': portfolio.get('metadata', {})
+            'metadata': portfolio.get('metadata', {}),
+            'benchmark_symbol': benchmark_symbol # Load benchmark symbol
         }
         
         return combined
@@ -477,15 +485,15 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
         instruments = k.instruments(exchange)
         df_inst = pd.DataFrame(instruments)
         
-        # Handle NIFTY 50 benchmark
-        if symbol.upper() == BENCHMARK_SYMBOL.upper():
-            # Find the index instrument (usually listed under exchange 'NSE')
+        # Special handling for NIFTY 50 (often listed as 'NIFTY' under 'NSE')
+        if symbol.upper() == BENCHMARK_NIFTY_SYMBOL.upper():
             token_row = df_inst[(df_inst['exchange'] == 'NSE') & (df_inst['tradingsymbol'] == 'NIFTY')]
         else:
+            # Try matching other symbols (e.g., specific stock or index symbol)
             token_row = df_inst[(df_inst['exchange'] == exchange.upper()) & (df_inst['tradingsymbol'] == symbol.upper())]
         
         if token_row.empty:
-            return pd.DataFrame({"_error": [f"Token not found for {symbol}"]})
+            return pd.DataFrame({"_error": [f"Token not found for {symbol} on {exchange}"]})
         
         token = int(token_row.iloc[0]['instrument_token'])
         
@@ -582,7 +590,7 @@ def calculate_security_level_compliance(portfolio_df: pd.DataFrame, threshold_co
     
     return security_compliance
 
-def calculate_advanced_metrics(portfolio_df, api_key, access_token, lookback_days=366):
+def calculate_advanced_metrics(portfolio_df, api_key, access_token, lookback_days, benchmark_symbol):
     """Calculate portfolio risk metrics including Beta, Alpha, and Sharpe"""
     
     # Initialize metrics to default structure in case of failure
@@ -609,12 +617,15 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token, lookback_day
         progress_bar.progress(int(0.4 * (i + 1) / len(symbols) * 100), text=f"Fetching {symbol}...")
     
     if failed_symbols:
-        st.warning(f"Failed to fetch historical data for: {', '.join(failed_symbols)}")
+        st.warning(f"Failed to fetch historical data for: {len(failed_symbols)} symbols.")
     
-    # 3. Fetch Benchmark Data (NIFTY 50)
-    benchmark_data = get_historical_data_cached(api_key, access_token, BENCHMARK_SYMBOL, from_date, to_date, 'day')
+    # 3. Fetch Benchmark Data
+    progress_bar.progress(40, text=f"Fetching benchmark data ({benchmark_symbol})...")
+    benchmark_data = get_historical_data_cached(api_key, access_token, benchmark_symbol, from_date, to_date, 'day')
+    
     if benchmark_data.empty or '_error' in benchmark_data.columns:
-        st.error(f"Failed to fetch benchmark data for {BENCHMARK_SYMBOL}. Using zero returns for benchmark.")
+        error_msg = benchmark_data.iloc[0]['_error'] if '_error' in benchmark_data.columns else "Unknown error."
+        st.error(f"Failed to fetch benchmark data for {benchmark_symbol}. {error_msg}. Using zero returns for benchmark.")
         benchmark_returns = pd.Series(0, index=returns_df.index)
         risk_free_rate = 0.04 / TRADING_DAYS_PER_YEAR # Proxy
     else:
@@ -647,9 +658,9 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token, lookback_day
     combined_returns = pd.concat([portfolio_returns, all_returns['Benchmark']], axis=1).dropna()
     
     # Final check before calculation
-    if combined_returns.empty:
+    if combined_returns.empty or 'Portfolio' not in combined_returns.columns or 'Benchmark' not in combined_returns.columns:
         progress_bar.empty()
-        st.error("Combined returns DataFrame is empty after alignment.")
+        st.error("Combined returns DataFrame is empty or missing required columns after alignment.")
         return metrics, combined_returns
 
     # 5. Calculate Metrics
@@ -913,6 +924,9 @@ def render_portfolio_card(portfolio):
                         st.session_state["risk_returns_df"] = loaded['risk_returns_df']
                     else:
                         st.session_state["risk_returns_df"] = pd.DataFrame()
+                        
+                    # Load benchmark symbol
+                    st.session_state["current_benchmark_symbol"] = loaded.get('benchmark_symbol', BENCHMARK_NIFTY_SYMBOL)
                             
                     if loaded.get('ai_analysis'):
                         st.session_state["ai_analysis_response"] = loaded['ai_analysis']
@@ -998,7 +1012,7 @@ def render_threshold_config():
     st.subheader("⚙️ Compliance Thresholds")
     
     # Ensure all keys exist before accessing
-    for key in DEFAULT_ADVANCED_METRICS.keys():
+    for key in st.session_state["threshold_configs"].keys():
         if key not in st.session_state["threshold_configs"]:
             st.session_state["threshold_configs"][key] = DEFAULT_ADVANCED_METRICS[key]
             
@@ -1203,6 +1217,9 @@ with st.sidebar:
                             st.session_state["risk_returns_df"] = loaded['risk_returns_df']
                         else:
                             st.session_state["risk_returns_df"] = pd.DataFrame()
+
+                        # Load benchmark symbol
+                        st.session_state["current_benchmark_symbol"] = loaded.get('benchmark_symbol', BENCHMARK_NIFTY_SYMBOL)
                             
                         if loaded.get('ai_analysis'):
                             st.session_state["ai_analysis_response"] = loaded['ai_analysis']
@@ -1268,6 +1285,7 @@ with tabs[0]:
                 st.session_state["ai_analysis_response"] = None
                 st.session_state["advanced_metrics"] = DEFAULT_ADVANCED_METRICS.copy()
                 st.session_state["risk_returns_df"] = pd.DataFrame()
+                st.session_state["current_benchmark_symbol"] = BENCHMARK_NIFTY_SYMBOL
                 # Clear stress test state
                 st.session_state["stress_summary"] = None
                 st.session_state["stressed_df"] = None
@@ -1370,7 +1388,7 @@ HHI < 800""")
                         'quantity': 'Quantity',
                         'name_of_the_instrument': 'Name',
                         'market_fair_value(rs_in_lacs)': 'Uploaded Value (Lacs)',
-                        'isin': 'ISIN' # Added ISIN for completeness
+                        'isin': 'ISIN' 
                     }
                     df = df.rename(columns=header_map)
                     
@@ -1523,7 +1541,8 @@ HHI < 800""")
                             'security_compliance': security_compliance.to_json(date_format='iso'),
                             'breach_alerts': breaches,
                             'advanced_metrics': st.session_state.get("advanced_metrics", DEFAULT_ADVANCED_METRICS.copy()),
-                            'risk_returns_df': st.session_state.get("risk_returns_df", pd.DataFrame()).to_json(date_format='iso')
+                            'risk_returns_df': st.session_state.get("risk_returns_df", pd.DataFrame()).to_json(date_format='iso'),
+                            'benchmark_symbol': st.session_state.get("current_benchmark_symbol", BENCHMARK_NIFTY_SYMBOL)
                         }
                         
                         save_compliance_analysis(st.session_state["user_id"], portfolio_id, compliance_data)
@@ -2105,6 +2124,7 @@ Detailed list with:
                             'breach_alerts': st.session_state.get("breach_alerts", []),
                             'advanced_metrics': st.session_state.get("advanced_metrics", DEFAULT_ADVANCED_METRICS.copy()),
                             'risk_returns_df': st.session_state.get("risk_returns_df", pd.DataFrame()).to_json(date_format='iso'),
+                            'benchmark_symbol': st.session_state.get("current_benchmark_symbol", BENCHMARK_NIFTY_SYMBOL),
                             'ai_analysis': response.text
                         }
                         
@@ -2184,40 +2204,59 @@ with tabs[2]:
     with risk_tab1:
         st.subheader("Advanced Portfolio Risk Metrics")
         
-        col_calc, col_period = st.columns([1, 1])
+        col_bench, col_period, col_calc = st.columns([2, 1, 1])
+        
+        with col_bench:
+            st.session_state["current_benchmark_symbol"] = st.text_input(
+                "Benchmark Symbol (e.g., NIFTY 50, MIDCAP 100)",
+                value=st.session_state.get("current_benchmark_symbol", BENCHMARK_NIFTY_SYMBOL),
+                key="benchmark_symbol_input",
+                help="Enter the symbol of the benchmark index you want to compare against (e.g., 'NIFTY 50' or 'NIFTYMIDCAP 100')"
+            ).strip().upper()
+        
         with col_period:
             lookback = st.slider("Lookback Period (Days)", 90, 730, 366, key="risk_lookback")
             
         with col_calc:
             if st.button("🔄 Calculate/Recalculate Advanced Metrics", type="primary", use_container_width=True):
-                with st.spinner(f"Calculating advanced metrics using {lookback} days of history..."):
-                    metrics, returns_df = calculate_advanced_metrics(portfolio_df, api_key, access_token, lookback)
-                    
-                    # Update session state with results or defaults if calculation failed
-                    if metrics:
-                        st.session_state.advanced_metrics = metrics
-                        st.session_state.risk_returns_df = returns_df
-                        st.success("✅ Metrics calculated.")
-                    else:
-                        st.session_state.advanced_metrics = DEFAULT_ADVANCED_METRICS.copy()
-                        st.session_state.risk_returns_df = pd.DataFrame()
-                        st.error("Metrics calculation failed.")
+                if not st.session_state["current_benchmark_symbol"]:
+                    st.error("Please enter a benchmark symbol.")
+                else:
+                    with st.spinner(f"Calculating advanced metrics using {lookback} days of history against {st.session_state['current_benchmark_symbol']}..."):
+                        metrics, returns_df = calculate_advanced_metrics(
+                            portfolio_df, 
+                            api_key, 
+                            access_token, 
+                            lookback, 
+                            st.session_state["current_benchmark_symbol"]
+                        )
                         
-                    if st.session_state.get("current_portfolio_id"):
-                        # Save metrics and returns data (returns as JSON string)
-                        compliance_data = {
-                            'threshold_configs': st.session_state["threshold_configs"],
-                            'custom_rules': st.session_state.get("current_rules_text", ""),
-                            'compliance_results': st.session_state.get("compliance_results", []),
-                            'security_compliance': st.session_state.get("security_level_compliance", pd.DataFrame()).to_json(date_format='iso'),
-                            'breach_alerts': st.session_state.get("breach_alerts", []),
-                            'advanced_metrics': st.session_state.advanced_metrics,
-                            'risk_returns_df': st.session_state.risk_returns_df.to_json(date_format='iso'),
-                            'ai_analysis': st.session_state.get("ai_analysis_response")
-                        }
-                        
-                        save_compliance_analysis(st.session_state["user_id"], st.session_state["current_portfolio_id"], compliance_data)
-                        st.success("✅ Metrics saved!")
+                        # Update session state with results or defaults if calculation failed
+                        if metrics and metrics.get('annualized_return') is not None:
+                            st.session_state.advanced_metrics = metrics
+                            st.session_state.risk_returns_df = returns_df
+                            st.success("✅ Metrics calculated.")
+                        else:
+                            st.session_state.advanced_metrics = DEFAULT_ADVANCED_METRICS.copy()
+                            st.session_state.risk_returns_df = pd.DataFrame()
+                            st.error("Metrics calculation failed (see warnings above).")
+                            
+                        if st.session_state.get("current_portfolio_id"):
+                            # Save metrics and returns data (returns as JSON string)
+                            compliance_data = {
+                                'threshold_configs': st.session_state["threshold_configs"],
+                                'custom_rules': st.session_state.get("current_rules_text", ""),
+                                'compliance_results': st.session_state.get("compliance_results", []),
+                                'security_compliance': st.session_state.get("security_level_compliance", pd.DataFrame()).to_json(date_format='iso'),
+                                'breach_alerts': st.session_state.get("breach_alerts", []),
+                                'advanced_metrics': st.session_state.advanced_metrics,
+                                'risk_returns_df': st.session_state.risk_returns_df.to_json(date_format='iso'),
+                                'benchmark_symbol': st.session_state.get("current_benchmark_symbol", BENCHMARK_NIFTY_SYMBOL),
+                                'ai_analysis': st.session_state.get("ai_analysis_response")
+                            }
+                            
+                            save_compliance_analysis(st.session_state["user_id"], st.session_state["current_portfolio_id"], compliance_data)
+                            st.success("✅ Metrics saved!")
                         st.rerun() # Rerun to refresh the display
 
         
@@ -2226,7 +2265,7 @@ with tabs[2]:
 
         if metrics and metrics.get('annualized_return') is not None:
             st.markdown("---")
-            st.markdown("### Return & Risk Adjusted Performance")
+            st.markdown(f"### Performance Metrics (vs {st.session_state['current_benchmark_symbol']})")
             
             perf_cols = st.columns(4)
             # Accessing metrics using .get() for safety, though robustly initialized
@@ -2235,7 +2274,7 @@ with tabs[2]:
             perf_cols[2].metric("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0.0):.2f}")
             perf_cols[3].metric("Sortino Ratio", f"{metrics.get('sortino_ratio', 0.0):.2f}")
             
-            st.markdown("### Relative Risk Metrics (vs NIFTY 50)")
+            st.markdown("### Relative Risk Metrics")
             relative_cols = st.columns(4)
             relative_cols[0].metric("Beta", f"{metrics.get('beta', 0.0):.2f}")
             relative_cols[1].metric("Jensen's Alpha", f"{metrics.get('alpha', 0.0) * 100:.2f}%")
@@ -2261,7 +2300,10 @@ with tabs[2]:
                 cumulative_returns = (1 + returns_df[['Portfolio', 'Benchmark']]).cumprod() - 1
                 cumulative_returns = cumulative_returns * 100 # Display as percentage
                 
-                fig_cum = px.line(cumulative_returns, y=['Portfolio', 'Benchmark'],
+                # Rename Benchmark column for clearer display
+                cumulative_returns = cumulative_returns.rename(columns={'Benchmark': st.session_state['current_benchmark_symbol']})
+
+                fig_cum = px.line(cumulative_returns, y=['Portfolio', st.session_state['current_benchmark_symbol']],
                                   title="Cumulative Returns (%) vs Benchmark",
                                   labels={'value': 'Cumulative Return (%)', 'index': 'Date', 'variable': 'Index'})
                 fig_cum.update_layout(legend_title_text="Index")
@@ -2543,7 +2585,7 @@ with tabs[3]:
         with trade_col1:
             trade_symbol = st.text_input("Trade Symbol", key="trade_symbol", value=default_symbol)
             trade_action = st.selectbox("Action", ["BUY", "SELL"], key="trade_action")
-        with trade_col2:
+        with col2:
             trade_quantity = st.number_input("Quantity", min_value=1, value=10, key="trade_quantity")
             
         current_ltp_for_trade = portfolio_for_api[portfolio_for_api['Symbol'] == trade_symbol]['LTP'].iloc[0] if trade_symbol in portfolio_for_api['Symbol'].values else 0.0
