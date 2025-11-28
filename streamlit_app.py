@@ -485,11 +485,16 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
         instruments = k.instruments(exchange)
         df_inst = pd.DataFrame(instruments)
         
-        # Special handling for NIFTY 50 (often listed as 'NIFTY' under 'NSE')
-        if symbol.upper() == BENCHMARK_NIFTY_SYMBOL.upper():
+        # Handle index symbols (NIFTY 50 is often 'NIFTY', NIFTYMIDCAP 100 is often 'NIFTYMIDCAP 100')
+        # Kite API often lists indices on NSE exchange without an explicit 'index' type filter here
+        if symbol.upper().replace(' ', '') in ['NIFTY50', 'NIFTY', BENCHMARK_NIFTY_SYMBOL.replace(' ', '')]:
             token_row = df_inst[(df_inst['exchange'] == 'NSE') & (df_inst['tradingsymbol'] == 'NIFTY')]
+        elif symbol.upper().replace(' ', '') in ['NIFTYMIDCAP100', 'NIFTYMIDCAP', 'MIDCAP100']:
+            token_row = df_inst[(df_inst['exchange'] == 'NSE') & (df_inst['tradingsymbol'].str.contains('MIDCAP', case=False, na=False))] # Broader search for midcap index
+            if token_row.empty:
+                token_row = df_inst[(df_inst['exchange'] == 'NSE') & (df_inst['instrument_type'] == 'INDEX') & (df_inst['name'].str.contains('MIDCAP', case=False, na=False))]
         else:
-            # Try matching other symbols (e.g., specific stock or index symbol)
+            # Try matching equity symbols
             token_row = df_inst[(df_inst['exchange'] == exchange.upper()) & (df_inst['tradingsymbol'] == symbol.upper())]
         
         if token_row.empty:
@@ -924,7 +929,7 @@ def render_portfolio_card(portfolio):
                         st.session_state["risk_returns_df"] = loaded['risk_returns_df']
                     else:
                         st.session_state["risk_returns_df"] = pd.DataFrame()
-                        
+
                     # Load benchmark symbol
                     st.session_state["current_benchmark_symbol"] = loaded.get('benchmark_symbol', BENCHMARK_NIFTY_SYMBOL)
                             
@@ -2437,8 +2442,10 @@ with tabs[2]:
         
         metrics = st.session_state.get("advanced_metrics", DEFAULT_ADVANCED_METRICS.copy())
         returns_df_raw = st.session_state.get("risk_returns_df", pd.DataFrame())
+        
+        portfolio_volatility = metrics.get('portfolio_volatility', 0)
 
-        if metrics and metrics.get('portfolio_volatility', 0) > 1e-6 and not returns_df_raw.empty:
+        if portfolio_volatility > 1e-6 and not returns_df_raw.empty:
             
             st.info("Risk metrics calculated based on historical correlation and volatility.")
             
@@ -2463,7 +2470,6 @@ with tabs[2]:
             
             if not benchmark_returns.empty and benchmark_returns.var() > 1e-6:
                 for symbol in stock_returns_df.columns:
-                    # Check if the security actually moved (non-zero variance)
                     if stock_returns_df[symbol].var() > 1e-6: 
                         beta_val = stock_returns_df[symbol].cov(benchmark_returns) / benchmark_returns.var()
                         security_betas[symbol] = beta_val
@@ -2478,9 +2484,7 @@ with tabs[2]:
             weights = risk_contribution_df.set_index('Symbol')['Weight'].reindex(stock_returns_df.columns, fill_value=0).values
             cov_matrix = stock_returns_df.cov() * TRADING_DAYS_PER_YEAR
             
-            portfolio_vol = metrics['portfolio_volatility']
-
-            if portfolio_vol > 1e-6 and not cov_matrix.empty:
+            if not cov_matrix.empty and len(weights) == len(cov_matrix):
                 
                 # Filter covariance matrix to successful symbols only
                 cov_matrix_filtered = cov_matrix.reindex(index=stock_returns_df.columns, columns=stock_returns_df.columns, fill_value=0)
@@ -2488,7 +2492,7 @@ with tabs[2]:
                 marginal_variance_contribution = cov_matrix_filtered.dot(weights) # Vector of Cov(R_i, R_p)
                 
                 # Marginal Contribution to Volatility (MCR): Cov(R_i, R_p) / Sigma_p
-                MCR_vol = marginal_variance_contribution / portfolio_vol
+                MCR_vol = marginal_variance_contribution / portfolio_volatility
                 
                 # Total Risk Contribution (TRC): w_i * MCR_i
                 TRC_vol = (weights * MCR_vol.values)
@@ -2498,46 +2502,51 @@ with tabs[2]:
                 
                 # Calculate % of Total Risk
                 # Normalize TRC so they sum to 100% of the portfolio volatility
-                # TRC_vol should sum up to portfolio_vol, but normalizing ensures stability
-                risk_contribution_df['% of Total Risk'] = (risk_contribution_df['Risk Contribution (Vol)'] / portfolio_vol) * 100
-                
+                risk_contribution_df['% of Total Risk'] = (risk_contribution_df['Risk Contribution (Vol)'] / portfolio_volatility) * 100
             else:
-                st.warning("Portfolio volatility is near zero or returns data is insufficient; risk decomposition skipped.")
                 risk_contribution_df['MCR (Vol)'] = 0.0
                 risk_contribution_df['Risk Contribution (Vol)'] = 0.0
                 risk_contribution_df['% of Total Risk'] = 0.0
+                st.warning("Covariance matrix calculation failed or shape mismatch. Check historical data fetching consistency.")
+
 
             st.markdown("#### Risk Decomposition (Contribution to Portfolio Volatility)")
             
-            # Ensure the display columns exist
+            # Filter to only stocks in the holdings list for clear display
+            risk_contribution_df_filtered = risk_contribution_df[risk_contribution_df['Symbol'].isin(portfolio_df['Symbol'])]
+            
+            # Ensure the display columns exist and handle non-numeric data gracefully
             display_cols = ['Name', 'Weight %', 'Annualized Volatility', 'Beta', 'Risk Contribution (Vol)', '% of Total Risk']
             
             # Filter to only symbols that actually contributed (Vol > 0)
-            top_risk_contributors = risk_contribution_df[risk_contribution_df['Annualized Volatility'] > 0].nlargest(10, 'Risk Contribution (Vol)')
+            top_risk_contributors = risk_contribution_df_filtered[risk_contribution_df_filtered['Annualized Volatility'] > 0].nlargest(10, 'Risk Contribution (Vol)')
             
-            st.dataframe(top_risk_contributors[display_cols].style.format({
-                'Weight %': '{:.2f}%',
-                'Annualized Volatility': '{:.2f}%',
-                'Beta': '{:.2f}',
-                'Risk Contribution (Vol)': '{:.4f}',
-                '% of Total Risk': '{:.1f}%'
-            }), use_container_width=True)
+            if not top_risk_contributors.empty:
+                st.dataframe(top_risk_contributors[display_cols].style.format({
+                    'Weight %': '{:.2f}%',
+                    'Annualized Volatility': '{:.2f}%',
+                    'Beta': '{:.2f}',
+                    'Risk Contribution (Vol)': '{:.4f}',
+                    '% of Total Risk': '{:.1f}%'
+                }), use_container_width=True)
 
-            
-            # Visualization: Risk Contribution vs Weight
-            fig_decomp = px.bar(
-                risk_contribution_df.sort_values('% of Total Risk', ascending=False).head(20),
-                x='Symbol',
-                y='% of Total Risk',
-                color='Industry',
-                title='Top 20 Securities: Percentage Contribution to Portfolio Volatility',
-                hover_data=['Name', 'Weight %', 'Annualized Volatility']
-            )
-            st.plotly_chart(fig_decomp, use_container_width=True)
+                
+                # Visualization: Risk Contribution vs Weight
+                fig_decomp = px.bar(
+                    risk_contribution_df_filtered.sort_values('% of Total Risk', ascending=False).head(20),
+                    x='Symbol',
+                    y='% of Total Risk',
+                    color='Industry',
+                    title='Top 20 Securities: Percentage Contribution to Portfolio Volatility',
+                    hover_data=['Name', 'Weight %', 'Annualized Volatility']
+                )
+                st.plotly_chart(fig_decomp, use_container_width=True)
+            else:
+                st.info("No securities found with non-zero historical volatility to perform decomposition.")
 
 
         else:
-            st.info("Calculate 'Advanced Metrics' first to see security risk breakdown.")
+            st.warning("Portfolio volatility is near zero or returns data is insufficient; risk decomposition skipped.")
 
 
 # --- TAB 4: API Interactions (Unchanged) ---
@@ -2585,7 +2594,7 @@ with tabs[3]:
         with trade_col1:
             trade_symbol = st.text_input("Trade Symbol", key="trade_symbol", value=default_symbol)
             trade_action = st.selectbox("Action", ["BUY", "SELL"], key="trade_action")
-        with col2:
+        with trade_col2:
             trade_quantity = st.number_input("Quantity", min_value=1, value=10, key="trade_quantity")
             
         current_ltp_for_trade = portfolio_for_api[portfolio_for_api['Symbol'] == trade_symbol]['LTP'].iloc[0] if trade_symbol in portfolio_for_api['Symbol'].values else 0.0
