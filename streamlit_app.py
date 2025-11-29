@@ -2475,16 +2475,14 @@ with tabs[2]:
             returns_df = returns_df_raw.set_index('date') if 'date' in returns_df_raw.columns else returns_df_raw.copy()
             
             # Filter returns to just the securities
-            # Note: We ensure stocks used for covariance calculation have non-zero variance (or sufficient data points)
             stock_returns_df = returns_df.drop(columns=['Portfolio', 'Active Return', 'Benchmark'], errors='ignore')
             
             # 2. Identify stocks with non-zero historical variance (must have moved to contribute risk)
-            # Find stocks with at least 2 non-NaN, non-zero returns to calculate variance.
             valid_variance_symbols = stock_returns_df.columns[stock_returns_df.apply(lambda x: x.var() > 1e-12, axis=0)].tolist()
             
             if not valid_variance_symbols:
+                # If no securities have moved in the lookback period, this is the expected failure point.
                 st.warning("No securities found with significant historical volatility to perform decomposition.")
-                # Skip the rest of the calculation
             else:
                 stock_returns_df = stock_returns_df[valid_variance_symbols]
                 benchmark_returns = returns_df['Benchmark']
@@ -2499,7 +2497,7 @@ with tabs[2]:
                 try:
                     cov_matrix = stock_returns_df.cov() * TRADING_DAYS_PER_YEAR
                 except Exception as e:
-                    st.error(f"Covariance matrix calculation failed: {e}")
+                    st.warning(f"Covariance matrix calculation failed internally ({e}). This usually means data is too sparse.")
                     cov_matrix = pd.DataFrame()
 
 
