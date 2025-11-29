@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import json
@@ -1286,7 +1285,7 @@ with st.sidebar:
                         st.session_state["stressed_df"] = None
                         st.session_state["stressed_compliance_results"] = None
                         
-                        st.success("Loaded!")
+                        st.success("✅ Portfolio Loaded!")
                         time.sleep(0.5)
                         st.rerun()
                 
@@ -2420,11 +2419,7 @@ with tabs[2]:
                 for col in ['Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %']:
                     if col in stressed_df_for_api.columns:
                         try:
-                            # Attempt to 'unwrap' if elements are single-item lists/arrays (FIX for Error 2)
-                            if stressed_df_for_api[col].dtype == 'object':
-                                stressed_df_for_api[col] = stressed_df_for_api[col].apply(
-                                    lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) == 1 else x
-                                )
+                            # Simplified cleaning: directly apply pd.to_numeric
                             stressed_df_for_api[col] = pd.to_numeric(stressed_df_for_api[col], errors='coerce').fillna(0.0)
                         except Exception as e:
                             st.error(f"Error cleaning column '{col}' for API call in stress test: {e}. Skipping API call.")
