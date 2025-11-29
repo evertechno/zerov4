@@ -576,12 +576,28 @@ def call_compliance_api(endpoint: str, payload: dict):
 
 # --- Enhanced Compliance Functions (using API) ---
 def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, threshold_configs: dict):
-    """Calls the API to run compliance checks."""
+    """
+    Calls the API to run compliance checks.
     
-    # Ensure all required columns are present and data types are float
+    Fix: Ensure that DataFrame columns passed to pd.to_numeric are indeed Series 
+    (which they should be if the input is a valid DataFrame, reinforcing that 
+    the input is handled correctly).
+    """
+    
+    # Ensure a defensive copy and necessary columns exist
     df_clean = portfolio_df.copy()
+    
     for col in ['Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %']:
         if col in df_clean.columns:
+            # Explicitly cast to Series before calling to_numeric, although standard DataFrame access should return Series.
+            # This confirms the data type issue likely stems from corrupted input data structure.
+            series_to_convert = df_clean[col]
+            
+            # Check if the column data is a Series; if not, force convert the underlying data structure
+            if not isinstance(series_to_convert, pd.Series):
+                 # This attempts to fix unexpected structures (like lists within a column)
+                df_clean[col] = pd.Series(df_clean[col].tolist(), index=df_clean.index)
+
             df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0.0)
 
     payload = {
@@ -963,7 +979,7 @@ def render_portfolio_card(portfolio):
                     st.session_state["stressed_df"] = None
                     st.session_state["stressed_compliance_results"] = None
                     
-                    st.success("✅ Portfolio Loaded!")
+                    st.success("Loaded!")
                     time.sleep(0.5)
                     st.rerun()
         
@@ -2464,108 +2480,106 @@ with tabs[2]:
         
         portfolio_volatility = metrics.get('portfolio_volatility', 0)
 
-        if portfolio_volatility > 1e-6 and not returns_df_raw.empty:
-            
+        # 1. Check for sufficient data
+        if portfolio_volatility < 1e-6 or returns_df_raw.empty or 'Benchmark' not in returns_df_raw.columns:
+            st.warning("Portfolio volatility is near zero or returns data is insufficient; risk decomposition skipped. Please calculate metrics first.")
+        else:
+            # --- Start Decomposition Logic ---
             st.info("Risk metrics calculated based on historical correlation and volatility.")
-            
+
             # Ensure the returns_df is indexed by date for calculation
             returns_df = returns_df_raw.set_index('date') if 'date' in returns_df_raw.columns else returns_df_raw.copy()
             
-            # Filter returns to just the securities (dropping calculated metrics and benchmark)
+            # Filter returns to just the securities
             stock_returns_df = returns_df.drop(columns=['Portfolio', 'Active Return', 'Benchmark'], errors='ignore')
-            benchmark_returns = returns_df['Benchmark'] if 'Benchmark' in returns_df.columns else pd.Series()
+            
+            # 2. Identify stocks with non-zero historical variance (must have moved to contribute risk)
+            # Find stocks with non-zero variance (avoid division by zero/flat lines)
+            valid_variance_symbols = stock_returns_df.columns[stock_returns_df.apply(lambda x: x.var() > 1e-12, axis=0)].tolist()
+            
+            if not valid_variance_symbols:
+                st.warning("No securities found with significant historical volatility to perform decomposition.")
+            else:
+                stock_returns_df = stock_returns_df[valid_variance_symbols]
+                benchmark_returns = returns_df['Benchmark']
+                
+                # Prepare contribution DataFrame, filtering only for valid symbols
+                risk_contribution_df = portfolio_df[['Symbol', 'Name', 'Weight %', 'Industry']].copy()
+                risk_contribution_df = risk_contribution_df[risk_contribution_df['Symbol'].isin(valid_symbols)]
+                risk_contribution_df['Weight'] = risk_contribution_df['Weight %'] / 100
+                
+                # Reindex weights to align with the filtered stock_returns_df columns
+                weights = risk_contribution_df.set_index('Symbol')['Weight'].reindex(stock_returns_df.columns, fill_value=0).values
+                
+                try:
+                    cov_matrix = stock_returns_df.cov() * TRADING_DAYS_PER_YEAR
+                except Exception as e:
+                    st.warning(f"Covariance matrix calculation failed internally ({e}). This usually means data is too sparse.")
+                    cov_matrix = pd.DataFrame()
 
-            risk_contribution_df = portfolio_df[['Symbol', 'Name', 'Weight %', 'Industry']].copy()
-            risk_contribution_df['Weight'] = risk_contribution_df['Weight %'] / 100
-            
-            # Filter stock_returns_df to only include symbols present in the portfolio_df
-            valid_symbols = [s for s in risk_contribution_df['Symbol'].tolist() if s in stock_returns_df.columns]
-            stock_returns_df = stock_returns_df[valid_symbols]
-            
-            # 2. Calculate Volatility and Beta per security
-            security_vols_daily = stock_returns_df.std()
-            security_vols_annual = security_vols_daily * np.sqrt(TRADING_DAYS_PER_YEAR)
-            security_betas = {}
-            
-            if not benchmark_returns.empty and benchmark_returns.var() > 1e-6:
-                for symbol in stock_returns_df.columns:
-                    if stock_returns_df[symbol].var() > 1e-6: 
-                        beta_val = stock_returns_df[symbol].cov(benchmark_returns) / benchmark_returns.var()
-                        security_betas[symbol] = beta_val
+
+                if not cov_matrix.empty and len(weights) == len(cov_matrix) and portfolio_volatility > 1e-6:
+                    
+                    # 2. Calculate Volatility and Beta per security
+                    security_vols_daily = stock_returns_df.std()
+                    security_vols_annual = security_vols_daily * np.sqrt(TRADING_DAYS_PER_YEAR)
+                    security_betas = {}
+                    
+                    if benchmark_returns.var() > 1e-6:
+                        for symbol in stock_returns_df.columns:
+                            # Note: We already filtered for non-zero variance stocks, so this should be fine
+                            beta_val = stock_returns_df[symbol].cov(benchmark_returns) / benchmark_returns.var()
+                            security_betas[symbol] = beta_val
+                    
+                    risk_contribution_df['Beta'] = risk_contribution_df['Symbol'].map(security_betas).fillna(0)
+                    risk_contribution_df['Annualized Volatility'] = risk_contribution_df['Symbol'].map(security_vols_annual.to_dict()).fillna(0) * 100 # as %
+
+                    # 3. Risk Decomposition (MCR and TRC)
+                    cov_matrix_filtered = cov_matrix.reindex(index=stock_returns_df.columns, columns=stock_returns_df.columns, fill_value=0)
+                    
+                    marginal_variance_contribution = cov_matrix_filtered.dot(weights) 
+                    MCR_vol = marginal_variance_contribution / portfolio_volatility
+                    TRC_vol = (weights * MCR_vol.values)
+                    
+                    risk_contribution_df['MCR (Vol)'] = risk_contribution_df['Symbol'].map(MCR_vol.to_dict()).fillna(0)
+                    risk_contribution_df['Risk Contribution (Vol)'] = risk_contribution_df['Symbol'].map(pd.Series(TRC_vol, index=stock_returns_df.columns).to_dict()).fillna(0)
+                    risk_contribution_df['% of Total Risk'] = (risk_contribution_df['Risk Contribution (Vol)'] / portfolio_volatility) * 100
+
+                    # --- Display Results ---
+                    st.markdown("#### Risk Decomposition (Contribution to Portfolio Volatility)")
+                    
+                    # Filter to ensure the display only includes stocks with calculated metrics
+                    risk_contribution_df_filtered = risk_contribution_df[risk_contribution_df['Risk Contribution (Vol)'].abs() > 1e-9]
+                    
+                    display_cols = ['Name', 'Weight %', 'Annualized Volatility', 'Beta', 'Risk Contribution (Vol)', '% of Total Risk']
+                    
+                    top_risk_contributors = risk_contribution_df_filtered.nlargest(10, 'Risk Contribution (Vol)', keep='first')
+                    
+                    if not top_risk_contributors.empty:
+                        st.dataframe(top_risk_contributors[display_cols].style.format({
+                            'Weight %': '{:.2f}%',
+                            'Annualized Volatility': '{:.2f}%',
+                            'Beta': '{:.2f}',
+                            'Risk Contribution (Vol)': '{:.4f}',
+                            '% of Total Risk': '{:.1f}%'
+                        }), use_container_width=True)
+
+                        
+                        # Visualization: Risk Contribution vs Weight
+                        fig_decomp = px.bar(
+                            risk_contribution_df_filtered.sort_values('% of Total Risk', ascending=False).head(20),
+                            x='Symbol',
+                            y='% of Total Risk',
+                            color='Industry',
+                            title='Top 20 Securities: Percentage Contribution to Portfolio Volatility',
+                            hover_data=['Name', 'Weight %', 'Annualized Volatility']
+                        )
+                        st.plotly_chart(fig_decomp, use_container_width=True)
                     else:
-                        security_betas[symbol] = 0.0
-            
-            risk_contribution_df['Beta'] = risk_contribution_df['Symbol'].map(security_betas).fillna(0)
-            risk_contribution_df['Annualized Volatility'] = risk_contribution_df['Symbol'].map(security_vols_annual.to_dict()).fillna(0) * 100 # as %
-            
-            # 3. Risk Decomposition (Marginal Risk Contribution)
-            
-            weights = risk_contribution_df.set_index('Symbol')['Weight'].reindex(stock_returns_df.columns, fill_value=0).values
-            cov_matrix = stock_returns_df.cov() * TRADING_DAYS_PER_YEAR
-            
-            if not cov_matrix.empty and len(weights) == len(cov_matrix):
-                
-                # Filter covariance matrix to successful symbols only
-                cov_matrix_filtered = cov_matrix.reindex(index=stock_returns_df.columns, columns=stock_returns_df.columns, fill_value=0)
-                
-                marginal_variance_contribution = cov_matrix_filtered.dot(weights) # Vector of Cov(R_i, R_p)
-                
-                # Marginal Contribution to Volatility (MCR): Cov(R_i, R_p) / Sigma_p
-                MCR_vol = marginal_variance_contribution / portfolio_volatility
-                
-                # Total Risk Contribution (TRC): w_i * MCR_i
-                TRC_vol = (weights * MCR_vol.values)
-                
-                risk_contribution_df['MCR (Vol)'] = risk_contribution_df['Symbol'].map(MCR_vol.to_dict()).fillna(0)
-                risk_contribution_df['Risk Contribution (Vol)'] = risk_contribution_df['Symbol'].map(pd.Series(TRC_vol, index=stock_returns_df.columns).to_dict()).fillna(0)
-                
-                # Calculate % of Total Risk
-                # Normalize TRC so they sum to 100% of the portfolio volatility
-                risk_contribution_df['% of Total Risk'] = (risk_contribution_df['Risk Contribution (Vol)'] / portfolio_volatility) * 100
-            else:
-                risk_contribution_df['MCR (Vol)'] = 0.0
-                risk_contribution_df['Risk Contribution (Vol)'] = 0.0
-                risk_contribution_df['% of Total Risk'] = 0.0
-                st.warning("Covariance matrix calculation failed or shape mismatch. Check historical data fetching consistency.")
-
-
-            st.markdown("#### Risk Decomposition (Contribution to Portfolio Volatility)")
-            
-            # Filter to only stocks in the holdings list for clear display
-            risk_contribution_df_filtered = risk_contribution_df[risk_contribution_df['Symbol'].isin(portfolio_df['Symbol'])]
-            
-            # Ensure the display columns exist and handle non-numeric data gracefully
-            display_cols = ['Name', 'Weight %', 'Annualized Volatility', 'Beta', 'Risk Contribution (Vol)', '% of Total Risk']
-            
-            # Filter to only symbols that actually contributed (Vol > 0)
-            top_risk_contributors = risk_contribution_df_filtered[risk_contribution_df_filtered['Annualized Volatility'] > 0].nlargest(10, 'Risk Contribution (Vol)')
-            
-            if not top_risk_contributors.empty:
-                st.dataframe(top_risk_contributors[display_cols].style.format({
-                    'Weight %': '{:.2f}%',
-                    'Annualized Volatility': '{:.2f}%',
-                    'Beta': '{:.2f}',
-                    'Risk Contribution (Vol)': '{:.4f}',
-                    '% of Total Risk': '{:.1f}%'
-                }), use_container_width=True)
-
-                
-                # Visualization: Risk Contribution vs Weight
-                fig_decomp = px.bar(
-                    risk_contribution_df_filtered.sort_values('% of Total Risk', ascending=False).head(20),
-                    x='Symbol',
-                    y='% of Total Risk',
-                    color='Industry',
-                    title='Top 20 Securities: Percentage Contribution to Portfolio Volatility',
-                    hover_data=['Name', 'Weight %', 'Annualized Volatility']
-                )
-                st.plotly_chart(fig_decomp, use_container_width=True)
-            else:
-                st.info("No securities found with non-zero historical volatility to perform decomposition.")
-
-
-        else:
-            st.warning("Portfolio volatility is near zero or returns data is insufficient; risk decomposition skipped.")
+                        st.info("No securities found with meaningful risk contribution to display.")
+                else:
+                    st.warning("Covariance matrix calculation failed or shape mismatch. Check historical data fetching consistency and ensure there are multiple data points.")
+            # --- End Decomposition Logic ---
 
 
 # --- TAB 4: API Interactions (Unchanged) ---
