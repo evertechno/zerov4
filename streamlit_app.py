@@ -1,5 +1,4 @@
 
-
 import streamlit as st
 import pandas as pd
 import json
@@ -580,9 +579,7 @@ def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, t
     """
     Calls the API to run compliance checks.
     
-    Fix: Ensure that DataFrame columns passed to pd.to_numeric are Series, 
-    but remove the overly aggressive defensive check that caused the AttributeError.
-    The standard copy() operation followed by df_clean[col] access should already return a Series.
+    Fix: Ensure that DataFrame columns passed to pd.to_numeric are Series.
     """
     
     # Ensure a defensive copy
@@ -590,11 +587,22 @@ def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, t
     
     for col in ['Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %']:
         if col in df_clean.columns:
-            # We trust that df_clean[col] returns a Series, and apply to_numeric directly.
-            # If the original input CSV parsing resulted in list/numpy objects inside cells,
-            # this might still fail, but we assume the standard CSV upload yields simple data types.
-            df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0.0)
-
+            # We assume df_clean[col] returns a Series, and apply to_numeric directly.
+            # If the Series contained an array/list object (which caused the error), 
+            # we need to be very explicit to get the simple value array.
+            
+            # Since the data for these columns comes from calculations or primary upload,
+            # using .astype(float) first can sometimes stabilize the data structure before to_numeric.
+            try:
+                # Attempt to convert the column to float directly, coercing errors
+                df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0.0)
+            except Exception as e:
+                # If conversion fails dramatically (as in the TypeError), log and fall back.
+                # This suggests the DataFrame structure is fundamentally problematic.
+                st.exception(f"Critical data cleaning failure on column {col}: {e}")
+                # We stop the conversion loop here to avoid further cascading errors
+                return [] 
+                
     payload = {
         "portfolio": df_clean.to_dict('records'),
         "rules_text": rules_text,
@@ -944,6 +952,8 @@ def render_portfolio_card(portfolio):
                     if loaded.get('security_compliance'):
                         if isinstance(loaded['security_compliance'], str):
                             st.session_state["security_level_compliance"] = pd.read_json(loaded['security_compliance'])
+                            # Ensure the index is reset if loading from JSON string
+                            st.session_state["security_level_compliance"].reset_index(drop=True, inplace=True)
                         elif loaded['security_compliance']:
                             st.session_state["security_level_compliance"] = pd.DataFrame(loaded['security_compliance'])
                     
@@ -974,12 +984,12 @@ def render_portfolio_card(portfolio):
                     st.session_state["stressed_df"] = None
                     st.session_state["stressed_compliance_results"] = None
                     
-                    st.success("Loaded!")
+                    st.success("✅ Portfolio Loaded!")
                     time.sleep(0.5)
                     st.rerun()
         
         with col4:
-            if st.button("🗑️", key=f"delete_hist_{portfolio['id']}", use_container_width=True, help="Delete Portfolio"):
+            if st.button("🗑️", key=f"delete_hist_{portfolio['id']}", use_container_width=True):
                 if delete_portfolio(portfolio['id']):
                     st.success("Deleted!")
                     st.session_state["saved_analyses"] = get_user_portfolios(st.session_state["user_id"])
@@ -1237,6 +1247,8 @@ with st.sidebar:
                         if loaded.get('security_compliance'):
                             if isinstance(loaded['security_compliance'], str):
                                 st.session_state["security_level_compliance"] = pd.read_json(loaded['security_compliance'])
+                                # Ensure the index is reset if loading from JSON string
+                                st.session_state["security_level_compliance"].reset_index(drop=True, inplace=True)
                             elif loaded['security_compliance']:
                                 st.session_state["security_level_compliance"] = pd.DataFrame(loaded['security_compliance'])
                         
@@ -2394,8 +2406,14 @@ with tabs[2]:
                 st.session_state['stressed_df'] = stressed_df
                 st.session_state['stress_summary'] = summary
                 
-                # Re-run compliance audit on the stressed data using the API
+                # --- FIX: Ensure columns are clean before calling the API checker ---
                 stressed_df_for_api = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'}).copy()
+                
+                # Clean specific numeric columns in the stressed DataFrame copy
+                for col in ['Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %']:
+                    if col in stressed_df_for_api.columns:
+                        stressed_df_for_api[col] = pd.to_numeric(stressed_df_for_api[col], errors='coerce').fillna(0.0)
+                # --- END FIX ---
                 
                 stressed_compliance_results = call_compliance_api_run_check(
                     stressed_df_for_api,
