@@ -579,7 +579,8 @@ def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, t
     """
     Calls the API to run compliance checks.
     
-    Fix: Ensure that DataFrame columns passed to pd.to_numeric are Series.
+    Fix: Ensure that DataFrame columns passed to pd.to_numeric are Series
+    and handle potential nested list/array elements.
     """
     
     # Ensure a defensive copy
@@ -587,20 +588,18 @@ def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, t
     
     for col in ['Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %']:
         if col in df_clean.columns:
-            # We assume df_clean[col] returns a Series, and apply to_numeric directly.
-            # If the Series contained an array/list object (which caused the error), 
-            # we need to be very explicit to get the simple value array.
-            
-            # Since the data for these columns comes from calculations or primary upload,
-            # using .astype(float) first can sometimes stabilize the data structure before to_numeric.
             try:
-                # Attempt to convert the column to float directly, coercing errors
+                # If a column's dtype is 'object', it might contain mixed types or nested lists.
+                # Attempt to 'unwrap' if elements are single-item lists/arrays.
+                if df_clean[col].dtype == 'object':
+                    df_clean[col] = df_clean[col].apply(
+                        lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) == 1 else x
+                    )
+                # Then, convert to numeric.
                 df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0.0)
             except Exception as e:
-                # If conversion fails dramatically (as in the TypeError), log and fall back.
-                # This suggests the DataFrame structure is fundamentally problematic.
-                st.exception(f"Critical data cleaning failure on column {col}: {e}")
-                # We stop the conversion loop here to avoid further cascading errors
+                st.exception(f"Critical data cleaning failure on column {col} before API call: {e}")
+                # If conversion fails dramatically, return empty to prevent API call with bad data
                 return [] 
                 
     payload = {
@@ -669,7 +668,7 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token, lookback_day
     if benchmark_data.empty or '_error' in benchmark_data.columns:
         error_msg = benchmark_data.iloc[0]['_error'] if '_error' in benchmark_data.columns else "Unknown error."
         st.error(f"Failed to fetch benchmark data for {benchmark_symbol}. {error_msg}. Using zero returns for benchmark.")
-        benchmark_returns = pd.Series(0, index=returns_df.index)
+        benchmark_returns = pd.Series(0, index=returns_df.index if not returns_df.empty else pd.DatetimeIndex([]))
         risk_free_rate = 0.04 / TRADING_DAYS_PER_YEAR # Proxy
     else:
         benchmark_returns = benchmark_data['close'].pct_change()
@@ -686,12 +685,16 @@ def calculate_advanced_metrics(portfolio_df, api_key, access_token, lookback_day
         return metrics, combined_returns
     
     successful_symbols = returns_df.columns.tolist()
+    
+    # Ensure portfolio_df_success uses symbols that actually returned data
     portfolio_df_success = portfolio_df.set_index('Symbol').reindex(successful_symbols).reset_index()
+    portfolio_df_success['Real-time Value (Rs)'] = pd.to_numeric(portfolio_df_success['Real-time Value (Rs)'], errors='coerce').fillna(0)
+
     total_value_success = portfolio_df_success['Real-time Value (Rs)'].sum()
     
     if total_value_success == 0:
         progress_bar.empty()
-        st.error("Total portfolio value is zero after filtering for successful price fetches.")
+        st.error("Total portfolio value is zero after filtering for successful price fetches or all holdings have zero value.")
         return metrics, combined_returns
     
     weights = (portfolio_df_success['Real-time Value (Rs)'] / total_value_success).values
@@ -791,6 +794,10 @@ def run_stress_test(original_df, scenario_type, params):
     Applies a stress scenario to a portfolio DataFrame.
     """
     stressed_df = original_df.copy()
+    
+    # Ensure 'Real-time Value (Rs)' is numeric before calculations
+    stressed_df['Real-time Value (Rs)'] = pd.to_numeric(stressed_df['Real-time Value (Rs)'], errors='coerce').fillna(0.0)
+    
     original_total_value = stressed_df['Real-time Value (Rs)'].sum()
     
     # Ensure 'Stressed Value (Rs)' is initialized based on the original value
@@ -1057,9 +1064,9 @@ def render_threshold_config():
     st.subheader("⚙️ Compliance Thresholds")
     
     # Ensure all keys exist before accessing
-    for key in st.session_state["threshold_configs"].keys():
-        if key not in st.session_state["threshold_configs"]:
-            st.session_state["threshold_configs"][key] = DEFAULT_ADVANCED_METRICS[key]
+    # Use DEFAULT_ADVANCED_METRICS as source for defaults for *safety*, though
+    # this function is for `threshold_configs`, so use a more appropriate default source.
+    # For now, relying on initial st.session_state["threshold_configs"] default.
             
     with st.expander("📊 Basic Limits", expanded=True):
         col1, col2 = st.columns(2)
@@ -2315,25 +2322,25 @@ with tabs[2]:
             st.markdown(f"### Performance Metrics (vs {st.session_state['current_benchmark_symbol']})")
             
             perf_cols = st.columns(4)
-            # Accessing metrics using .get() for safety, though robustly initialized
-            perf_cols[0].metric("Annualized Return", f"{metrics.get('annualized_return', 0.0) * 100:.2f}%")
-            perf_cols[1].metric("Portfolio Volatility", f"{metrics.get('portfolio_volatility', 0.0) * 100:.2f}%")
-            perf_cols[2].metric("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0.0):.2f}")
-            perf_cols[3].metric("Sortino Ratio", f"{metrics.get('sortino_ratio', 0.0):.2f}")
+            # Accessing metrics using .get() for safety, and casting to float
+            perf_cols[0].metric("Annualized Return", f"{float(metrics.get('annualized_return', 0.0)) * 100:.2f}%")
+            perf_cols[1].metric("Portfolio Volatility", f"{float(metrics.get('portfolio_volatility', 0.0)) * 100:.2f}%")
+            perf_cols[2].metric("Sharpe Ratio", f"{float(metrics.get('sharpe_ratio', 0.0)):.2f}")
+            perf_cols[3].metric("Sortino Ratio", f"{float(metrics.get('sortino_ratio', 0.0)):.2f}") # FIX for Error 1
             
             st.markdown("### Relative Risk Metrics")
             relative_cols = st.columns(4)
-            relative_cols[0].metric("Beta", f"{metrics.get('beta', 0.0):.2f}")
-            relative_cols[1].metric("Jensen's Alpha", f"{metrics.get('alpha', 0.0) * 100:.2f}%")
-            relative_cols[2].metric("Tracking Error", f"{metrics.get('tracking_error', 0.0) * 100:.2f}%")
-            relative_cols[3].metric("Information Ratio", f"{metrics.get('information_ratio', 0.0):.2f}")
+            relative_cols[0].metric("Beta", f"{float(metrics.get('beta', 0.0)):.2f}")
+            relative_cols[1].metric("Jensen's Alpha", f"{float(metrics.get('alpha', 0.0)) * 100:.2f}%")
+            relative_cols[2].metric("Tracking Error", f"{float(metrics.get('tracking_error', 0.0)) * 100:.2f}%")
+            relative_cols[3].metric("Information Ratio", f"{float(metrics.get('information_ratio', 0.0)):.2f}")
 
             st.markdown("### Concentration & Downside Risk")
             risk_cols = st.columns(4)
-            risk_cols[0].metric("Diversification Ratio", f"{metrics.get('diversification_ratio', 0.0):.2f}")
-            risk_cols[1].metric("Avg Correlation", f"{metrics.get('avg_correlation', 0.0):.2f}")
-            risk_cols[2].metric("VaR (95%) Daily", f"{metrics.get('var_95', 0.0) * 100:.2f}%")
-            risk_cols[3].metric("CVaR (95%) Daily", f"{metrics.get('cvar_95', 0.0) * 100:.2f}%")
+            risk_cols[0].metric("Diversification Ratio", f"{float(metrics.get('diversification_ratio', 0.0)):.2f}")
+            risk_cols[1].metric("Avg Correlation", f"{float(metrics.get('avg_correlation', 0.0)):.2f}")
+            risk_cols[2].metric("VaR (95%) Daily", f"{float(metrics.get('var_95', 0.0)) * 100:.2f}%")
+            risk_cols[3].metric("CVaR (95%) Daily", f"{float(metrics.get('cvar_95', 0.0)) * 100:.2f}%")
             
             if not returns_df.empty and 'Portfolio' in returns_df.columns and 'Benchmark' in returns_df.columns:
                 st.markdown("---")
@@ -2412,14 +2419,24 @@ with tabs[2]:
                 # Clean specific numeric columns in the stressed DataFrame copy
                 for col in ['Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %']:
                     if col in stressed_df_for_api.columns:
-                        stressed_df_for_api[col] = pd.to_numeric(stressed_df_for_api[col], errors='coerce').fillna(0.0)
+                        try:
+                            # Attempt to 'unwrap' if elements are single-item lists/arrays (FIX for Error 2)
+                            if stressed_df_for_api[col].dtype == 'object':
+                                stressed_df_for_api[col] = stressed_df_for_api[col].apply(
+                                    lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) == 1 else x
+                                )
+                            stressed_df_for_api[col] = pd.to_numeric(stressed_df_for_api[col], errors='coerce').fillna(0.0)
+                        except Exception as e:
+                            st.error(f"Error cleaning column '{col}' for API call in stress test: {e}. Skipping API call.")
+                            stressed_compliance_results = [] # Indicate failure
+                            break # Exit loop if a critical error occurs
+                else: # This else block executes if the for loop completes without a 'break'
+                    stressed_compliance_results = call_compliance_api_run_check(
+                        stressed_df_for_api,
+                        st.session_state.current_rules_text,
+                        st.session_state.threshold_configs
+                    )
                 # --- END FIX ---
-                
-                stressed_compliance_results = call_compliance_api_run_check(
-                    stressed_df_for_api,
-                    st.session_state.current_rules_text,
-                    st.session_state.threshold_configs
-                )
                 
                 st.session_state['stressed_compliance_results'] = stressed_compliance_results
                 st.success("Stress test simulation complete.")
@@ -2518,7 +2535,8 @@ with tabs[2]:
                 
                 # Prepare contribution DataFrame, filtering only for valid symbols
                 risk_contribution_df = portfolio_df[['Symbol', 'Name', 'Weight %', 'Industry']].copy()
-                risk_contribution_df = risk_contribution_df[risk_contribution_df['Symbol'].isin(valid_symbols)]
+                risk_contribution_df['Weight %'] = pd.to_numeric(risk_contribution_df['Weight %'], errors='coerce').fillna(0) # Ensure numeric
+                risk_contribution_df = risk_contribution_df[risk_contribution_df['Symbol'].isin(valid_variance_symbols)] # Use valid_variance_symbols
                 risk_contribution_df['Weight'] = risk_contribution_df['Weight %'] / 100
                 
                 # Reindex weights to align with the filtered stock_returns_df columns
