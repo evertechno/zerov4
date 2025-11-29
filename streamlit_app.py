@@ -485,21 +485,40 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
         instruments = k.instruments(exchange)
         df_inst = pd.DataFrame(instruments)
         
-        # Handle index symbols (NIFTY 50 is often 'NIFTY', NIFTYMIDCAP 100 is often 'NIFTYMIDCAP 100')
-        # Kite API often lists indices on NSE exchange without an explicit 'index' type filter here
-        if symbol.upper().replace(' ', '') in ['NIFTY50', 'NIFTY', BENCHMARK_NIFTY_SYMBOL.replace(' ', '')]:
-            token_row = df_inst[(df_inst['exchange'] == 'NSE') & (df_inst['tradingsymbol'] == 'NIFTY')]
-        elif symbol.upper().replace(' ', '') in ['NIFTYMIDCAP100', 'NIFTYMIDCAP', 'MIDCAP100']:
-            token_row = df_inst[(df_inst['exchange'] == 'NSE') & (df_inst['tradingsymbol'].str.contains('MIDCAP', case=False, na=False))] # Broader search for midcap index
-            if token_row.empty:
-                token_row = df_inst[(df_inst['exchange'] == 'NSE') & (df_inst['instrument_type'] == 'INDEX') & (df_inst['name'].str.contains('MIDCAP', case=False, na=False))]
-        else:
-            # Try matching equity symbols
-            token_row = df_inst[(df_inst['exchange'] == exchange.upper()) & (df_inst['tradingsymbol'] == symbol.upper())]
+        # Normalize the input symbol for matching
+        symbol_normalized = symbol.upper().replace(' ', '').replace('-', '')
+        
+        # Handle index symbols with improved matching
+        token_row = pd.DataFrame()
+        
+        # Try matching NIFTY 50 (most common benchmark)
+        if symbol_normalized in ['NIFTY50', 'NIFTY', BENCHMARK_NIFTY_SYMBOL.replace(' ', '')]:
+            # The official Kite trading symbol for Nifty 50 on NSE is typically just 'NIFTY'
+            token_row = df_inst[
+                (df_inst['exchange'] == 'NSE') & 
+                (df_inst['tradingsymbol'] == 'NIFTY')
+            ]
+        
+        # Try matching NIFTY MIDCAP 100
+        elif 'MIDCAP100' in symbol_normalized or 'MIDCAP' in symbol_normalized:
+            # Search for relevant symbols like NIFTYMIDCAP100
+            token_row = df_inst[
+                (df_inst['exchange'] == 'NSE') & 
+                (df_inst['tradingsymbol'].str.contains('MIDCAP', case=False, na=False))
+            ]
+            
+        
+        # If still empty, try exact equity symbol matching
+        if token_row.empty:
+            token_row = df_inst[
+                (df_inst['exchange'] == exchange.upper()) & 
+                (df_inst['tradingsymbol'] == symbol.upper())
+            ]
         
         if token_row.empty:
             return pd.DataFrame({"_error": [f"Token not found for {symbol} on {exchange}"]})
         
+        # Get the first matching token
         token = int(token_row.iloc[0]['instrument_token'])
         
         # Kite API expects datetime objects
