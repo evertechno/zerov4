@@ -1480,6 +1480,11 @@ HHI < 800""")
                     df_results['Real-time Value (Rs)'] = (df_results['LTP'] * df_results['Quantity']).fillna(0)
                     total_value = df_results['Real-time Value (Rs)'].sum()
                     df_results['Weight %'] = (df_results['Real-time Value (Rs)'] / total_value * 100) if total_value > 0 else 0
+
+                    # CRITICAL FIX: Ensure 'Weight %' is always numeric here.
+                    # If total_value was 0, Weight % might be 0, but if something upstream set it to '₹0' string,
+                    # this step ensures it's cleaned to a proper float.
+                    df_results['Weight %'] = pd.to_numeric(df_results['Weight %'], errors='coerce').fillna(0.0)
                     
                     if total_value == 0:
                         st.error("Total portfolio value is zero. Cannot proceed with weight-based analysis.")
@@ -1821,7 +1826,7 @@ HHI < 800""")
                 from io import BytesIO
                 output = BytesIO()
                 
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                with pd.ExcelWriter(output, engine='openypxl') as writer:
                     # Holdings sheet
                     results_df.to_excel(writer, sheet_name='Holdings', index=False)
                     
@@ -2251,7 +2256,7 @@ with tabs[2]:
         
     st.info(f"Analyzing: **{st.session_state.get('current_portfolio_name', 'Unnamed Portfolio')}**")
     
-    # Removed risk_tab3
+    # Removed risk_tab3 from tabs declaration
     risk_tab1, risk_tab2 = st.tabs(["Advanced Metrics & Performance", "Stress Testing & Scenarios"])
 
     # --- Risk Tab 1: Advanced Metrics ---
@@ -2326,7 +2331,7 @@ with tabs[2]:
             perf_cols[0].metric("Annualized Return", f"{float(metrics.get('annualized_return', 0.0)) * 100:.2f}%")
             perf_cols[1].metric("Portfolio Volatility", f"{float(metrics.get('portfolio_volatility', 0.0)) * 100:.2f}%")
             perf_cols[2].metric("Sharpe Ratio", f"{float(metrics.get('sharpe_ratio', 0.0)):.2f}")
-            perf_cols[3].metric("Sortino Ratio", f"{float(metrics.get('sortino_ratio', 0.0)):.2f}") # FIX for Error 1
+            perf_cols[3].metric("Sortino Ratio", f"{float(metrics.get('sortino_ratio', 0.0)):.2f}") 
             
             st.markdown("### Relative Risk Metrics")
             relative_cols = st.columns(4)
@@ -2421,18 +2426,24 @@ with tabs[2]:
                 # Validate and clean the DataFrame elements before calling the API
                 for col in ['Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %']:
                     if col in stressed_df_for_api.columns:
-                        # Ensure the data in the column is a scalar or simple list/array
-                        # This extra step tries to flatten any nested structures within cells
-                        # that might prevent pd.to_numeric from operating directly on the Series.
-                        # For example, if a cell accidentally became `[50.0]`, this turns it to `50.0`.
                         try:
-                            # Apply a lambda function to each element to flatten if it's a list/array
-                            # This is a defensive step for unexpected data structures in cells.
-                            stressed_df_for_api[col] = stressed_df_for_api[col].apply(
-                                lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) == 1 else x
-                            )
-                            # Then, convert the Series to numeric
-                            stressed_df_for_api[col] = pd.to_numeric(stressed_df_for_api[col], errors='coerce').fillna(0.0)
+                            # IMPORTANT: Ensure the column content is consumable by pd.to_numeric.
+                            # The .apply(lambda x: x[0] if ... else x) is a defensive measure for weird nested lists.
+                            # The primary fix for "arg must be a list..." is if stressed_df_for_api[col] itself
+                            # is not a Series object. This is highly unlikely if stressed_df_for_api is a valid DataFrame.
+                            # So, we'll try to convert its *values* to a list/array first if it's an object dtype,
+                            # to be absolutely sure pd.to_numeric gets a simple iterable.
+
+                            if stressed_df_for_api[col].dtype == 'object':
+                                # Attempt to flatten if cells contain lists/arrays
+                                column_data_to_convert = stressed_df_for_api[col].apply(
+                                    lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) == 1 else x
+                                ).tolist() # Convert to a list of Python scalars
+                            else:
+                                column_data_to_convert = stressed_df_for_api[col].tolist() # Convert numerical Series to list
+
+                            stressed_df_for_api[col] = pd.to_numeric(column_data_to_convert, errors='coerce').fillna(0.0)
+
                         except Exception as e:
                             st.error(f"Error cleaning column '{col}' for API call in stress test: {e}. Skipping API call.")
                             stressed_compliance_results = [] # Indicate failure to get results
