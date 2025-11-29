@@ -2759,7 +2759,8 @@ with tabs[2]:
                 st.session_state['stress_summary'] = summary
 
                 # --- Ensure columns are clean before calling the LOCAL compliance checker ---
-                stressed_df_for_local_check = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'}).copy()
+                # Drop original 'Weight %' to avoid duplication before renaming 'Stressed Weight %'
+                stressed_df_for_local_check = stressed_df.drop(columns=['Weight %'], errors='ignore').rename(columns={'Stressed Weight %': 'Weight %'}).copy()
 
                 stressed_compliance_results = [] # Initialize here to ensure it always exists
                 stressed_breach_alerts = []
