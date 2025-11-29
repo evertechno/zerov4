@@ -1,4 +1,5 @@
 
+
 import streamlit as st
 import pandas as pd
 import json
@@ -579,25 +580,19 @@ def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, t
     """
     Calls the API to run compliance checks.
     
-    Fix: Ensure that DataFrame columns passed to pd.to_numeric are indeed Series 
-    (which they should be if the input is a valid DataFrame, reinforcing that 
-    the input is handled correctly).
+    Fix: Ensure that DataFrame columns passed to pd.to_numeric are Series, 
+    but remove the overly aggressive defensive check that caused the AttributeError.
+    The standard copy() operation followed by df_clean[col] access should already return a Series.
     """
     
-    # Ensure a defensive copy and necessary columns exist
+    # Ensure a defensive copy
     df_clean = portfolio_df.copy()
     
     for col in ['Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %']:
         if col in df_clean.columns:
-            # Explicitly cast to Series before calling to_numeric, although standard DataFrame access should return Series.
-            # This confirms the data type issue likely stems from corrupted input data structure.
-            series_to_convert = df_clean[col]
-            
-            # Check if the column data is a Series; if not, force convert the underlying data structure
-            if not isinstance(series_to_convert, pd.Series):
-                 # This attempts to fix unexpected structures (like lists within a column)
-                df_clean[col] = pd.Series(df_clean[col].tolist(), index=df_clean.index)
-
+            # We trust that df_clean[col] returns a Series, and apply to_numeric directly.
+            # If the original input CSV parsing resulted in list/numpy objects inside cells,
+            # this might still fail, but we assume the standard CSV upload yields simple data types.
             df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0.0)
 
     payload = {
@@ -1213,7 +1208,7 @@ with st.sidebar:
                 'ai_completed': '🤖'
             }.get(analysis_stage, '📊')
             
-            with st.expander(f"{stage_emoji} {portfolio_name}"):
+            with st.expander(f"{stage_emoji} {portfolio['portfolio_name']}"):
                 st.caption(f"Stage: {analysis_stage}")
                 
                 if st.button(f"Load", key=f"load_{portfolio['id']}", use_container_width=True):
@@ -1393,7 +1388,7 @@ with tabs[0]:
         default_rules = st.session_state.get("current_rules_text", """# SEBI Compliance Rules
 STOCK RELIANCE < 10
 STOCK TCS < 10
-SECTOR BANKING < 25
+SECTOR BANKing < 25
 SECTOR IT < 25
 TOP_N_STOCKS 10 <= 50
 TOP_N_SECTORS 3 <= 60
