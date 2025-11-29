@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import json
@@ -2250,8 +2251,8 @@ with tabs[2]:
         
     st.info(f"Analyzing: **{st.session_state.get('current_portfolio_name', 'Unnamed Portfolio')}**")
     
-    
-    risk_tab1, risk_tab2, risk_tab3 = st.tabs(["Advanced Metrics & Performance", "Stress Testing & Scenarios", "Security Risk Breakdown & RMS"])
+    # Removed risk_tab3
+    risk_tab1, risk_tab2 = st.tabs(["Advanced Metrics & Performance", "Stress Testing & Scenarios"])
 
     # --- Risk Tab 1: Advanced Metrics ---
     with risk_tab1:
@@ -2415,16 +2416,27 @@ with tabs[2]:
                 # --- FIX: Ensure columns are clean before calling the API checker ---
                 stressed_df_for_api = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'}).copy()
                 
-                # Clean specific numeric columns in the stressed DataFrame copy
+                stressed_compliance_results = [] # Initialize here to ensure it always exists
+                
+                # Validate and clean the DataFrame elements before calling the API
                 for col in ['Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %']:
                     if col in stressed_df_for_api.columns:
+                        # Ensure the data in the column is a scalar or simple list/array
+                        # This extra step tries to flatten any nested structures within cells
+                        # that might prevent pd.to_numeric from operating directly on the Series.
+                        # For example, if a cell accidentally became `[50.0]`, this turns it to `50.0`.
                         try:
-                            # Simplified cleaning: directly apply pd.to_numeric
+                            # Apply a lambda function to each element to flatten if it's a list/array
+                            # This is a defensive step for unexpected data structures in cells.
+                            stressed_df_for_api[col] = stressed_df_for_api[col].apply(
+                                lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) == 1 else x
+                            )
+                            # Then, convert the Series to numeric
                             stressed_df_for_api[col] = pd.to_numeric(stressed_df_for_api[col], errors='coerce').fillna(0.0)
                         except Exception as e:
                             st.error(f"Error cleaning column '{col}' for API call in stress test: {e}. Skipping API call.")
-                            stressed_compliance_results = [] # Indicate failure
-                            break # Exit loop if a critical error occurs
+                            stressed_compliance_results = [] # Indicate failure to get results
+                            break # Exit the loop if cleaning fails for a column
                 else: # This else block executes if the for loop completes without a 'break'
                     stressed_compliance_results = call_compliance_api_run_check(
                         stressed_df_for_api,
@@ -2495,117 +2507,6 @@ with tabs[2]:
                 'Weight %': '{:.2f}%',
                 'Stressed Weight %': '{:.2f}%'
             }), use_container_width=True)
-
-    # --- Risk Tab 3: Security Risk Breakdown & RMS ---
-    with risk_tab3:
-        st.subheader("Security-Level Risk Decomposition (RMS)")
-        
-        metrics = st.session_state.get("advanced_metrics", DEFAULT_ADVANCED_METRICS.copy())
-        returns_df_raw = st.session_state.get("risk_returns_df", pd.DataFrame())
-        
-        portfolio_volatility = metrics.get('portfolio_volatility', 0)
-
-        # 1. Check for sufficient data
-        if portfolio_volatility < 1e-6 or returns_df_raw.empty or 'Benchmark' not in returns_df_raw.columns:
-            st.warning("Portfolio volatility is near zero or returns data is insufficient; risk decomposition skipped. Please calculate metrics first.")
-        else:
-            # --- Start Decomposition Logic ---
-            st.info("Risk metrics calculated based on historical correlation and volatility.")
-
-            # Ensure the returns_df is indexed by date for calculation
-            returns_df = returns_df_raw.set_index('date') if 'date' in returns_df_raw.columns else returns_df_raw.copy()
-            
-            # Filter returns to just the securities
-            stock_returns_df = returns_df.drop(columns=['Portfolio', 'Active Return', 'Benchmark'], errors='ignore')
-            
-            # 2. Identify stocks with non-zero historical variance (must have moved to contribute risk)
-            # Find stocks with non-zero variance (avoid division by zero/flat lines)
-            valid_variance_symbols = stock_returns_df.columns[stock_returns_df.apply(lambda x: x.var() > 1e-12, axis=0)].tolist()
-            
-            if not valid_variance_symbols:
-                st.warning("No securities found with significant historical volatility to perform decomposition.")
-            else:
-                stock_returns_df = stock_returns_df[valid_variance_symbols]
-                benchmark_returns = returns_df['Benchmark']
-                
-                # Prepare contribution DataFrame, filtering only for valid symbols
-                risk_contribution_df = portfolio_df[['Symbol', 'Name', 'Weight %', 'Industry']].copy()
-                risk_contribution_df['Weight %'] = pd.to_numeric(risk_contribution_df['Weight %'], errors='coerce').fillna(0) # Ensure numeric
-                risk_contribution_df = risk_contribution_df[risk_contribution_df['Symbol'].isin(valid_variance_symbols)] # Use valid_variance_symbols
-                risk_contribution_df['Weight'] = risk_contribution_df['Weight %'] / 100
-                
-                # Reindex weights to align with the filtered stock_returns_df columns
-                weights = risk_contribution_df.set_index('Symbol')['Weight'].reindex(stock_returns_df.columns, fill_value=0).values
-                
-                try:
-                    cov_matrix = stock_returns_df.cov() * TRADING_DAYS_PER_YEAR
-                except Exception as e:
-                    st.warning(f"Covariance matrix calculation failed internally ({e}). This usually means data is too sparse.")
-                    cov_matrix = pd.DataFrame()
-
-
-                if not cov_matrix.empty and len(weights) == len(cov_matrix) and portfolio_volatility > 1e-6:
-                    
-                    # 2. Calculate Volatility and Beta per security
-                    security_vols_daily = stock_returns_df.std()
-                    security_vols_annual = security_vols_daily * np.sqrt(TRADING_DAYS_PER_YEAR)
-                    security_betas = {}
-                    
-                    if benchmark_returns.var() > 1e-6:
-                        for symbol in stock_returns_df.columns:
-                            # Note: We already filtered for non-zero variance stocks, so this should be fine
-                            beta_val = stock_returns_df[symbol].cov(benchmark_returns) / benchmark_returns.var()
-                            security_betas[symbol] = beta_val
-                    
-                    risk_contribution_df['Beta'] = risk_contribution_df['Symbol'].map(security_betas).fillna(0)
-                    risk_contribution_df['Annualized Volatility'] = risk_contribution_df['Symbol'].map(security_vols_annual.to_dict()).fillna(0) * 100 # as %
-
-                    # 3. Risk Decomposition (MCR and TRC)
-                    cov_matrix_filtered = cov_matrix.reindex(index=stock_returns_df.columns, columns=stock_returns_df.columns, fill_value=0)
-                    
-                    marginal_variance_contribution = cov_matrix_filtered.dot(weights) 
-                    MCR_vol = marginal_variance_contribution / portfolio_volatility
-                    TRC_vol = (weights * MCR_vol.values)
-                    
-                    risk_contribution_df['MCR (Vol)'] = risk_contribution_df['Symbol'].map(MCR_vol.to_dict()).fillna(0)
-                    risk_contribution_df['Risk Contribution (Vol)'] = risk_contribution_df['Symbol'].map(pd.Series(TRC_vol, index=stock_returns_df.columns).to_dict()).fillna(0)
-                    risk_contribution_df['% of Total Risk'] = (risk_contribution_df['Risk Contribution (Vol)'] / portfolio_volatility) * 100
-
-                    # --- Display Results ---
-                    st.markdown("#### Risk Decomposition (Contribution to Portfolio Volatility)")
-                    
-                    # Filter to ensure the display only includes stocks with calculated metrics
-                    risk_contribution_df_filtered = risk_contribution_df[risk_contribution_df['Risk Contribution (Vol)'].abs() > 1e-9]
-                    
-                    display_cols = ['Name', 'Weight %', 'Annualized Volatility', 'Beta', 'Risk Contribution (Vol)', '% of Total Risk']
-                    
-                    top_risk_contributors = risk_contribution_df_filtered.nlargest(10, 'Risk Contribution (Vol)', keep='first')
-                    
-                    if not top_risk_contributors.empty:
-                        st.dataframe(top_risk_contributors[display_cols].style.format({
-                            'Weight %': '{:.2f}%',
-                            'Annualized Volatility': '{:.2f}%',
-                            'Beta': '{:.2f}',
-                            'Risk Contribution (Vol)': '{:.4f}',
-                            '% of Total Risk': '{:.1f}%'
-                        }), use_container_width=True)
-
-                        
-                        # Visualization: Risk Contribution vs Weight
-                        fig_decomp = px.bar(
-                            risk_contribution_df_filtered.sort_values('% of Total Risk', ascending=False).head(20),
-                            x='Symbol',
-                            y='% of Total Risk',
-                            color='Industry',
-                            title='Top 20 Securities: Percentage Contribution to Portfolio Volatility',
-                            hover_data=['Name', 'Weight %', 'Annualized Volatility']
-                        )
-                        st.plotly_chart(fig_decomp, use_container_width=True)
-                    else:
-                        st.info("No securities found with meaningful risk contribution to display.")
-                else:
-                    st.warning("Covariance matrix calculation failed or shape mismatch. Check historical data fetching consistency and ensure there are multiple data points.")
-            # --- End Decomposition Logic ---
 
 
 # --- TAB 4: API Interactions (Unchanged) ---
