@@ -45,7 +45,7 @@ st.set_page_config(page_title="Invsion Connect", layout="wide", initial_sidebar_
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_EXCHANGE = "NSE"
 BENCHMARK_NIFTY_SYMBOL = "NIFTY 50" # Use a specific constant for the default benchmark
-COMPLIANCE_API_BASE_URL = "https://zeroapiv4.onrender.com/api/v1" 
+# COMPLIANCE_API_BASE_URL = "https://zeroapiv4.onrender.com/api/v1" # Removed API dependency for compliance logic
 
 # --- Standard Advanced Metrics Structure ---
 DEFAULT_ADVANCED_METRICS = {
@@ -538,51 +538,461 @@ def get_historical_data_cached(api_key: str, access_token: str, symbol: str, fro
         return pd.DataFrame({"_error": [str(e)]})
 
 
-# --- Compliance API Integration Helper ---
-def call_compliance_api(endpoint: str, payload: dict):
+# --- LOCAL Compliance Rule Engine ---
+def evaluate_rule(rule_line: str, portfolio_df: pd.DataFrame, threshold_configs: dict):
     """
-    Generic helper function to call a compliance API endpoint.
-    Returns JSON response data or None on error.
+    Evaluates a single compliance rule against the portfolio DataFrame.
+    Returns a dictionary indicating status, details, and breach info.
     """
+    rule_line = rule_line.strip()
+    if not rule_line or rule_line.startswith('#'):
+        return None # Skip empty lines or comments
+
+    result = {
+        'rule': rule_line,
+        'status': 'PASS',
+        'details': 'Compliant',
+        'current_value': None,
+        'threshold': None,
+        'breach_amount': 0.0
+    }
+
     try:
-        url = f"{COMPLIANCE_API_BASE_URL}{endpoint}"
-        # st.info(f"Calling API: {url} with payload (truncated): {str(payload)[:500]}...") # Log payload for debug
-        response = requests.post(url, json=payload, timeout=60)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-        # st.success(f"API call to {endpoint} successful!")
-        return response.json()
-    except requests.exceptions.HTTPError as e:
-        st.error(f"API HTTP Error ({endpoint}): {e.response.status_code} - {e.response.text}")
-        return None
-    except requests.exceptions.ConnectionError as e:
-        st.error(f"API Connection Error ({endpoint}): {e}")
-        return None
-    except requests.exceptions.Timeout as e:
-        st.error(f"API Timeout Error ({endpoint}): {e}")
-        return None
-    except requests.exceptions.RequestException as e:
-        st.error(f"An unexpected API Request Error occurred ({endpoint}): {e}")
-        return None
-    except json.JSONDecodeError:
-        try:
-            st.error(f"Failed to decode JSON response from API ({endpoint}): {response.text}")
-        except:
-             st.error(f"Failed to decode JSON response from API ({endpoint}): No response text available.")
-        return None
+        parts = rule_line.split()
+        rule_type = parts[0].upper()
+        
+        # Ensure 'Weight %' is numeric for all calculations
+        portfolio_df['Weight %'] = pd.to_numeric(portfolio_df['Weight %'], errors='coerce').fillna(0)
+
+        # Helper for operator evaluation
+        def check_condition(current, operator, threshold):
+            if operator == '<': return current < threshold
+            if operator == '>': return current > threshold
+            if operator == '<=': return current <= threshold
+            if operator == '>=': return current >= threshold
+            if operator == '=': return current == threshold
+            return False
+
+        if rule_type == "STOCK":
+            symbol = parts[1].upper()
+            operator = parts[2]
+            threshold = float(parts[3])
+            current_weight = portfolio_df[portfolio_df['Symbol'].str.upper() == symbol]['Weight %'].sum()
+            result['current_value'] = current_weight
+            result['threshold'] = threshold
+            if not check_condition(current_weight, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"{symbol} weight {current_weight:.2f}% {operator} {threshold:.2f}%"
+                result['breach_amount'] = current_weight - threshold if operator in ['<', '<='] else threshold - current_weight
+        
+        elif rule_type == "SECTOR":
+            sector_name = parts[1].upper()
+            operator = parts[2]
+            threshold = float(parts[3])
+            
+            if 'Industry' not in portfolio_df.columns:
+                raise ValueError("Portfolio data missing 'Industry' column for SECTOR rule.")
+            
+            current_weight = portfolio_df[portfolio_df['Industry'].str.upper() == sector_name]['Weight %'].sum()
+            result['current_value'] = current_weight
+            result['threshold'] = threshold
+            if not check_condition(current_weight, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Sector {sector_name} weight {current_weight:.2f}% {operator} {threshold:.2f}%"
+                result['breach_amount'] = current_weight - threshold if operator in ['<', '<='] else threshold - current_weight
+
+        elif rule_type == "TOP_N_STOCKS":
+            n = int(parts[1])
+            operator = parts[2]
+            threshold = float(parts[3])
+            if len(portfolio_df) >= n:
+                current_value = portfolio_df.nlargest(n, 'Weight %')['Weight %'].sum()
+            else:
+                current_value = portfolio_df['Weight %'].sum() # if less than N stocks, sum all
+            result['current_value'] = current_value
+            result['threshold'] = threshold
+            if not check_condition(current_value, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Top {n} stocks concentration {current_value:.2f}% {operator} {threshold:.2f}%"
+                result['breach_amount'] = current_value - threshold if operator in ['<', '<='] else threshold - current_value
+
+        elif rule_type == "TOP_N_SECTORS":
+            n = int(parts[1])
+            operator = parts[2]
+            threshold = float(parts[3])
+            if 'Industry' not in portfolio_df.columns:
+                raise ValueError("Portfolio data missing 'Industry' column for TOP_N_SECTORS rule.")
+            
+            sector_weights = portfolio_df.groupby('Industry')['Weight %'].sum().nlargest(n)
+            current_value = sector_weights.sum() if len(sector_weights) >= n else portfolio_df['Weight %'].sum() # Sum of top N or all if fewer than N
+            result['current_value'] = current_value
+            result['threshold'] = threshold
+            if not check_condition(current_value, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Top {n} sectors concentration {current_value:.2f}% {operator} {threshold:.2f}%"
+                result['breach_amount'] = current_value - threshold if operator in ['<', '<='] else threshold - current_value
+        
+        elif rule_type == "BOTTOM_N_STOCKS":
+            n = int(parts[1])
+            operator = parts[2]
+            threshold = float(parts[3])
+            if len(portfolio_df) >= n:
+                current_value = portfolio_df.nsmallest(n, 'Weight %')['Weight %'].sum()
+            else:
+                current_value = portfolio_df['Weight %'].sum() # if less than N stocks, sum all
+            result['current_value'] = current_value
+            result['threshold'] = threshold
+            if not check_condition(current_value, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Bottom {n} stocks concentration {current_value:.2f}% {operator} {threshold:.2f}%"
+                result['breach_amount'] = current_value - threshold if operator in ['<', '<='] else threshold - current_value
+
+        elif rule_type == "COUNT_STOCKS":
+            operator = parts[1]
+            threshold = int(parts[2])
+            current_value = len(portfolio_df)
+            result['current_value'] = current_value
+            result['threshold'] = threshold
+            if not check_condition(current_value, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Number of stocks {current_value} {operator} {threshold}"
+                result['breach_amount'] = current_value - threshold if operator in ['<', '<='] else threshold - current_value
+
+        elif rule_type == "COUNT_SECTORS":
+            operator = parts[1]
+            threshold = int(parts[2])
+            if 'Industry' not in portfolio_df.columns:
+                raise ValueError("Portfolio data missing 'Industry' column for COUNT_SECTORS rule.")
+            current_value = portfolio_df['Industry'].nunique()
+            result['current_value'] = current_value
+            result['threshold'] = threshold
+            if not check_condition(current_value, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Number of sectors {current_value} {operator} {threshold}"
+                result['breach_amount'] = current_value - threshold if operator in ['<', '<='] else threshold - current_value
+
+        elif rule_type == "AVG_STOCK_WEIGHT":
+            operator = parts[1]
+            threshold = float(parts[2])
+            current_value = portfolio_df['Weight %'].mean() if not portfolio_df.empty else 0.0
+            result['current_value'] = current_value
+            result['threshold'] = threshold
+            if not check_condition(current_value, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Average stock weight {current_value:.2f}% {operator} {threshold:.2f}%"
+                result['breach_amount'] = current_value - threshold if operator in ['<', '<='] else threshold - current_value
+
+        elif rule_type == "MAX_STOCK_WEIGHT":
+            operator = parts[1]
+            threshold = float(parts[2])
+            current_value = portfolio_df['Weight %'].max() if not portfolio_df.empty else 0.0
+            result['current_value'] = current_value
+            result['threshold'] = threshold
+            if not check_condition(current_value, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Maximum stock weight {current_value:.2f}% {operator} {threshold:.2f}%"
+                result['breach_amount'] = current_value - threshold if operator in ['<', '<='] else threshold - current_value
+
+        elif rule_type == "MIN_STOCK_WEIGHT":
+            operator = parts[1]
+            threshold = float(parts[2])
+            current_value = portfolio_df['Weight %'].min() if not portfolio_df.empty else 0.0
+            result['current_value'] = current_value
+            result['threshold'] = threshold
+            if not check_condition(current_value, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Minimum stock weight {current_value:.2f}% {operator} {threshold:.2f}%"
+                result['breach_amount'] = current_value - threshold if operator in ['<', '<='] else threshold - current_value
+        
+        elif rule_type == "SECTOR_DIVERSITY":
+            sector_name = parts[1].upper()
+            operator = parts[2]
+            threshold = int(parts[3])
+            if 'Industry' not in portfolio_df.columns:
+                raise ValueError("Portfolio data missing 'Industry' column for SECTOR_DIVERSITY rule.")
+            
+            current_value = portfolio_df[portfolio_df['Industry'].str.upper() == sector_name]['Symbol'].nunique()
+            result['current_value'] = current_value
+            result['threshold'] = threshold
+            if not check_condition(current_value, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Stocks in sector {sector_name} {current_value} {operator} {threshold}"
+                result['breach_amount'] = current_value - threshold if operator in ['<', '<='] else threshold - current_value
+
+        elif rule_type == "HHI":
+            operator = parts[1]
+            threshold = float(parts[2])
+            if not portfolio_df.empty:
+                current_value = (portfolio_df['Weight %'] ** 2).sum()
+            else:
+                current_value = 0.0
+            result['current_value'] = current_value
+            result['threshold'] = threshold
+            if not check_condition(current_value, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Herfindahl-Hirschman Index (HHI) {current_value:.2f} {operator} {threshold:.2f}"
+                result['breach_amount'] = current_value - threshold if operator in ['<', '<='] else threshold - current_value
+
+        elif rule_type == "GINI":
+            operator = parts[1]
+            threshold = float(parts[2])
+            if not portfolio_df.empty:
+                weights_sorted = portfolio_df['Weight %'].sort_values().values
+                n = len(weights_sorted)
+                if n > 0 and np.sum(weights_sorted) > 0:
+                    index = np.arange(1, n + 1)
+                    relative_weights = weights_sorted / np.sum(weights_sorted)
+                    current_value = (np.sum((2 * index - n - 1) * relative_weights)) / n
+                else:
+                    current_value = 0.0
+            else:
+                current_value = 0.0
+            result['current_value'] = current_value
+            result['threshold'] = threshold
+            if not check_condition(current_value, operator, threshold):
+                result['status'] = 'FAIL'
+                result['details'] = f"Gini Coefficient {current_value:.4f} {operator} {threshold:.4f}"
+                result['breach_amount'] = current_value - threshold if operator in ['<', '<='] else threshold - current_value
+
+        else:
+            result['status'] = 'ERROR'
+            result['details'] = f"Unknown rule type: {rule_type}"
+
     except Exception as e:
-        st.error(f"An unexpected error occurred during API call ({endpoint}): {e}")
-        return None
+        result['status'] = 'ERROR'
+        result['details'] = f"Error parsing/evaluating rule: {e}"
+        st.exception(f"Error evaluating rule: {rule_line}")
+
+    return result
+
+def run_local_compliance_checks(portfolio_df: pd.DataFrame, rules_text: str, threshold_configs: dict):
+    """
+    Runs all local compliance checks based on rules_text and threshold_configs.
+    """
+    compliance_results = []
+    breaches = []
+
+    # 1. Evaluate custom rules from rules_text
+    rule_lines = rules_text.split('\n')
+    for line in rule_lines:
+        rule_evaluation_result = evaluate_rule(line, portfolio_df, threshold_configs)
+        if rule_evaluation_result:
+            compliance_results.append(rule_evaluation_result)
+            if rule_evaluation_result['status'] == 'FAIL':
+                severity = "🟡 Medium" 
+                if abs(rule_evaluation_result.get('breach_amount', 0)) > rule_evaluation_result.get('threshold', 0) * 0.2:
+                    severity = "🔴 Critical"
+                elif abs(rule_evaluation_result.get('breach_amount', 0)) > rule_evaluation_result.get('threshold', 0) * 0.1:
+                    severity = "🟠 High"
+                
+                breaches.append({
+                    'type': 'Custom Rule Violation',
+                    'severity': severity,
+                    'details': f"{rule_evaluation_result['rule']} - {rule_evaluation_result['details']}"
+                })
+
+    # 2. Add system-defined threshold checks (from threshold_configs)
+    # These are similar to what was in the API, now local.
+    
+    # Ensure 'Weight %' is numeric for safety
+    portfolio_df['Weight %'] = pd.to_numeric(portfolio_df['Weight %'], errors='coerce').fillna(0.0)
+
+    # Single Stock Limit
+    single_stock_limit = threshold_configs.get('single_stock_limit', 10.0)
+    if (portfolio_df['Weight %'] > single_stock_limit).any():
+        for _, stock in portfolio_df[portfolio_df['Weight %'] > single_stock_limit].iterrows():
+            breaches.append({
+                'type': 'System Rule: Single Stock Limit',
+                'severity': '🔴 Critical',
+                'details': f"{stock['Symbol']} ({stock['Name']}) at {stock['Weight %']:.2f}% (Limit: {single_stock_limit}%)"
+            })
+            compliance_results.append({
+                'rule': f"SINGLE_STOCK_LIMIT < {single_stock_limit}",
+                'status': 'FAIL',
+                'details': f"Stock {stock['Symbol']} weight {stock['Weight %']:.2f}% > {single_stock_limit:.2f}%",
+                'current_value': stock['Weight %'],
+                'threshold': single_stock_limit,
+                'breach_amount': stock['Weight %'] - single_stock_limit
+            })
+
+    # Single Sector Limit
+    if 'Industry' in portfolio_df.columns:
+        sector_weights = portfolio_df.groupby('Industry')['Weight %'].sum()
+        single_sector_limit = threshold_configs.get('single_sector_limit', 25.0)
+        if (sector_weights > single_sector_limit).any():
+            for sector, weight in sector_weights[sector_weights > single_sector_limit].items():
+                breaches.append({
+                    'type': 'System Rule: Single Sector Limit',
+                    'severity': '🟠 High',
+                    'details': f"Sector {sector} at {weight:.2f}% (Limit: {single_sector_limit}%)"
+                })
+                compliance_results.append({
+                    'rule': f"SINGLE_SECTOR_LIMIT < {single_sector_limit}",
+                    'status': 'FAIL',
+                    'details': f"Sector {sector} weight {weight:.2f}% > {single_sector_limit:.2f}%",
+                    'current_value': weight,
+                    'threshold': single_sector_limit,
+                    'breach_amount': weight - single_sector_limit
+                })
+
+    # Top 10 Holdings Limit
+    top_10_holdings_limit = threshold_configs.get('top_10_holdings_limit', 50.0)
+    if len(portfolio_df) > 0:
+        top_10_weight = portfolio_df.nlargest(10, 'Weight %')['Weight %'].sum()
+    else:
+        top_10_weight = 0.0
+    
+    if top_10_weight > top_10_holdings_limit:
+        breaches.append({
+            'type': 'System Rule: Top 10 Holdings Limit',
+            'severity': '🔴 Critical',
+            'details': f"Top 10 holdings combine for {top_10_weight:.2f}% (Limit: {top_10_holdings_limit}%)"
+        })
+        compliance_results.append({
+            'rule': f"TOP_10_HOLDINGS < {top_10_holdings_limit}",
+            'status': 'FAIL',
+            'details': f"Top 10 holdings combined weight {top_10_weight:.2f}% > {top_10_holdings_limit:.2f}%",
+            'current_value': top_10_weight,
+            'threshold': top_10_holdings_limit,
+            'breach_amount': top_10_weight - top_10_holdings_limit
+        })
+        
+    # Minimum Holdings
+    min_holdings = threshold_configs.get('min_holdings', 20)
+    if len(portfolio_df) < min_holdings:
+        breaches.append({
+            'type': 'System Rule: Minimum Holdings',
+            'severity': '🟡 Medium',
+            'details': f"Portfolio has only {len(portfolio_df)} holdings (Minimum: {min_holdings})"
+        })
+        compliance_results.append({
+            'rule': f"MIN_HOLDINGS >= {min_holdings}",
+            'status': 'FAIL',
+            'details': f"Portfolio holdings count {len(portfolio_df)} < {min_holdings}",
+            'current_value': len(portfolio_df),
+            'threshold': min_holdings,
+            'breach_amount': float(min_holdings - len(portfolio_df))
+        })
+
+    # Other system-level checks can be added here following similar patterns
+    
+    return compliance_results, breaches
+
+def get_simulated_portfolio_df(original_df: pd.DataFrame, trade: dict = None, cash_flow: dict = None):
+    """
+    Applies a hypothetical trade or cash flow to the portfolio and recalculates weights.
+    Returns a new DataFrame representing the simulated portfolio.
+    """
+    simulated_df = original_df.copy()
+
+    # Ensure necessary columns are numeric
+    simulated_df['Quantity'] = pd.to_numeric(simulated_df['Quantity'], errors='coerce').fillna(0)
+    simulated_df['LTP'] = pd.to_numeric(simulated_df['LTP'], errors='coerce').fillna(0)
+    simulated_df['Real-time Value (Rs)'] = (simulated_df['LTP'] * simulated_df['Quantity']).fillna(0)
+
+    # Apply trade
+    if trade:
+        symbol = trade['symbol']
+        action = trade['action']
+        quantity = trade['quantity']
+        ltp = trade['ltp']
+        industry = trade.get('industry', 'UNKNOWN')
+        name = trade.get('name', symbol)
+
+        if symbol in simulated_df['Symbol'].values:
+            idx = simulated_df[simulated_df['Symbol'] == symbol].index[0]
+            if action == "BUY":
+                simulated_df.loc[idx, 'Quantity'] += quantity
+                simulated_df.loc[idx, 'LTP'] = ltp # Update LTP to trade price for consistency in this simulation
+            elif action == "SELL":
+                simulated_df.loc[idx, 'Quantity'] -= quantity
+                if simulated_df.loc[idx, 'Quantity'] < 0:
+                    simulated_df.loc[idx, 'Quantity'] = 0 # Cannot sell more than owned
+        else: # New stock for BUY trade
+            if action == "BUY":
+                new_holding = pd.DataFrame([{
+                    'Symbol': symbol,
+                    'Name': name,
+                    'Industry': industry,
+                    'Quantity': quantity,
+                    'LTP': ltp,
+                    'Real-time Value (Rs)': ltp * quantity,
+                    'Weight %': 0.0 # Will be recalculated
+                }])
+                simulated_df = pd.concat([simulated_df, new_holding], ignore_index=True)
+            # SELL of non-existent stock has no effect here
+    
+    # Apply cash flow (adjust existing 'CASH' or create it)
+    cash_amount = 0.0
+    if cash_flow and 'amount' in cash_flow:
+        cash_amount = float(cash_flow['amount'])
+
+    # Re-calculate Real-time Value (Rs) and total value
+    simulated_df['Real-time Value (Rs)'] = (simulated_df['LTP'] * simulated_df['Quantity']).fillna(0)
+    
+    # Filter out holdings with zero quantity after trade/adjustment, unless they represent cash
+    simulated_df = simulated_df[simulated_df['Quantity'] > 0].reset_index(drop=True)
+
+    # Add/Update 'CASH' holding for total value calculation for now.
+    # A more robust solution might handle cash separately without it being a "holding"
+    current_cash_value = 0.0
+    if 'CASH' in simulated_df['Symbol'].values:
+        cash_idx = simulated_df[simulated_df['Symbol'] == 'CASH'].index[0]
+        current_cash_value = simulated_df.loc[cash_idx, 'Real-time Value (Rs)']
+        simulated_df.loc[cash_idx, 'Real-time Value (Rs)'] = current_cash_value + cash_amount
+        simulated_df.loc[cash_idx, 'Quantity'] = simulated_df.loc[cash_idx, 'Real-time Value (Rs)'] # Quantity for cash = value
+        simulated_df.loc[cash_idx, 'LTP'] = 1.0 # LTP for cash is 1
+    else:
+        if cash_amount > 0 or simulated_df.empty: # Add cash if there's an inflow or portfolio is empty
+             new_cash_row = pd.DataFrame([{
+                'Symbol': 'CASH', 'Name': 'Cash Equivalent', 'Industry': 'CASH',
+                'Quantity': cash_amount, 'LTP': 1.0, 'Real-time Value (Rs)': cash_amount, 'Weight %': 0.0
+            }])
+             simulated_df = pd.concat([simulated_df, new_cash_row], ignore_index=True)
+             
+    simulated_df = simulated_df[simulated_df['Real-time Value (Rs)'] > 0].reset_index(drop=True)
+
+    total_value = simulated_df['Real-time Value (Rs)'].sum()
+    simulated_df['Weight %'] = (simulated_df['Real-time Value (Rs)'] / total_value * 100) if total_value > 0 else 0
+
+    return simulated_df
 
 
-# --- Enhanced Compliance Functions (using API) ---
+# --- END LOCAL Compliance Rule Engine ---
+
+
+# --- Compliance API Integration Helper (kept for other sections if needed, but not for local compliance checks) ---
+# def call_compliance_api(endpoint: str, payload: dict):
+#     """
+#     Generic helper function to call a compliance API endpoint.
+#     Returns JSON response data or None on error.
+#     """
+#     try:
+#         url = f"{COMPLIANCE_API_BASE_URL}{endpoint}"
+#         response = requests.post(url, json=payload, timeout=60)
+#         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+#         return response.json()
+#     except requests.exceptions.HTTPError as e:
+#         st.error(f"API HTTP Error ({endpoint}): {e.response.status_code} - {e.response.text}")
+#         return None
+#     except requests.exceptions.RequestException as e:
+#         st.error(f"An unexpected API Request Error occurred ({endpoint}): {e}")
+#         return None
+#     except json.JSONDecodeError:
+#         try:
+#             st.error(f"Failed to decode JSON response from API ({endpoint}): {response.text}")
+#         except:
+#              st.error(f"Failed to decode JSON response from API ({endpoint}): No response text available.")
+#         return None
+#     except Exception as e:
+#         st.error(f"An unexpected error occurred during API call ({endpoint}): {e}")
+#         return None
+
+# The `call_compliance_api_run_check` now calls the local implementation
 def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, threshold_configs: dict):
     """
-    Calls the API to run compliance checks.
-    
-    Fix: Ensure that DataFrame columns passed to pd.to_numeric are Series
-    and handle potential nested list/array elements.
+    Placeholder for previous API call, now redirects to local compliance engine.
     """
-    
     # Ensure a defensive copy
     df_clean = portfolio_df.copy()
     
@@ -598,17 +1008,12 @@ def call_compliance_api_run_check(portfolio_df: pd.DataFrame, rules_text: str, t
                 # Then, convert to numeric.
                 df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0.0)
             except Exception as e:
-                st.exception(f"Critical data cleaning failure on column {col} before API call: {e}")
-                # If conversion fails dramatically, return empty to prevent API call with bad data
-                return [] 
-                
-    payload = {
-        "portfolio": df_clean.to_dict('records'),
-        "rules_text": rules_text,
-        "threshold_configs": threshold_configs
-    }
-    api_response = call_compliance_api("/simulate/portfolio", payload)
-    return api_response['compliance_results'] if api_response and 'compliance_results' in api_response else []
+                st.exception(f"Critical data cleaning failure on column {col} before local compliance check: {e}")
+                return [] # Return empty to indicate failure
+    
+    # Call the local compliance engine
+    compliance_results, _ = run_local_compliance_checks(df_clean, rules_text, threshold_configs)
+    return compliance_results
 
 
 def calculate_security_level_compliance(portfolio_df: pd.DataFrame, threshold_configs: dict):
@@ -1490,8 +1895,8 @@ HHI < 800""")
                         st.error("Total portfolio value is zero. Cannot proceed with weight-based analysis.")
                         st.stop()
 
-                    # Call API for custom rules validation
-                    compliance_results = call_compliance_api_run_check(df_results, rules_text, st.session_state["threshold_configs"])
+                    # Call LOCAL compliance checks
+                    compliance_results, breaches = run_local_compliance_checks(df_results, rules_text, st.session_state["threshold_configs"])
                     
                     # Calculate security-level compliance (local function)
                     security_compliance = calculate_security_level_compliance(df_results, st.session_state["threshold_configs"])
@@ -1499,75 +1904,10 @@ HHI < 800""")
                     # Store in session state
                     st.session_state.compliance_results_df = df_results
                     st.session_state.security_level_compliance = security_compliance
-                    st.session_state.compliance_results = compliance_results
+                    st.session_state.compliance_results = compliance_results # This now holds results from local_compliance_checks
                     st.session_state.current_rules_text = rules_text
                     st.session_state.current_portfolio_name = portfolio_name
-                    
-                    # Detect breaches (local detection for display consistency)
-                    breaches = []
-                    
-                    # --- Local Breach Detection ---
-                    single_stock_limit = st.session_state["threshold_configs"]['single_stock_limit']
-                    if (df_results['Weight %'] > single_stock_limit).any():
-                        breach_stocks = df_results[df_results['Weight %'] > single_stock_limit]
-                        for _, stock in breach_stocks.iterrows():
-                            breaches.append({
-                                'type': 'Single Stock Limit (Local Check)',
-                                'severity': '🔴 Critical',
-                                'details': f"{stock['Symbol']} at {stock['Weight %']:.2f}% (Limit: {single_stock_limit}%)"
-                            })
-                    
-                    # Sector limit breaches
-                    sector_weights = df_results.groupby('Industry')['Weight %'].sum()
-                    single_sector_limit = st.session_state["threshold_configs"]['single_sector_limit']
-                    if (sector_weights > single_sector_limit).any():
-                        breach_sectors = sector_weights[sector_weights > single_sector_limit]
-                        for sector, weight in breach_sectors.items():
-                            breaches.append({
-                                'type': 'Sector Limit (Local Check)',
-                                'severity': '🟠 High',
-                                'details': f"{sector} at {weight:.2f}% (Limit: {single_sector_limit}%)"
-                            })
-                    
-                    # Custom rule failures (from API)
-                    for rule_result in compliance_results:
-                        if rule_result['status'] == "FAIL":
-                            severity = "🟡 Medium" 
-                            if abs(rule_result.get('breach_amount', 0)) > rule_result.get('threshold', 0) * 0.2:
-                                severity = "🔴 Critical"
-                            elif abs(rule_result.get('breach_amount', 0)) > rule_result.get('threshold', 0) * 0.1:
-                                severity = "🟠 High"
-                            
-                            breaches.append({
-                                'type': 'Custom Rule Violation (API Check)',
-                                'severity': severity,
-                                'details': f"{rule_result['rule']} - {rule_result['details']}"
-                            })
-                    
-                    # Portfolio structure checks (local function as they depend on the updated df_results)
-                    if len(df_results) < st.session_state["threshold_configs"]['min_holdings']:
-                        breaches.append({
-                            'type': 'Min Holdings',
-                            'severity': '🟡 Medium',
-                            'details': f"Only {len(df_results)} holdings (Min: {st.session_state['threshold_configs']['min_holdings']})"
-                        })
-                    
-                    if len(df_results) > st.session_state["threshold_configs"]['max_holdings']:
-                        breaches.append({
-                            'type': 'Max Holdings',
-                            'severity': '🟡 Medium',
-                            'details': f"{len(df_results)} holdings (Max: {st.session_state['threshold_configs']['max_holdings']})"
-                        })
-                    
-                    sector_count = df_results['Industry'].nunique()
-                    if sector_count < st.session_state["threshold_configs"]['min_sectors']:
-                        breaches.append({
-                            'type': 'Min Sectors',
-                            'severity': '🟠 High',
-                            'details': f"Only {sector_count} sectors (Min: {st.session_state['threshold_configs']['min_sectors']})"
-                        })
-                    
-                    st.session_state.breach_alerts = breaches
+                    st.session_state.breach_alerts = breaches # Use the breaches directly from local_compliance_checks
                     st.session_state.compliance_stage = "compliance_done"
                     
                     # Save to database
@@ -1691,7 +2031,7 @@ HHI < 800""")
                 # API returns "PASS" or "FAIL"
                 passed = sum(1 for r in validation_results if r['status'] == "PASS")
                 failed = sum(1 for r in validation_results if r['status'] == "FAIL")
-                errors = sum(1 for r in validation_results if r['status'] == 'Error') # assuming API sends 'Error' for parsing issues
+                errors = sum(1 for r in validation_results if r['status'] == 'ERROR') # assuming local engine sends 'ERROR'
                 
                 summary_cols = st.columns(4)
                 summary_cols[0].metric("Total Rules", total_rules)
@@ -1703,7 +2043,7 @@ HHI < 800""")
                 
                 failed_rules = [r for r in validation_results if r['status'] == "FAIL"]
                 passed_rules = [r for r in validation_results if r['status'] == "PASS"]
-                error_rules = [r for r in validation_results if r['status'] == 'Error']
+                error_rules = [r for r in validation_results if r['status'] == 'ERROR']
                 
                 if failed_rules:
                     st.markdown("### ❌ Failed Rules")
@@ -2418,40 +2758,36 @@ with tabs[2]:
                 st.session_state['stressed_df'] = stressed_df
                 st.session_state['stress_summary'] = summary
                 
-                # --- FIX: Ensure columns are clean before calling the API checker ---
-                stressed_df_for_api = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'}).copy()
+                # --- Ensure columns are clean before calling the LOCAL compliance checker ---
+                stressed_df_for_local_check = stressed_df.rename(columns={'Stressed Weight %': 'Weight %'}).copy()
                 
                 stressed_compliance_results = [] # Initialize here to ensure it always exists
-                
-                # Validate and clean the DataFrame elements before calling the API
+                stressed_breach_alerts = []
+
+                # Validate and clean the DataFrame elements before calling the local compliance function
                 for col in ['Quantity', 'LTP', 'Real-time Value (Rs)', 'Weight %']:
-                    if col in stressed_df_for_api.columns:
+                    if col in stressed_df_for_local_check.columns:
                         try:
-                            # Apply a lambda to ensure each cell is a scalar (or can be coerced to one).
-                            # If a cell contains a single-element list or numpy array, extract the scalar.
-                            # Then, ensure the entire Series is numeric and fill NaN values.
-                            # This handles the 'numpy.ndarray' object has no attribute 'fillna' error
-                            # by ensuring we pass a proper Series/list-of-scalars to pd.to_numeric,
-                            # and call fillna on the *result* which is always a Series.
-                            
-                            processed_column_data = stressed_df_for_api[col].apply(
+                            processed_column_data = stressed_df_for_local_check[col].apply(
                                 lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) == 1 else x
                             )
-                            stressed_df_for_api[col] = pd.to_numeric(processed_column_data, errors='coerce').fillna(0.0)
+                            stressed_df_for_local_check[col] = pd.to_numeric(processed_column_data, errors='coerce').fillna(0.0)
 
                         except Exception as e:
-                            st.error(f"Error cleaning column '{col}' for API call in stress test: {e}. Skipping API call.")
-                            stressed_compliance_results = [] # Indicate failure to get results
-                            break # Exit the loop if cleaning fails for a column
+                            st.error(f"Error cleaning column '{col}' for local compliance check in stress test: {e}. Skipping check.")
+                            stressed_compliance_results = [] 
+                            stressed_breach_alerts = []
+                            break 
                 else: # This else block executes if the for loop completes without a 'break'
-                    stressed_compliance_results = call_compliance_api_run_check(
-                        stressed_df_for_api,
+                    stressed_compliance_results, stressed_breach_alerts = run_local_compliance_checks(
+                        stressed_df_for_local_check,
                         st.session_state.current_rules_text,
                         st.session_state.threshold_configs
                     )
-                # --- END FIX ---
+                # --- END LOCAL CHECK ---
                 
                 st.session_state['stressed_compliance_results'] = stressed_compliance_results
+                st.session_state['stressed_breach_alerts'] = stressed_breach_alerts # Store breaches too
                 st.success("Stress test simulation complete.")
         
         
@@ -2479,27 +2815,13 @@ with tabs[2]:
             )
 
             st.markdown("#### Post-Stress Compliance Audit")
-            stressed_results = st.session_state['stressed_compliance_results']
-            new_breaches = [r for r in stressed_results if r['status'] == "FAIL"]
+            stressed_breaches = st.session_state.get('stressed_breach_alerts', [])
             
-            if not new_breaches:
+            if not stressed_breaches:
                 st.success("✅ **Portfolio remains compliant under this stress scenario.**")
             else:
-                st.error(f"🚨 **{len(new_breaches)} Compliance Breaches Triggered Under Stress!**")
-                breach_data = []
-                for breach in new_breaches:
-                    severity = "🟡 Medium" 
-                    if abs(breach.get('breach_amount', 0)) > breach.get('threshold', 0) * 0.2:
-                        severity = "🔴 Critical"
-                    elif abs(breach.get('breach_amount', 0)) > breach.get('threshold', 0) * 0.1:
-                        severity = "🟠 High"
-
-                    breach_data.append({
-                        "Rule": breach['rule'],
-                        "Severity": severity,
-                        "Details": breach['details']
-                    })
-                st.dataframe(pd.DataFrame(breach_data), use_container_width=True, hide_index=True)
+                st.error(f"🚨 **{len(stressed_breaches)} Compliance Breaches Triggered Under Stress!**")
+                st.dataframe(pd.DataFrame(stressed_breaches), use_container_width=True, hide_index=True)
             
             st.markdown("#### Detailed Portfolio Impact")
             
@@ -2515,47 +2837,40 @@ with tabs[2]:
             }), use_container_width=True)
 
 
-# --- TAB 4: API Interactions (Unchanged) ---
+# --- TAB 4: API Interactions (Now local) ---
 with tabs[3]:
-    st.header("🔧 Compliance API Interactions")
-    st.markdown("Interact directly with the compliance backend API for various simulation and suggestion tasks.")
+    st.header("🔧 Local Compliance Simulations")
+    st.markdown("Interact directly with the local compliance engine for various simulation tasks.")
 
     current_portfolio_df = st.session_state.get("compliance_results_df")
     current_rules_text = st.session_state.get("current_rules_text")
     current_threshold_configs = st.session_state.get("threshold_configs")
 
     if current_portfolio_df is None or current_portfolio_df.empty:
-        st.warning("⚠️ Please load or analyze a portfolio in 'Portfolio Analysis' tab to use API functions.")
+        st.warning("⚠️ Please load or analyze a portfolio in 'Portfolio Analysis' tab to use simulation functions.")
         st.stop()
     if not current_rules_text:
-        st.warning("⚠️ Please define compliance rules in 'Portfolio Analysis' tab to use API functions.")
+        st.warning("⚠️ Please define compliance rules in 'Portfolio Analysis' tab to use simulation functions.")
         st.stop()
     
     st.info(f"**Using Portfolio:** `{st.session_state.get('current_portfolio_name', 'Unnamed Portfolio')}`")
     st.caption("The portfolio data, rules, and thresholds from the 'Portfolio Analysis' tab are automatically used.")
 
-    # Convert current_portfolio_df to a JSON-serializable list of dicts for the API calls
-    portfolio_for_api = current_portfolio_df[['Symbol', 'Name', 'Quantity', 'LTP', 'Industry']].copy()
-    portfolio_for_api.fillna({'Industry': 'UNKNOWN'}, inplace=True) 
-    portfolio_for_api['Quantity'] = pd.to_numeric(portfolio_for_api['Quantity'], errors='coerce').fillna(0)
-    portfolio_for_api['LTP'] = pd.to_numeric(portfolio_for_api['LTP'], errors='coerce').fillna(0)
-    portfolio_for_api = portfolio_for_api[portfolio_for_api['Quantity'] > 0] # Filter out zero quantity holdings
-
-
     api_call_tab1, api_call_tab2, api_call_tab3, api_call_tab4 = st.tabs([
         "Pre-Trade Simulation", 
-        "Optimal Trade Suggester", 
+        "Optimal Trade Suggester (Local)", 
         "Cash Flow Simulation", 
-        "Block Trade Allocation"
+        "Block Trade Allocation (Local)"
     ])
 
     with api_call_tab1:
-        st.subheader("Simulate Proposed Trades")
-        st.write("Test a single buy/sell trade against your current portfolio and rules.")
+        st.subheader("Simulate Proposed Trades (Local)")
+        st.write("Test a single buy/sell trade against your current portfolio and rules locally.")
         
         trade_col1, trade_col2 = st.columns(2)
         
-        default_symbol = portfolio_for_api['Symbol'].iloc[0] if not portfolio_for_api.empty else "RELIANCE"
+        # Ensure 'Symbol' column exists and is not empty before accessing .iloc[0]
+        default_symbol = current_portfolio_df['Symbol'].iloc[0] if not current_portfolio_df.empty and 'Symbol' in current_portfolio_df.columns else "RELIANCE"
         
         with trade_col1:
             trade_symbol = st.text_input("Trade Symbol", key="trade_symbol", value=default_symbol)
@@ -2563,145 +2878,192 @@ with tabs[3]:
         with trade_col2:
             trade_quantity = st.number_input("Quantity", min_value=1, value=10, key="trade_quantity")
             
-        current_ltp_for_trade = portfolio_for_api[portfolio_for_api['Symbol'] == trade_symbol]['LTP'].iloc[0] if trade_symbol in portfolio_for_api['Symbol'].values else 0.0
+        current_ltp_for_trade = current_portfolio_df[current_portfolio_df['Symbol'] == trade_symbol]['LTP'].iloc[0] if trade_symbol in current_portfolio_df['Symbol'].values else 0.0
         
-        # FIX for StreamlitValueBelowMinError: Ensure value is >= min_value
         safe_ltp_value = max(float(current_ltp_for_trade), 0.01)
         trade_ltp = st.number_input(f"LTP for {trade_symbol}", value=safe_ltp_value, min_value=0.01)
         
-        trade_industry = portfolio_for_api[portfolio_for_api['Symbol'] == trade_symbol]['Industry'].iloc[0] if trade_symbol in portfolio_for_api['Symbol'].values else "UNKNOWN"
+        trade_industry = current_portfolio_df[current_portfolio_df['Symbol'] == trade_symbol]['Industry'].iloc[0] if trade_symbol in current_portfolio_df['Symbol'].values else "UNKNOWN"
         trade_industry = st.text_input(f"Industry for {trade_symbol}", value=str(trade_industry))
 
-        if st.button("Simulate Trade", type="primary"):
-            trade_payload = {
-                "portfolio": portfolio_for_api.to_dict('records'),
-                "rules_text": current_rules_text,
-                "threshold_configs": current_threshold_configs,
-                "trade": {
-                    "symbol": trade_symbol.upper(),
-                    "action": trade_action.upper(),
-                    "quantity": int(trade_quantity),
-                    "ltp": float(trade_ltp),
-                    "industry": trade_industry.upper(),
-                    "name": trade_symbol.upper() # Add 'Name' to trade for API compatibility
-                }
+        if st.button("Simulate Trade Locally", type="primary"):
+            trade_details = {
+                "symbol": trade_symbol.upper(),
+                "action": trade_action.upper(),
+                "quantity": int(trade_quantity),
+                "ltp": float(trade_ltp),
+                "industry": trade_industry.upper(),
+                "name": trade_symbol.upper()
             }
-            with st.spinner(f"Simulating {trade_action} {trade_quantity} {trade_symbol}..."):
-                response_data = call_compliance_api("/simulate/trade", trade_payload)
-                if response_data:
-                    st.success("Pre-trade simulation results:")
-                    simulated_df = pd.DataFrame(response_data['simulated_portfolio'])
-                    st.markdown("##### Simulated Portfolio")
-                    st.dataframe(simulated_df.style.format({'Real-time Value (Rs)': '₹{:,.2f}', 'Weight %': '{:.2f}%', 'LTP': '₹{:,.2f}'}), use_container_width=True)
-                    st.markdown("##### Compliance Results After Trade")
-                    st.dataframe(pd.DataFrame(response_data['compliance_results']), use_container_width=True, hide_index=True)
+            with st.spinner(f"Simulating {trade_action} {trade_quantity} {trade_symbol} locally..."):
+                simulated_df = get_simulated_portfolio_df(current_portfolio_df, trade=trade_details)
+                simulated_compliance_results, simulated_breaches = run_local_compliance_checks(
+                    simulated_df,
+                    current_rules_text,
+                    current_threshold_configs
+                )
+                
+                st.success("Pre-trade simulation results:")
+                st.markdown("##### Simulated Portfolio")
+                st.dataframe(simulated_df.style.format({'Real-time Value (Rs)': '₹{:,.2f}', 'Weight %': '{:.2f}%', 'LTP': '₹{:,.2f}'}), use_container_width=True)
+                st.markdown("##### Compliance Results After Trade")
+                st.dataframe(pd.DataFrame(simulated_compliance_results), use_container_width=True, hide_index=True)
+                
+                if simulated_breaches:
+                    st.error(f"🚨 **{len(simulated_breaches)} Breaches Detected After Trade!**")
+                    st.dataframe(pd.DataFrame(simulated_breaches), use_container_width=True, hide_index=True)
                 else:
-                    st.error("Failed to get pre-trade simulation results.")
+                    st.success("✅ **No compliance breaches detected after this trade.**")
 
     with api_call_tab2:
-        st.subheader("Optimal Trade Suggester")
-        st.write("Get suggestions for trades to resolve any detected compliance breaches.")
+        st.subheader("Optimal Trade Suggester (Local - Basic Placeholder)")
+        st.write("This is a basic local placeholder for a trade suggester. A full optimal trade suggester would require complex optimization algorithms.")
+        st.info("Currently, this only suggests reducing the top breaching stock/sector to bring it within limits.")
 
-        if st.button("Get Trade Suggestions", type="primary"):
-            trade_suggestion_payload = {
-                "portfolio": portfolio_for_api.to_dict('records'),
-                "rules_text": current_rules_text,
-                "threshold_configs": current_threshold_configs
-            }
-            with st.spinner("Requesting trade suggestions..."):
-                response_data = call_compliance_api("/suggest/trades", trade_suggestion_payload)
-                if response_data:
-                    if response_data['suggestions']:
-                        st.success("Optimal trade suggestions:")
-                        st.dataframe(pd.DataFrame(response_data['suggestions']), use_container_width=True, hide_index=True)
-                    else:
-                        st.info(response_data.get('message', "No suggestions available, portfolio might be compliant."))
-                    
-                    st.markdown("---")
-                    st.markdown("##### Current Compliance Before Suggestions (from API)")
-                    st.dataframe(pd.DataFrame(response_data['current_compliance']), use_container_width=True, hide_index=True)
+        if st.button("Get Local Trade Suggestions", type="primary"):
+            current_compliance_results, current_breaches = run_local_compliance_checks(
+                current_portfolio_df,
+                current_rules_text,
+                current_threshold_configs
+            )
+            
+            if not current_breaches:
+                st.success("✅ Portfolio is already compliant. No trade suggestions needed.")
+            else:
+                st.markdown("##### Current Breaches")
+                st.dataframe(pd.DataFrame(current_breaches), use_container_width=True, hide_index=True)
+                st.markdown("---")
+                st.markdown("##### Basic Trade Suggestions to Resolve Breaches:")
+                
+                suggestions = []
+                for breach in current_breaches:
+                    if "Stock Limit" in breach['type'] or "STOCK" in breach['details']:
+                        match = re.search(r'([\w\d]+) weight ([\d.]+)%', breach['details'])
+                        if match:
+                            symbol = match.group(1)
+                            current_weight = float(match.group(2))
+                            limit = st.session_state["threshold_configs"].get('single_stock_limit', 10.0)
+                            if current_weight > limit:
+                                stock_row = current_portfolio_df[current_portfolio_df['Symbol'].str.upper() == symbol.upper()]
+                                if not stock_row.empty:
+                                    excess_weight_pct = current_weight - limit
+                                    current_value = stock_row['Real-time Value (Rs)'].iloc[0]
+                                    total_portfolio_value = current_portfolio_df['Real-time Value (Rs)'].sum()
+                                    
+                                    # Calculate target value to bring it to limit
+                                    target_value = total_portfolio_value * (limit / 100.0)
+                                    amount_to_reduce = current_value - target_value 
+                                    
+                                    if stock_row['LTP'].iloc[0] > 0:
+                                        quantity_to_sell = max(1, int(amount_to_reduce / stock_row['LTP'].iloc[0]))
+                                        suggestions.append({
+                                            'Type': 'SELL',
+                                            'Symbol': symbol,
+                                            'Quantity': quantity_to_sell,
+                                            'Reason': f"Reduce {symbol} by {excess_weight_pct:.2f}% to meet stock limit ({limit:.2f}%)"
+                                        })
+                    elif "Sector Limit" in breach['type'] or "SECTOR" in breach['details']:
+                         match = re.search(r'Sector ([\w\s]+) weight ([\d.]+)%', breach['details'])
+                         if match:
+                             sector = match.group(1)
+                             current_weight = float(match.group(2))
+                             limit = st.session_state["threshold_configs"].get('single_sector_limit', 25.0)
+                             if current_weight > limit:
+                                 # This is a very simplistic suggestion: suggest selling the largest stock in the breaching sector
+                                 breaching_sector_stocks = current_portfolio_df[current_portfolio_df['Industry'].str.upper() == sector.upper()]
+                                 if not breaching_sector_stocks.empty:
+                                     largest_stock_in_sector = breaching_sector_stocks.nlargest(1, 'Weight %').iloc[0]
+                                     symbol = largest_stock_in_sector['Symbol']
+                                     # Estimate quantity to sell to bring the sector below limit (simplistic)
+                                     excess_weight_pct = current_weight - limit
+                                     total_portfolio_value = current_portfolio_df['Real-time Value (Rs)'].sum()
+                                     amount_to_reduce_sector = total_portfolio_value * (excess_weight_pct / 100.0)
+                                     
+                                     if largest_stock_in_sector['LTP'] > 0:
+                                        quantity_to_sell_rough = max(1, int(amount_to_reduce_sector / largest_stock_in_sector['LTP']))
+                                        suggestions.append({
+                                            'Type': 'SELL',
+                                            'Symbol': symbol,
+                                            'Quantity': quantity_to_sell_rough,
+                                            'Reason': f"Reduce {symbol} to help meet {sector} sector limit ({limit:.2f}%)"
+                                        })
+                if suggestions:
+                    st.dataframe(pd.DataFrame(suggestions), use_container_width=True, hide_index=True)
                 else:
-                    st.error("Failed to get trade suggestions.")
+                    st.info("No specific actionable suggestions could be generated for current breaches with this basic suggester.")
+
 
     with api_call_tab3:
-        st.subheader("Cash Flow Simulation")
-        st.write("Simulate the impact of adding or withdrawing cash from the portfolio.")
+        st.subheader("Cash Flow Simulation (Local)")
+        st.write("Simulate the impact of adding or withdrawing cash from the portfolio locally.")
 
         cash_amount = st.number_input("Cash Amount (Rs)", value=100000.0, step=10000.0, help="Positive for inflow, negative for outflow.")
         
-        if st.button("Simulate Cash Flow", type="primary"):
-            cash_flow_payload = {
-                "portfolio": portfolio_for_api.to_dict('records'),
-                "rules_text": current_rules_text,
-                "threshold_configs": current_threshold_configs,
-                "cash_flow": {
-                    "amount": float(cash_amount)
-                }
-            }
-            with st.spinner("Simulating cash flow..."):
-                response_data = call_compliance_api("/simulate/cashflow", cash_flow_payload)
-                if response_data:
-                    st.success("Cash flow simulation results:")
-                    simulated_df = pd.DataFrame(response_data['simulated_portfolio'])
-                    st.markdown("##### Simulated Portfolio with Cash Flow")
-                    st.dataframe(simulated_df.style.format({'Real-time Value (Rs)': '₹{:,.2f}', 'Weight %': '{:.2f}%', 'LTP': '₹{:,.2f}'}), use_container_width=True)
-                    st.markdown("##### Compliance Results After Cash Flow")
-                    st.dataframe(pd.DataFrame(response_data['compliance_results']), use_container_width=True, hide_index=True)
+        if st.button("Simulate Cash Flow Locally", type="primary"):
+            cash_flow_details = { "amount": float(cash_amount) }
+            with st.spinner("Simulating cash flow locally..."):
+                simulated_df = get_simulated_portfolio_df(current_portfolio_df, cash_flow=cash_flow_details)
+                simulated_compliance_results, simulated_breaches = run_local_compliance_checks(
+                    simulated_df,
+                    current_rules_text,
+                    current_threshold_configs
+                )
+                
+                st.success("Cash flow simulation results:")
+                st.markdown("##### Simulated Portfolio with Cash Flow")
+                st.dataframe(simulated_df.style.format({'Real-time Value (Rs)': '₹{:,.2f}', 'Weight %': '{:.2f}%', 'LTP': '₹{:,.2f}'}), use_container_width=True)
+                st.markdown("##### Compliance Results After Cash Flow")
+                st.dataframe(pd.DataFrame(simulated_compliance_results), use_container_width=True, hide_index=True)
+                
+                if simulated_breaches:
+                    st.error(f"🚨 **{len(simulated_breaches)} Breaches Detected After Cash Flow!**")
+                    st.dataframe(pd.DataFrame(simulated_breaches), use_container_width=True, hide_index=True)
                 else:
-                    st.error("Failed to simulate cash flow.")
+                    st.success("✅ **No compliance breaches detected after this cash flow.**")
 
     with api_call_tab4:
-        st.subheader("Block Trade Allocation Check")
-        st.write("Check how a hypothetical block trade (split and allocated to your current portfolio) affects compliance. This assumes the entire block trade is allocated to this one portfolio for demonstration.")
+        st.subheader("Block Trade Allocation Check (Local - Basic Placeholder)")
+        st.write("This is a basic local placeholder for a block trade allocation check. It simulates the entire block trade being allocated to the current portfolio.")
 
         bt_symbol = st.text_input("Block Trade Symbol", key="bt_symbol", value="RELIANCE")
         bt_ltp = st.number_input("Block Trade LTP (Rs)", value=2500.0, key="bt_ltp")
         bt_quantity = st.number_input("Block Trade Total Quantity", min_value=1, value=500, key="bt_quantity")
         bt_action = st.selectbox("Block Trade Action", ["BUY", "SELL"], key="bt_action_block")
         
-        # Determine industry for the block trade symbol
-        bt_industry = portfolio_for_api[portfolio_for_api['Symbol'].str.upper() == bt_symbol.upper()]['Industry'].iloc[0] \
-                        if bt_symbol.upper() in portfolio_for_api['Symbol'].str.upper().values else "UNKNOWN"
+        bt_industry = current_portfolio_df[current_portfolio_df['Symbol'].str.upper() == bt_symbol.upper()]['Industry'].iloc[0] \
+                        if bt_symbol.upper() in current_portfolio_df['Symbol'].str.upper().values else "UNKNOWN"
         bt_industry_input = st.text_input(f"Industry for {bt_symbol}", value=str(bt_industry), key="bt_industry")
 
-        if st.button("Check Block Trade Allocation", type="primary"):
-            if not st.session_state.get('current_portfolio_id'):
-                st.error("No current portfolio loaded to check allocation against. Please load a portfolio first.")
-            else:
-                # For demonstration, we'll simulate the entire block trade being allocated to the *current* portfolio
-                allocation_payload = {
-                    "portfolios": [
-                        {
-                            "id": st.session_state.current_portfolio_id,
-                            "holdings": portfolio_for_api.to_dict('records'), # Using the current portfolio
-                            "rules_text": current_rules_text,
-                            "threshold_configs": current_threshold_configs,
-                            "allocation_quantity": int(bt_quantity) # Allocating total quantity to this single portfolio
-                        }
-                    ],
-                    "block_trade": {
-                        "symbol": bt_symbol.upper(),
-                        "action": bt_action.upper(),
-                        "ltp": float(bt_ltp),
-                        "industry": bt_industry_input.upper(),
-                        "name": bt_symbol.upper() # Add 'Name' to block_trade for API compatibility
-                    }
-                }
+        if st.button("Check Block Trade Allocation Locally", type="primary"):
+            block_trade_details = {
+                "symbol": bt_symbol.upper(),
+                "action": bt_action.upper(),
+                "quantity": int(bt_quantity),
+                "ltp": float(bt_ltp),
+                "industry": bt_industry_input.upper(),
+                "name": bt_symbol.upper()
+            }
+            
+            with st.spinner(f"Checking local block trade allocation for {bt_symbol}..."):
+                # Simulate the entire block trade as a single trade on the current portfolio
+                simulated_df = get_simulated_portfolio_df(current_portfolio_df, trade=block_trade_details)
+                simulated_compliance_results, simulated_breaches = run_local_compliance_checks(
+                    simulated_df,
+                    current_rules_text,
+                    current_threshold_configs
+                )
                 
-                with st.spinner(f"Checking block trade allocation for {bt_symbol}..."):
-                    response_data = call_compliance_api("/simulate/block_allocation", allocation_payload)
-                    if response_data and response_data['allocation_results']:
-                        st.success("Block trade allocation results:")
-                        # Display results for each portfolio (in this case, just the one current portfolio)
-                        for res in response_data['allocation_results']:
-                            st.markdown(f"##### Portfolio ID: {res['portfolio_id']}")
-                            if res['breach_count'] > 0:
-                                st.error(f"❌ {res['breach_count']} breaches detected after allocation.")
-                            else:
-                                st.success("✅ Compliant after allocation.")
-                            st.dataframe(pd.DataFrame(res['compliance_results']), use_container_width=True, hide_index=True)
-                    else:
-                        st.error("Failed to check block trade allocation.")
+                st.success("Block trade allocation results:")
+                st.markdown(f"##### Simulated Portfolio After Allocating {bt_quantity} of {bt_symbol}")
+                st.dataframe(simulated_df.style.format({'Real-time Value (Rs)': '₹{:,.2f}', 'Weight %': '{:.2f}%', 'LTP': '₹{:,.2f}'}), use_container_width=True)
+                st.markdown("##### Compliance Results After Allocation")
+                st.dataframe(pd.DataFrame(simulated_compliance_results), use_container_width=True, hide_index=True)
+                
+                if simulated_breaches:
+                    st.error(f"🚨 **{len(simulated_breaches)} Breaches Detected After Block Trade Allocation!**")
+                    st.dataframe(pd.DataFrame(simulated_breaches), use_container_width=True, hide_index=True)
+                else:
+                    st.success("✅ **No compliance breaches detected after this block trade allocation.**")
 
 
 # --- TAB 5: History (Unchanged) ---
