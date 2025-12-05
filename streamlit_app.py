@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import json
@@ -1710,8 +1709,8 @@ k = get_authenticated_kite_client(KITE_CREDENTIALS["api_key"], st.session_state[
 api_key = KITE_CREDENTIALS["api_key"]
 access_token = st.session_state["kite_access_token"]
 
-# Rename Tab 3 to "Risk & Analysis"
-tabs = st.tabs(["💼 Portfolio Analysis", "🤖 AI Analysis", "📈 Risk & Analysis", "🔧 API Interactions", "📚 History"])
+# Renamed tabs for consistency
+tabs = st.tabs(["💼 Portfolio Analysis", "🤖 AI Analysis", "📈 Risk & Analysis", "📚 History"])
 
 
 # --- TAB 1: Enhanced Compliance Analysis (Mostly Unchanged) ---
@@ -2521,8 +2520,8 @@ Detailed list with:
                             'compliance_results': st.session_state.get("compliance_results", []),
                             'security_compliance': st.session_state.get("security_level_compliance", pd.DataFrame()).to_json(date_format='iso'),
                             'breach_alerts': st.session_state.get("breach_alerts", []),
-                            'advanced_metrics': st.session_state.get("advanced_metrics", DEFAULT_ADVANCED_METRICS.copy()),
-                            'risk_returns_df': st.session_state.get("risk_returns_df", pd.DataFrame()).to_json(date_format='iso'),
+                            'advanced_metrics': st.session_state.advanced_metrics,
+                            'risk_returns_df': st.session_state.risk_returns_df.to_json(date_format='iso'),
                             'benchmark_symbol': st.session_state.get("current_benchmark_symbol", BENCHMARK_NIFTY_SYMBOL),
                             'ai_analysis': response.text
                         }
@@ -2842,237 +2841,8 @@ with tabs[2]:
             }), use_container_width=True)
 
 
-# --- TAB 4: API Interactions (Now local) ---
-with tabs[3]:
-    st.header("🔧 Local Compliance Simulations")
-    st.markdown("Interact directly with the local compliance engine for various simulation tasks.")
-
-    current_portfolio_df = st.session_state.get("compliance_results_df")
-    current_rules_text = st.session_state.get("current_rules_text")
-    current_threshold_configs = st.session_state.get("threshold_configs")
-
-    if current_portfolio_df is None or current_portfolio_df.empty:
-        st.warning("⚠️ Please load or analyze a portfolio in 'Portfolio Analysis' tab to use simulation functions.")
-        st.stop()
-    if not current_rules_text:
-        st.warning("⚠️ Please define compliance rules in 'Portfolio Analysis' tab to use simulation functions.")
-        st.stop()
-
-    st.info(f"**Using Portfolio:** `{st.session_state.get('current_portfolio_name', 'Unnamed Portfolio')}`")
-    st.caption("The portfolio data, rules, and thresholds from the 'Portfolio Analysis' tab are automatically used.")
-
-    api_call_tab1, api_call_tab2, api_call_tab3, api_call_tab4 = st.tabs([
-        "Pre-Trade Simulation",
-        "Optimal Trade Suggester (Local)",
-        "Cash Flow Simulation",
-        "Block Trade Allocation (Local)"
-    ])
-
-    with api_call_tab1:
-        st.subheader("Simulate Proposed Trades (Local)")
-        st.write("Test a single buy/sell trade against your current portfolio and rules locally.")
-
-        trade_col1, trade_col2 = st.columns(2)
-
-        # Ensure 'Symbol' column exists and is not empty before accessing .iloc[0]
-        default_symbol = current_portfolio_df['Symbol'].iloc[0] if not current_portfolio_df.empty and 'Symbol' in current_portfolio_df.columns else "RELIANCE"
-
-        with trade_col1:
-            trade_symbol = st.text_input("Trade Symbol", key="trade_symbol", value=default_symbol)
-            trade_action = st.selectbox("Action", ["BUY", "SELL"], key="trade_action")
-        with trade_col2:
-            trade_quantity = st.number_input("Quantity", min_value=1, value=10, key="trade_quantity")
-
-        current_ltp_for_trade = current_portfolio_df[current_portfolio_df['Symbol'] == trade_symbol]['LTP'].iloc[0] if trade_symbol in current_portfolio_df['Symbol'].values else 0.0
-
-        safe_ltp_value = max(float(current_ltp_for_trade), 0.01)
-        trade_ltp = st.number_input(f"LTP for {trade_symbol}", value=safe_ltp_value, min_value=0.01)
-
-        trade_industry = current_portfolio_df[current_portfolio_df['Symbol'] == trade_symbol]['Industry'].iloc[0] if trade_symbol in current_portfolio_df['Symbol'].values else "UNKNOWN"
-        trade_industry = st.text_input(f"Industry for {trade_symbol}", value=str(trade_industry))
-
-        if st.button("Simulate Trade Locally", type="primary"):
-            trade_details = {
-                "symbol": trade_symbol.upper(),
-                "action": trade_action.upper(),
-                "quantity": int(trade_quantity),
-                "ltp": float(trade_ltp),
-                "industry": trade_industry.upper(),
-                "name": trade_symbol.upper()
-            }
-            with st.spinner(f"Simulating {trade_action} {trade_quantity} {trade_symbol} locally..."):
-                simulated_df = get_simulated_portfolio_df(current_portfolio_df, trade=trade_details)
-                simulated_compliance_results, simulated_breaches = run_local_compliance_checks(
-                    simulated_df,
-                    current_rules_text,
-                    current_threshold_configs
-                )
-
-                st.success("Pre-trade simulation results:")
-                st.markdown("##### Simulated Portfolio")
-                st.dataframe(simulated_df.style.format({'Real-time Value (Rs)': '₹{:,.2f}', 'Weight %': '{:.2f}%', 'LTP': '₹{:,.2f}'}), use_container_width=True)
-                st.markdown("##### Compliance Results After Trade")
-                st.dataframe(pd.DataFrame(simulated_compliance_results), use_container_width=True, hide_index=True)
-
-                if simulated_breaches:
-                    st.error(f"🚨 **{len(simulated_breaches)} Breaches Detected After Trade!**")
-                    st.dataframe(pd.DataFrame(simulated_breaches), use_container_width=True, hide_index=True)
-                else:
-                    st.success("✅ **No compliance breaches detected after this trade.**")
-
-    with api_call_tab2:
-        st.subheader("Optimal Trade Suggester (Local - Basic Placeholder)")
-        st.write("This is a basic local placeholder for a trade suggester. A full optimal trade suggester would require complex optimization algorithms.")
-        st.info("Currently, this only suggests reducing the top breaching stock/sector to bring it within limits.")
-
-        if st.button("Get Local Trade Suggestions", type="primary"):
-            current_compliance_results, current_breaches = run_local_compliance_checks(
-                current_portfolio_df,
-                current_rules_text,
-                current_threshold_configs
-            )
-
-            if not current_breaches:
-                st.success("✅ Portfolio is already compliant. No trade suggestions needed.")
-            else:
-                st.markdown("##### Current Breaches")
-                st.dataframe(pd.DataFrame(current_breaches), use_container_width=True, hide_index=True)
-                st.markdown("---")
-                st.markdown("##### Basic Trade Suggestions to Resolve Breaches:")
-
-                suggestions = []
-                for breach in current_breaches:
-                    if "Stock Limit" in breach['type'] or "STOCK" in breach['details']:
-                        match = re.search(r'([\w\d]+) weight ([\d.]+)%', breach['details'])
-                        if match:
-                            symbol = match.group(1)
-                            current_weight = float(match.group(2))
-                            limit = st.session_state["threshold_configs"].get('single_stock_limit', 10.0)
-                            if current_weight > limit:
-                                stock_row = current_portfolio_df[current_portfolio_df['Symbol'].str.upper() == symbol.upper()]
-                                if not stock_row.empty:
-                                    excess_weight_pct = current_weight - limit
-                                    current_value = stock_row['Real-time Value (Rs)'].iloc[0]
-                                    total_portfolio_value = current_portfolio_df['Real-time Value (Rs)'].sum()
-
-                                    # Calculate target value to bring it to limit
-                                    target_value = total_portfolio_value * (limit / 100.0)
-                                    amount_to_reduce = current_value - target_value
-
-                                    if stock_row['LTP'].iloc[0] > 0:
-                                        quantity_to_sell = max(1, int(amount_to_reduce / stock_row['LTP'].iloc[0]))
-                                        suggestions.append({
-                                            'Type': 'SELL',
-                                            'Symbol': symbol,
-                                            'Quantity': quantity_to_sell,
-                                            'Reason': f"Reduce {symbol} by {excess_weight_pct:.2f}% to meet stock limit ({limit:.2f}%)"
-                                        })
-                    elif "Sector Limit" in breach['type'] or "SECTOR" in breach['details']:
-                         match = re.search(r'Sector ([\w\s]+) weight ([\d.]+)%', breach['details'])
-                         if match:
-                             sector = match.group(1)
-                             current_weight = float(match.group(2))
-                             limit = st.session_state["threshold_configs"].get('single_sector_limit', 25.0)
-                             if current_weight > limit:
-                                 # This is a very simplistic suggestion: suggest selling the largest stock in the breaching sector
-                                 breaching_sector_stocks = current_portfolio_df[current_portfolio_df['Industry'].str.upper() == sector.upper()]
-                                 if not breaching_sector_stocks.empty:
-                                     largest_stock_in_sector = breaching_sector_stocks.nlargest(1, 'Weight %').iloc[0]
-                                     symbol = largest_stock_in_sector['Symbol']
-                                     # Estimate quantity to sell to bring the sector below limit (simplistic)
-                                     excess_weight_pct = current_weight - limit
-                                     total_portfolio_value = current_portfolio_df['Real-time Value (Rs)'].sum()
-                                     amount_to_reduce_sector = total_portfolio_value * (excess_weight_pct / 100.0)
-
-                                     if largest_stock_in_sector['LTP'] > 0:
-                                        quantity_to_sell_rough = max(1, int(amount_to_reduce_sector / largest_stock_in_sector['LTP']))
-                                        suggestions.append({
-                                            'Type': 'SELL',
-                                            'Symbol': symbol,
-                                            'Quantity': quantity_to_sell_rough,
-                                            'Reason': f"Reduce {symbol} to help meet {sector} sector limit ({limit:.2f}%)"
-                                        })
-                if suggestions:
-                    st.dataframe(pd.DataFrame(suggestions), use_container_width=True, hide_index=True)
-                else:
-                    st.info("No specific actionable suggestions could be generated for current breaches with this basic suggester.")
-
-
-    with api_call_tab3:
-        st.subheader("Cash Flow Simulation (Local)")
-        st.write("Simulate the impact of adding or withdrawing cash from the portfolio locally.")
-
-        cash_amount = st.number_input("Cash Amount (Rs)", value=100000.0, step=10000.0, help="Positive for inflow, negative for outflow.")
-
-        if st.button("Simulate Cash Flow Locally", type="primary"):
-            cash_flow_details = { "amount": float(cash_amount) }
-            with st.spinner("Simulating cash flow locally..."):
-                simulated_df = get_simulated_portfolio_df(current_portfolio_df, cash_flow=cash_flow_details)
-                simulated_compliance_results, simulated_breaches = run_local_compliance_checks(
-                    simulated_df,
-                    current_rules_text,
-                    current_threshold_configs
-                )
-
-                st.success("Cash flow simulation results:")
-                st.markdown("##### Simulated Portfolio with Cash Flow")
-                st.dataframe(simulated_df.style.format({'Real-time Value (Rs)': '₹{:,.2f}', 'Weight %': '{:.2f}%', 'LTP': '₹{:,.2f}'}), use_container_width=True)
-                st.markdown("##### Compliance Results After Cash Flow")
-                st.dataframe(pd.DataFrame(simulated_compliance_results), use_container_width=True, hide_index=True)
-
-                if simulated_breaches:
-                    st.error(f"🚨 **{len(simulated_breaches)} Breaches Detected After Cash Flow!**")
-                    st.dataframe(pd.DataFrame(simulated_breaches), use_container_width=True, hide_index=True)
-                else:
-                    st.success("✅ **No compliance breaches detected after this cash flow.**")
-
-    with api_call_tab4:
-        st.subheader("Block Trade Allocation Check (Local - Basic Placeholder)")
-        st.write("This is a basic local placeholder for a block trade allocation check. It simulates the entire block trade being allocated to the current portfolio.")
-
-        bt_symbol = st.text_input("Block Trade Symbol", key="bt_symbol", value="RELIANCE")
-        bt_ltp = st.number_input("Block Trade LTP (Rs)", value=2500.0, key="bt_ltp")
-        bt_quantity = st.number_input("Block Trade Total Quantity", min_value=1, value=500, key="bt_quantity")
-        bt_action = st.selectbox("Block Trade Action", ["BUY", "SELL"], key="bt_action_block")
-
-        bt_industry = current_portfolio_df[current_portfolio_df['Symbol'].str.upper() == bt_symbol.upper()]['Industry'].iloc[0] \
-                        if bt_symbol.upper() in current_portfolio_df['Symbol'].str.upper().values else "UNKNOWN"
-        bt_industry_input = st.text_input(f"Industry for {bt_symbol}", value=str(bt_industry), key="bt_industry")
-
-        if st.button("Check Block Trade Allocation Locally", type="primary"):
-            block_trade_details = {
-                "symbol": bt_symbol.upper(),
-                "action": bt_action.upper(),
-                "quantity": int(bt_quantity),
-                "ltp": float(bt_ltp),
-                "industry": bt_industry_input.upper(),
-                "name": bt_symbol.upper()
-            }
-
-            with st.spinner(f"Checking local block trade allocation for {bt_symbol}..."):
-                # Simulate the entire block trade as a single trade on the current portfolio
-                simulated_df = get_simulated_portfolio_df(current_portfolio_df, trade=block_trade_details)
-                simulated_compliance_results, simulated_breaches = run_local_compliance_checks(
-                    simulated_df,
-                    current_rules_text,
-                    current_threshold_configs
-                )
-
-                st.success("Block trade allocation results:")
-                st.markdown(f"##### Simulated Portfolio After Allocating {bt_quantity} of {bt_symbol}")
-                st.dataframe(simulated_df.style.format({'Real-time Value (Rs)': '₹{:,.2f}', 'Weight %': '{:.2f}%', 'LTP': '₹{:,.2f}'}), use_container_width=True)
-                st.markdown("##### Compliance Results After Allocation")
-                st.dataframe(pd.DataFrame(simulated_compliance_results), use_container_width=True, hide_index=True)
-
-                if simulated_breaches:
-                    st.error(f"🚨 **{len(simulated_breaches)} Breaches Detected After Block Trade Allocation!**")
-                    st.dataframe(pd.DataFrame(simulated_breaches), use_container_width=True, hide_index=True)
-                else:
-                    st.success("✅ **No compliance breaches detected after this block trade allocation.**")
-
-
-# --- TAB 5: History (Unchanged) ---
-with tabs[4]:
+# --- TAB 4: History (Previously TAB 5) ---
+with tabs[3]: # Note: This is now the 4th tab due to removal of 'API Interactions'
     st.header("📚 Portfolio History")
 
     col1, col2 = st.columns([3, 1])
@@ -3130,3 +2900,4 @@ st.markdown(f"""
     <p style='font-size: 0.8em;'>User: {st.session_state["user_email"]} | Session Active</p>
 </div>
 """, unsafe_allow_html=True)
+
