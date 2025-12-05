@@ -1,10 +1,4 @@
-The `ValueError` in `st.dataframe` when using `.style.format` often arises if the DataFrame contains `NaN` values in columns where a specific format (like `'{:,.0f}'` for integers or `'{:,.2f}'` for floats) is applied. Pandas styler, under the hood, attempts to apply the formatter function to every value in the specified column, and if a `NaN` is encountered, the formatter might fail because `NaN` is not a number that can be directly formatted as an integer or a specific float precision without explicit handling.
 
-The fix involves handling `NaN` values *before* applying the `.style.format()` method, typically by filling them with a default value (like 0) or by making the formatter more robust. For numeric columns, `fillna(0)` is a common approach if `NaN`s are acceptable as zero values in the display.
-
-Here's the corrected part of the code, specifically addressing the `st.dataframe` call in `analysis_tabs[1]` which is the most likely culprit based on the traceback:
-
-```python
 import streamlit as st
 import pandas as pd
 import json
@@ -2442,4 +2436,4 @@ st.markdown(f"""
     <p style='font-size: 0.8em;'>User: {st.session_state["user_email"]} | Session Active</p>
 </div>
 """, unsafe_allow_html=True)
-```
+
