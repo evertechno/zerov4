@@ -1,4 +1,10 @@
+The `ValueError` in `st.dataframe` when using `.style.format` often arises if the DataFrame contains `NaN` values in columns where a specific format (like `'{:,.0f}'` for integers or `'{:,.2f}'` for floats) is applied. Pandas styler, under the hood, attempts to apply the formatter function to every value in the specified column, and if a `NaN` is encountered, the formatter might fail because `NaN` is not a number that can be directly formatted as an integer or a specific float precision without explicit handling.
 
+The fix involves handling `NaN` values *before* applying the `.style.format()` method, typically by filling them with a default value (like 0) or by making the formatter more robust. For numeric columns, `fillna(0)` is a common approach if `NaN`s are acceptable as zero values in the display.
+
+Here's the corrected part of the code, specifically addressing the `st.dataframe` call in `analysis_tabs[1]` which is the most likely culprit based on the traceback:
+
+```python
 import streamlit as st
 import pandas as pd
 import json
@@ -1198,6 +1204,10 @@ HHI < 800""")
                         st.warning("UTF-8 decoding failed, trying 'latin-1' encoding.")
                         uploaded_file.seek(0)  # Reset file pointer
                         df = pd.read_csv(uploaded_file, encoding='latin-1')
+                    except Exception as e:
+                        st.error(f"Failed to read CSV: {e}. Please ensure it's a valid CSV file.")
+                        st.stop()
+
 
                     df.columns = [str(col).strip().lower().replace(' ', '_').replace('.', '').replace('/', '_') for col in df.columns]
 
@@ -1217,6 +1227,11 @@ HHI < 800""")
                     if 'LTP' not in df.columns:  # Ensure LTP exists before calling API or recalculating
                         df['LTP'] = 0.0
 
+                    # Ensure 'Quantity' column is numeric, coercing errors to NaN
+                    df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce')
+                    # Drop rows where 'Quantity' is NaN after coercion, as they are invalid holdings
+                    df.dropna(subset=['Quantity'], inplace=True)
+                    
                     # Fetch real-time prices
                     symbols = df['Symbol'].unique().tolist()
                     ltp_data = k.ltp([f"{DEFAULT_EXCHANGE}:{s}" for s in symbols])
@@ -1224,9 +1239,9 @@ HHI < 800""")
 
                     df_results = df.copy()
                     df_results['LTP'] = df_results['Symbol'].map(prices)
-                    df_results['Real-time Value (Rs)'] = (df_results['LTP'] * pd.to_numeric(df_results['Quantity'],
-                                                                                               errors='coerce')).fillna(
-                        0)
+                    # Fill NaN LTPs with 0 for calculation to avoid errors
+                    df_results['LTP'].fillna(0, inplace=True)
+                    df_results['Real-time Value (Rs)'] = (df_results['LTP'] * df_results['Quantity']).fillna(0)
                     total_value = df_results['Real-time Value (Rs)'].sum()
                     df_results['Weight %'] = (df_results['Real-time Value (Rs)'] / total_value * 100) if total_value > 0 else 0
 
@@ -1420,8 +1435,16 @@ HHI < 800""")
 
         with analysis_tabs[1]:
             st.subheader("Holdings Details")
-            st.dataframe(results_df[['Name', 'Symbol', 'Industry', 'Weight %', 'Real-time Value (Rs)', 'LTP',
-                                     'Quantity']].style.format({
+            # Create a copy and fill NaNs before formatting
+            display_df_formatted = results_df[['Name', 'Symbol', 'Industry', 'Weight %', 'Real-time Value (Rs)', 'LTP', 'Quantity']].copy()
+            
+            # Fill NaNs in numeric columns that are part of formatting
+            numeric_cols_to_format = ['Weight %', 'Real-time Value (Rs)', 'LTP', 'Quantity']
+            for col in numeric_cols_to_format:
+                if col in display_df_formatted.columns:
+                    display_df_formatted[col] = pd.to_numeric(display_df_formatted[col], errors='coerce').fillna(0) # Fill with 0 or a placeholder
+            
+            st.dataframe(display_df_formatted.style.format({
                 'Weight %': '{:.2f}%',
                 'Real-time Value (Rs)': '₹{:,.2f}',
                 'LTP': '₹{:,.2f}',
@@ -2419,4 +2442,4 @@ st.markdown(f"""
     <p style='font-size: 0.8em;'>User: {st.session_state["user_email"]} | Session Active</p>
 </div>
 """, unsafe_allow_html=True)
-
+```
